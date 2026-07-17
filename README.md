@@ -74,6 +74,7 @@ account. See [`server/README.md`](server/README.md) for flags and env vars.
 | **Sessions list** | move selection | open session | exit app |
 | **Session view** | native scroll — up into history, back down to live | open Compose menu | back to list |
 | **Compose menu** | move selection | fire action / enter submenu | back to session |
+| **Commands submenu** | move selection | fire slash command | back to Compose |
 | **Model / Mode / Effort submenu** | move selection | apply | back to Compose |
 | **Voice dictation** | scroll transcript | done — review before it sends | cancel |
 | **Confirm send** | scroll the message | send | cancel |
@@ -84,8 +85,14 @@ Every session opens on its newest output and auto-follows while running
 (`● live`). Scroll up and it freezes a history window you swipe through; scroll
 back down and it re-attaches to the tail. The Compose menu leads with Dictate,
 then the configurable quick-sends (`Proceed`, `Run tests`, `Explain`),
-`Interrupt`, `Model`, `Mode`, `Effort` (reasoning effort:
+`Interrupt`, `Commands`, `Model`, `Mode`, `Effort` (reasoning effort:
 `auto`/`low`/`medium`/`high`/`xhigh`), and `Archive`.
+
+`Commands` opens a submenu of slash commands (`/context`, `/usage`, `/mcp`,
+`/compact`, `/clear` by default; configurable). Picking one sends it as a plain
+`/name` message, which the session runs as a local command at no token cost, then
+drops you back on the live tail to watch the output. Heavy or destructive ones
+(`/compact`, `/clear`) land on the confirm screen first.
 
 A canned send or a finished dictation never fires on that single tap - it lands
 on a confirmation screen showing the full message, so a stray tap on the touchpad
@@ -100,8 +107,9 @@ menu to reopen it on your own terms. A prompt you answer elsewhere - the panel,
 the terminal, another controller - retires itself.
 
 The companion panel in the phone WebView mirrors all of this and adds free-text
-sends, the full un-clipped event log with tool inputs and usage/cost, and the
-Settings card.
+sends, a `/` slash-command autocomplete in the send box (type `/` to filter the
+same command set), the full un-clipped event log with tool inputs and usage/cost,
+and the Settings card.
 
 ## Configuration
 

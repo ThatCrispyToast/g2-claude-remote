@@ -7,7 +7,7 @@
 // Everything else has a sensible default so the app runs with just a bridge
 // URL + token. See `.env.example`.
 
-import type { QuickSend, ModelChoice, EffortChoice, PermissionMode } from './rc/types'
+import type { QuickSend, SlashCommand, ModelChoice, EffortChoice, PermissionMode } from './rc/types'
 
 // ─── Runtime settings (saved from the panel, stored on the device) ───────────
 /** localStorage key for user-entered connection settings. Also the key under
@@ -190,6 +190,50 @@ function parseQuickSends(raw: unknown): QuickSend[] {
   ]
 }
 export const QUICK_SENDS: QuickSend[] = parseQuickSends(env.VITE_QUICK_SENDS)
+
+/**
+ * Slash commands offered in the Compose → Commands submenu (glasses) and the
+ * panel's `/` autocomplete. Sent to the session as a plain `/name` message —
+ * remote-control workers run slash commands locally at zero cost (the mechanism
+ * the effort control's fallback uses). The default set is deliberately limited to
+ * "fire-and-observe" commands that behave over remote-control; interactive ones
+ * (/login, /config, /vim…) have no remote meaning and must not go here. Override
+ * with a JSON array of {name,label,hint?,takesArg?,confirm?} in VITE_SLASH_COMMANDS.
+ */
+function parseSlashCommands(raw: unknown): SlashCommand[] {
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const arr = JSON.parse(raw)
+      if (Array.isArray(arr)) {
+        return arr
+          .filter((c) => c && typeof c.name === 'string' && typeof c.label === 'string')
+          .map((c) => ({
+            name: String(c.name).replace(/^\/+/, ''), // tolerate a leading slash in config
+            label: c.label,
+            hint: typeof c.hint === 'string' ? c.hint : undefined,
+            takesArg: Boolean(c.takesArg),
+            confirm: Boolean(c.confirm),
+          }))
+      }
+    } catch {
+      /* fall through to defaults */
+    }
+  }
+  // This set is validated live against a remote-control worker (see CLAUDE.md
+  // "Slash commands"): each runs LOCALLY at zero model cost. Commands the worker
+  // refuses over RC (/status, /release-notes → "isn't available over Remote
+  // Control") or that aren't real local commands (/todos → falls through to a
+  // model turn) are deliberately excluded. /cost is just a redirect to /usage,
+  // so we ship /usage directly.
+  return [
+    { name: 'context', label: 'Context usage', hint: 'Tokens left in context' },
+    { name: 'usage', label: 'Usage', hint: 'Session + weekly usage' },
+    { name: 'mcp', label: 'MCP servers', hint: 'MCP connection status' },
+    { name: 'compact', label: 'Compact context', hint: 'Summarize history to free space', takesArg: true, confirm: true },
+    { name: 'clear', label: 'Clear history', hint: 'Wipe the conversation', confirm: true },
+  ]
+}
+export const SLASH_COMMANDS: SlashCommand[] = parseSlashCommands(env.VITE_SLASH_COMMANDS)
 
 // ─── Voice dictation (optional; reuses the glasses mic + Deepgram) ───────────
 // Text INPUT on a keyboard-less device: hold-free voice dictation. Streams the

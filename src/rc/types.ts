@@ -29,6 +29,28 @@ export interface QuickSend {
 }
 
 /**
+ * A slash command the wearer can fire from the Compose → Commands submenu (glasses)
+ * or the panel's `/` autocomplete. Sent to the worker as a plain `/name` message —
+ * remote-control workers execute slash commands locally at zero cost (the same
+ * mechanism the effort control's fallback relies on), so no dedicated bridge route
+ * is needed.
+ */
+export interface SlashCommand {
+  /** The command name WITHOUT the leading slash, e.g. `compact`. */
+  name: string
+  /** Display label, e.g. `Compact context`. */
+  label: string
+  /** One-line description for the panel autocomplete row. */
+  hint?: string
+  /** Takes a free-text argument: the panel fills `/name ` and waits for typed
+   *  input instead of sending on pick. Ignored on the glasses (fired bare). */
+  takesArg?: boolean
+  /** Heavy or destructive → don't fire on a single interaction. Glasses route it
+   *  through the confirm screen; the panel fills the box and waits for Send. */
+  confirm?: boolean
+}
+
+/**
  * A session as the bridge returns it — ALREADY guaranteed active+connected by
  * the server-side filter (GET /api/sessions never returns archived or dead ones).
  */

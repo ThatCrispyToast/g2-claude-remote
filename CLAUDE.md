@@ -160,6 +160,53 @@ npx @evenrealities/evenhub-cli qr --url http://<host>:5175   # sideload QR
   clears `pendingSend`; a deferred prompt still can't hijack the confirm screen
   (it's not `session`+`live`, so `armPrompt` defers).
 
+## Slash commands
+
+- **They ride `/send` — no bridge route.** A slash command is just a `/name`
+  message; RC workers execute it locally at zero cost (the same mechanism the
+  effort control's fallback uses — see rule 4). The Compose → Commands submenu
+  (`commandItems`, `fireSlashCommand`) and the panel's `/` autocomplete both go
+  through the existing `send`/`onSend` path. Adding a command is a `SLASH_COMMANDS`
+  config entry (`VITE_SLASH_COMMANDS` to override), never new bridge code.
+- **Curate to fire-and-observe commands only, and VALIDATE live.** Not every
+  command works over remote-control, and the failure modes are silent-ish:
+  - **Refused by the worker** — some print `"/<name> isn't available over Remote
+    Control."` as an assistant line and do nothing. Confirmed live (2026-07-17,
+    Haiku RC worker): `/status` and `/release-notes` both refuse this way. Keep
+    them out.
+  - **Not a real local command** — an unrecognized `/name` is NOT echoed as a
+    local command; it falls through to the model as a literal user message and
+    triggers a full (tool-using) turn. Confirmed: `/todos` did exactly this
+    (assistant → ToolSearch → TaskList). This is the worst case — it spends a
+    model turn — so never ship an unverified name.
+  - **Aliases** — `/cost` redirects to `/usage` (the echo shows
+    `<command-name>/usage`), so ship the canonical name.
+  - **Verified good** (local, `$0`, glanceable output): `/context`, `/usage`,
+    `/mcp`, `/compact`. `/clear` runs (no error, no model turn) but emits NO
+    `<local-command-stdout>`, so it gives no HUD feedback that it worked.
+  - Interactive ones (`/login`, `/config`, `/vim`, `/ide`, `/terminal-setup`)
+    have no remote meaning. Mind machine-global semantics too: like `/effort`,
+    some commands persist a machine default rather than being session-scoped.
+  - Test harness: send `/name` via `POST /api/sessions/<sid>/send`, then read
+    `/events` — a good command shows the `<command-name>` + `<local-command-stdout>`
+    echo with zero `result.usage.costUsd` and no assistant turn.
+- **`confirm:true` = don't fire on one interaction** (heavy/destructive, e.g.
+  `/compact`, `/clear`). On the glasses it routes through the send-confirm screen;
+  on the panel it fills the box and waits for an explicit Send. `takesArg:true`
+  makes the panel fill `/name ` and wait for a typed argument (glasses fire bare
+  — v1 has no on-glasses argument entry; dictated args are a planned fast-follow).
+- **Command echoes are cleaned on BOTH surfaces by `cleanUserEcho`** (exported
+  from `events/format.ts`, used by the HUD's `renderEvent` AND the panel's
+  `renderEventNode`). It unwraps `<command-name>` / `<command-args>` /
+  `<local-command-stdout>` to readable text and DROPS the `<local-command-caveat>`
+  block (that block is addressed to the model — "DO NOT respond to these
+  messages…" — so it's noise for the reader; a caveat-only event cleans to '' and
+  is dropped). Confirmed live in the simulator: without this the panel showed raw
+  `<command-name>/context</command-name>` + the caveat paragraph as message
+  bubbles. Note a local command still yields two user events that both read as the
+  command (the send + the `<command-name>` echo); the HUD's row-budgeted tail
+  usually hides the older one, the panel shows both — acceptable, not deduped.
+
 ## Config & secrets
 
 - **Layering, runtime wins:** panel-saved settings (`claude-remote.settings` in

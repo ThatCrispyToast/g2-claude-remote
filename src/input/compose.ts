@@ -2,7 +2,7 @@
 // can fire on a session by scrolling to one and tapping. Pure data + tiny
 // helpers; the state machine in main.ts drives selection and dispatch.
 
-import { EFFORTS, MODELS, MODES, QUICK_SENDS } from '../config'
+import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS } from '../config'
 import { HUD } from '../glasses'
 import type { EffortLevel, PermissionMode } from '../rc/types'
 
@@ -11,7 +11,7 @@ export type ComposeAction =
   | { kind: 'send'; label: string; text: string }
   | { kind: 'voice'; label: string }
   | { kind: 'interrupt'; label: string }
-  | { kind: 'submenu'; label: string; menu: 'model' | 'mode' | 'effort' }
+  | { kind: 'submenu'; label: string; menu: 'model' | 'mode' | 'effort' | 'command' }
   | { kind: 'archive'; label: string }
   | { kind: 'back'; label: string }
 
@@ -32,8 +32,11 @@ export function composeActions(opts: { voiceAvailable: boolean; pendingPrompt?: 
   if (opts.voiceAvailable) actions.push({ kind: 'voice', label: `${HUD.USER} Dictate a message` })
   // 2) One-tap canned sends.
   for (const q of QUICK_SENDS) actions.push({ kind: 'send', label: `${HUD.SEND} ${q.label}`, text: q.text })
-  // 3) Run controls, then steering, then the destructive/exit tail.
+  // 3) Run controls, then steering, then the destructive/exit tail. Commands leads
+  //    the submenu cluster; the `/` reads as "slash command" (a plain-ASCII glyph
+  //    the firmware font always renders).
   actions.push({ kind: 'interrupt', label: `${HUD.STOP} Interrupt` })
+  if (SLASH_COMMANDS.length) actions.push({ kind: 'submenu', label: `/ Commands ${HUD.GO}`, menu: 'command' })
   actions.push({ kind: 'submenu', label: `Model ${HUD.GO}`, menu: 'model' })
   actions.push({ kind: 'submenu', label: `Mode ${HUD.GO}`, menu: 'mode' })
   actions.push({ kind: 'submenu', label: `Effort ${HUD.GO}`, menu: 'effort' })
@@ -54,6 +57,21 @@ export function modelItems(current: string | null): SubmenuItem[] {
     label: `${m.id === current ? `${HUD.CUR} ` : '  '}${m.label}`,
     value: m.id,
     current: m.id === current,
+  }))
+  items.push({ label: `${HUD.BACK} Back`, value: '', current: false })
+  return items
+}
+
+/**
+ * The Commands submenu — each row fires a slash command (`/name`). A command is a
+ * one-shot action, not a persistent setting, so nothing is ever marked `current`;
+ * `value` carries the bare command name for the state machine to dispatch.
+ */
+export function commandItems(): SubmenuItem[] {
+  const items: SubmenuItem[] = SLASH_COMMANDS.map((c) => ({
+    label: `/ ${c.label}`,
+    value: c.name,
+    current: false,
   }))
   items.push({ label: `${HUD.BACK} Back`, value: '', current: false })
   return items

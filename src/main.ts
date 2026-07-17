@@ -14,14 +14,14 @@
 import { OsEventTypeList, waitForEvenAppBridge } from '@evenrealities/even_hub_sdk'
 import type { EvenAppBridge, EvenHubEvent } from '@evenrealities/even_hub_sdk'
 
-import { APP_TITLE, APP_TITLE_SHORT, BRIDGE_URL, HISTORY_WINDOW_BYTES, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES, LIVE_BODY_ROWS, POLL_MS, SETTINGS_KEY, currentBridge, isBridgeConfigured } from './config'
+import { APP_TITLE, APP_TITLE_SHORT, BRIDGE_URL, HISTORY_WINDOW_BYTES, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES, LIVE_BODY_ROWS, POLL_MS, SETTINGS_KEY, SLASH_COMMANDS, currentBridge, isBridgeConfigured } from './config'
 import { GlassesDisplay, HUD, clip, liveTail, screen, type Layout } from './glasses'
 import { HttpBridgeClient } from './rc/client'
 import { BridgeError } from './rc/types'
 import type { ActiveSession, Decision, DialogAnswer, DialogOption, DialogQuestion, EffortLevel, PermissionMode, RcEvent } from './rc/types'
 import { EventLog } from './events/log'
 import { isQuestionRequest } from './events/format'
-import { composeActions, effortItems, modelItems, modeItems, type ComposeAction, type SubmenuItem } from './input/compose'
+import { commandItems, composeActions, effortItems, modelItems, modeItems, type ComposeAction, type SubmenuItem } from './input/compose'
 import { VoiceDictation } from './input/voice'
 import { Panel } from './ui'
 
@@ -90,7 +90,7 @@ class App {
   private lastScrollAt = 0 // performance.now() of the last handled scroll (debounce)
 
   // compose / submenu
-  private submenuKind: 'model' | 'mode' | 'effort' = 'model'
+  private submenuKind: 'model' | 'mode' | 'effort' | 'command' = 'model'
   private submenu: SubmenuItem[] = []
   // Effort applied from this app, per session — the session object doesn't
   // expose effort, so this is the only "current" the submenu can mark.
@@ -1147,14 +1147,16 @@ class App {
     }
   }
 
-  private openSubmenu(kind: 'model' | 'mode' | 'effort'): void {
+  private openSubmenu(kind: 'model' | 'mode' | 'effort' | 'command'): void {
     this.submenuKind = kind
     this.submenu =
       kind === 'model'
         ? modelItems(this.session?.model ?? null)
         : kind === 'mode'
           ? modeItems(this.session?.permissionMode ?? null)
-          : effortItems(this.sid ? this.effortBySid.get(this.sid) : undefined)
+          : kind === 'effort'
+            ? effortItems(this.sid ? this.effortBySid.get(this.sid) : undefined)
+            : commandItems()
     this.listSelectIndex = 0 // native list starts highlighted at the top row
     this.go('submenu')
   }
@@ -1165,10 +1167,34 @@ class App {
       this.go('compose')
       return
     }
+    if (this.submenuKind === 'command') {
+      this.fireSlashCommand(item.value) // owns its own navigation (confirm vs fire+watch)
+      return
+    }
     if (this.submenuKind === 'model') void this.applyModel(item.value)
     else if (this.submenuKind === 'mode') void this.applyMode(item.value as PermissionMode)
     else void this.applyEffort(item.value)
     this.go('session')
+  }
+
+  /** Fire a slash command from the Commands submenu. Sent as a plain `/name`
+   *  message — the worker runs it locally at zero cost. A `confirm` command
+   *  (heavy/destructive, e.g. /compact, /clear) lands on the confirm screen first
+   *  so a stray tap can't fire it; the rest send immediately and jump to the live
+   *  tail so the wearer watches the command's output land. */
+  private fireSlashCommand(name: string): void {
+    const cmd = SLASH_COMMANDS.find((c) => c.name === name)
+    if (!cmd) {
+      this.go('session')
+      return
+    }
+    const text = `/${cmd.name}`
+    if (cmd.confirm) {
+      this.confirmSend(text, 'compose') // cancel returns to the Compose menu, one level up
+      return
+    }
+    void this.send(text)
+    this.goLiveSession()
   }
 
   // ── state transition + rendering ───────────────────────────────────────
@@ -1225,7 +1251,7 @@ class App {
       case 'submenu':
         return {
           kind: 'list',
-          header: `${this.submenuKind === 'model' ? 'Model' : this.submenuKind === 'mode' ? 'Permission mode' : 'Effort'} ${HUD.SEP} tap ${HUD.SEP} dbl = back`,
+          header: `${SUBMENU_TITLE[this.submenuKind]} ${HUD.SEP} tap ${HUD.SEP} dbl = back`,
           items: this.submenu.map((i) => i.label),
         }
       case 'session':
@@ -1359,6 +1385,15 @@ class App {
 }
 
 // ── small pure helpers ─────────────────────────────────────────────────────
+/** Header title per submenu kind (exhaustive, so a new kind can't silently
+ *  inherit the wrong label the way a fall-through ternary did). */
+const SUBMENU_TITLE: Record<'model' | 'mode' | 'effort' | 'command', string> = {
+  model: 'Model',
+  mode: 'Permission mode',
+  effort: 'Effort',
+  command: 'Commands',
+}
+
 function short(w: string | null | undefined): string {
   if (w === 'requires_action') return 'needs you'
   return w ?? 'idle'

@@ -15,8 +15,9 @@
 // No framework. (The glasses HUD in glasses.ts is a separate, firmware-native
 // monochrome surface and is not governed by this doc.)
 
-import type { ActiveSession, RcEvent, PermissionRequest, DialogQuestion, WhoAmI, Decision, PermissionMode } from './rc/types'
-import { EFFORTS, MODELS, MODES, QUICK_SENDS, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, loadRuntimeSettings, saveRuntimeSettings } from './config'
+import type { ActiveSession, RcEvent, PermissionRequest, DialogQuestion, WhoAmI, Decision, PermissionMode, SlashCommand } from './rc/types'
+import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, loadRuntimeSettings, saveRuntimeSettings } from './config'
+import { cleanUserEcho } from './events/format'
 
 /** Everything the panel calls back into main.ts to do — main.ts owns the bridge. */
 export interface PanelCallbacks {
@@ -125,6 +126,7 @@ export class Panel {
   private effortSel: HTMLSelectElement | null = null
   private archiveBtn: HTMLButtonElement | null = null
   private toastEl: HTMLDivElement | null = null
+  private cmdMenuEl: HTMLDivElement | null = null
 
   private mounted = false
   private dictating = false
@@ -133,6 +135,10 @@ export class Panel {
   private toastTimer: number | null = null
   /** sequenceNums already rendered in the log — dedupes the history↔stream seam. */
   private seen = new Set<number>()
+  // The `/`-autocomplete popover over the send box: the commands matching what's
+  // been typed after the leading slash, and the keyboard-highlighted row.
+  private cmdMatches: SlashCommand[] = []
+  private cmdIndex = 0
 
   constructor(private readonly cb: PanelCallbacks) {}
 
@@ -212,8 +218,9 @@ ${settingsHtml}
           <div id="log" class="log"></div>
 
           <div class="composer">
+            <div id="cmdMenu" class="cmd-menu" hidden></div>
             <textarea id="sendInput" class="send-input" rows="2"
-              placeholder="Message the session…" enterkeyhint="send"></textarea>
+              placeholder="Message the session… (/ for commands)" enterkeyhint="send"></textarea>
             <div id="interim" class="interim"></div>
             <div class="composer-row">
               <button id="sendBtn" class="btn primary">Send</button>
@@ -264,6 +271,7 @@ ${settingsHtml}
     this.effortSel = root.querySelector<HTMLSelectElement>('#effortSel')
     this.archiveBtn = root.querySelector<HTMLButtonElement>('#archiveBtn')
     this.toastEl = root.querySelector<HTMLDivElement>('#toast')
+    this.cmdMenuEl = root.querySelector<HTMLDivElement>('#cmdMenu')
 
     // Wire events.
     root.querySelector<HTMLButtonElement>('#exitBtn')?.addEventListener('click', () => this.cb.onExit())
@@ -271,8 +279,34 @@ ${settingsHtml}
     this.wireSettings(root)
 
     this.sendBtn?.addEventListener('click', () => this.doSend())
-    // Enter sends; Shift+Enter inserts a newline (a phone keyboard nicety).
+    // Typing after a leading `/` drives the command autocomplete.
+    this.sendInput?.addEventListener('input', () => this.updateCommandMenu())
     this.sendInput?.addEventListener('keydown', (e) => {
+      // While the command menu is open it owns the arrows / Enter / Escape, so a
+      // pick doesn't fall through to sending the half-typed `/co` literally.
+      if (this.cmdMenuOpen()) {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault()
+          this.moveCmd(1)
+          return
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault()
+          this.moveCmd(-1)
+          return
+        }
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault()
+          this.chooseCmd(this.cmdIndex)
+          return
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault()
+          this.hideCommandMenu()
+          return
+        }
+      }
+      // Enter sends; Shift+Enter inserts a newline (a phone keyboard nicety).
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault()
         this.doSend()
@@ -370,10 +404,110 @@ ${settingsHtml}
   private doSend(): void {
     const text = this.sendInput?.value.trim() ?? ''
     if (!text) return
+    this.hideCommandMenu()
     this.cb.onSend(text)
     if (this.sendInput) {
       this.sendInput.value = ''
       this.sendInput.blur() // dismiss the mobile keyboard
+    }
+  }
+
+  // ── Slash-command autocomplete ─────────────────────────────────────────────
+  // Typing `/` in the send box pops a filtered command menu above it, mirroring
+  // Claude Code's own `/` menu. A command is sent as a plain `/name` message
+  // (main.ts → the bridge's /send route); the worker runs it locally. Commands
+  // that take an argument or are heavy/destructive (`confirm`) fill the box and
+  // wait for an explicit Send instead of firing on pick — the panel never routes
+  // through the glasses' confirm screen, so "don't fire on one tap" is honored by
+  // filling-and-waiting here.
+
+  private cmdMenuOpen(): boolean {
+    return !!this.cmdMenuEl && !this.cmdMenuEl.hidden && this.cmdMatches.length > 0
+  }
+
+  /** Recompute matches from the send box and show/hide the menu. Active only
+   *  while typing the command NAME: a leading `/` and no space yet (a space means
+   *  they've moved on to the argument). */
+  private updateCommandMenu(): void {
+    const val = this.sendInput?.value ?? ''
+    const m = /^\/([a-z0-9:_-]*)$/i.exec(val)
+    if (!m || SLASH_COMMANDS.length === 0) {
+      this.hideCommandMenu()
+      return
+    }
+    const q = m[1].toLowerCase()
+    const matches = SLASH_COMMANDS.filter(
+      (c) => c.name.toLowerCase().startsWith(q) || (!!q && c.label.toLowerCase().includes(q)),
+    )
+    if (matches.length === 0) {
+      this.hideCommandMenu()
+      return
+    }
+    this.cmdMatches = matches
+    if (this.cmdIndex >= matches.length) this.cmdIndex = 0
+    this.renderCommandMenu()
+    if (this.cmdMenuEl) this.cmdMenuEl.hidden = false
+  }
+
+  private renderCommandMenu(): void {
+    const menu = this.cmdMenuEl
+    if (!menu) return
+    menu.textContent = ''
+    this.cmdMatches.forEach((c, i) => {
+      const row = document.createElement('button')
+      row.type = 'button'
+      row.className = `cmd-row${i === this.cmdIndex ? ' active' : ''}`
+      const name = document.createElement('span')
+      name.className = 'cmd-name'
+      name.textContent = `/${c.name}`
+      row.appendChild(name)
+      const hint = c.hint ?? c.label
+      if (hint) {
+        const h = document.createElement('span')
+        h.className = 'cmd-hint'
+        h.textContent = hint
+        row.appendChild(h)
+      }
+      // The menu isn't blur-hidden, so it survives the textarea losing focus on
+      // tap and a plain click lands on the row (portable across touch). chooseCmd
+      // re-focuses the box itself on the fill path.
+      row.addEventListener('click', () => this.chooseCmd(i))
+      menu.appendChild(row)
+    })
+  }
+
+  private moveCmd(delta: number): void {
+    const n = this.cmdMatches.length
+    if (n === 0) return
+    this.cmdIndex = (this.cmdIndex + delta + n) % n
+    this.renderCommandMenu()
+  }
+
+  /** Pick command `i`: fire it (plain), or fill the box and wait for Send (takes an
+   *  argument, or is `confirm`-gated). */
+  private chooseCmd(i: number): void {
+    const cmd = this.cmdMatches[i]
+    if (!cmd || !this.sendInput) return
+    this.hideCommandMenu()
+    if (cmd.takesArg || cmd.confirm) {
+      this.sendInput.value = cmd.takesArg ? `/${cmd.name} ` : `/${cmd.name}`
+      this.sendInput.focus()
+      // Keep the caret at the end so a typed argument appends cleanly.
+      const end = this.sendInput.value.length
+      this.sendInput.setSelectionRange(end, end)
+      return
+    }
+    this.cb.onSend(`/${cmd.name}`)
+    this.sendInput.value = ''
+    this.sendInput.blur()
+  }
+
+  private hideCommandMenu(): void {
+    this.cmdIndex = 0
+    this.cmdMatches = []
+    if (this.cmdMenuEl) {
+      this.cmdMenuEl.hidden = true
+      this.cmdMenuEl.textContent = ''
     }
   }
 
@@ -465,6 +599,7 @@ ${settingsHtml}
   // ── Detail view (reveal / header / control-enable) ────────────────────────
   setActiveSession(session: ActiveSession | null): void {
     this.currentSid = session?.id ?? null
+    this.hideCommandMenu() // never carry a stale popover across an open/close
     const showDetail = session !== null
     if (this.listView) this.listView.hidden = showDetail
     if (this.detailView) this.detailView.hidden = !showDetail
@@ -708,8 +843,11 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
     }
 
     case 'user': {
-      const text = e.text.trim()
-      if (!text) return null // bare tool_result echo — noise
+      // Clean local-command echoes the same way the HUD does: strip the
+      // model-directed caveat block and unwrap `<command-name>` / stdout tags, so
+      // a fired slash command reads as `/context`, not raw XML tag soup.
+      const text = cleanUserEcho(e.text).trim()
+      if (!text) return null // bare tool_result echo / caveat-only — noise
       // Your message → a right-aligned dark bubble (the doc's BC-Highlight
       // treatment); the assistant's replies stay as plain flowing text.
       const row = document.createElement('div')
@@ -948,7 +1086,7 @@ function injectStyles(): void {
       border: 1px solid var(--line); border-radius: var(--r-in); white-space: pre-wrap; word-break: break-word; }
 
     /* ── Composer ────────────────────────────────────────────────────────── */
-    .composer { display: flex; flex-direction: column; gap: 8px; }
+    .composer { position: relative; display: flex; flex-direction: column; gap: 8px; }
     .send-input { width: 100%; box-sizing: border-box; resize: vertical; min-height: 48px; padding: 12px 14px;
       font: 300 15px/1.45 var(--font); letter-spacing: -0.01em; color: var(--tc-1st); background: var(--sc-2nd);
       border: 1px solid transparent; border-radius: var(--r); outline: none; -webkit-appearance: none; }
@@ -961,6 +1099,20 @@ function injectStyles(): void {
        not a ragged auto-wrap. Each row's chips share the width equally. */
     .quick-row { display: flex; flex-wrap: wrap; gap: 8px; }
     .quick-row .quick { flex: 1 1 30%; min-width: 96px; }
+
+    /* ── Slash-command autocomplete (floats above the composer) ───────────── */
+    .cmd-menu { position: absolute; left: 0; right: 0; bottom: 100%; margin-bottom: 6px; z-index: 5;
+      max-height: 232px; overflow-y: auto; display: flex; flex-direction: column;
+      background: var(--bc-1st); border: 1px solid var(--line); border-radius: var(--r); box-shadow: var(--shadow); }
+    .cmd-menu[hidden] { display: none; }
+    .cmd-row { display: flex; align-items: baseline; gap: 10px; width: 100%; box-sizing: border-box;
+      text-align: left; padding: 11px 13px; background: transparent; border: 0; border-bottom: 1px solid var(--line);
+      cursor: pointer; }
+    .cmd-row:last-child { border-bottom: 0; }
+    .cmd-row.active, .cmd-row:active { background: var(--bc-2nd); }
+    .cmd-name { flex: 0 0 auto; font: 400 14px/1.2 var(--mono); color: var(--tc-1st); }
+    .cmd-hint { flex: 1 1 auto; min-width: 0; font-size: 13px; font-weight: 300; color: var(--tc-2nd);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; }
 
     /* ── Steering ────────────────────────────────────────────────────────── */
     .steer { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-items: end; }

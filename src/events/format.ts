@@ -72,17 +72,22 @@ export function cleanProse(text: string): string {
 /**
  * Local slash-command echoes arrive as user messages wrapped in XML-ish tags
  * (`<command-name>`, `<command-args>`, `<local-command-stdout>`) — raw tag soup
- * on the HUD. Keep the gist: the command line, or the stdout's inner text.
+ * otherwise. Keep the gist: the command line, or the stdout's inner text. The
+ * `<local-command-caveat>` block is addressed to the MODEL ("DO NOT respond to
+ * these messages…"), never the reader, so it's stripped first; an event that was
+ * only the caveat cleans to '' and is dropped from the log. Shared by the HUD
+ * (`renderEvent`) and the panel (`ui.ts`) so both render command echoes the same.
  */
-function cleanUserEcho(text: string): string {
-  const cmd = /<command-name>([^<]*)<\/command-name>/.exec(text)?.[1]
+export function cleanUserEcho(text: string): string {
+  const stripped = text.replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/g, '').trim()
+  const cmd = /<command-name>([^<]*)<\/command-name>/.exec(stripped)?.[1]
   if (cmd) {
-    const args = /<command-args>([^<]*)<\/command-args>/.exec(text)?.[1] ?? ''
+    const args = /<command-args>([^<]*)<\/command-args>/.exec(stripped)?.[1] ?? ''
     return `${cmd} ${args}`.trim()
   }
-  const stdout = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/.exec(text)?.[1]
+  const stdout = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/.exec(stripped)?.[1]
   if (stdout != null) return stdout.trim()
-  return text
+  return stripped
 }
 
 /** One `◆ Name  summary` line per tool_use (over-long summaries are clipped). */
