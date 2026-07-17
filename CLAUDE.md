@@ -141,6 +141,25 @@ npx @evenrealities/evenhub-cli qr --url http://<host>:5175   # sideload QR
   it is snapshotted into `composeItems` on entry so a mid-menu stream event
   can't desync the firmware row → action map.
 
+## Send confirmation
+
+- **A message never fires on one tap.** Both a canned quick-send (Compose) and a
+  finished dictation route through the `confirm` screen (`confirmSend` →
+  `pendingSend` → `commitPendingSend`/`cancelPendingSend`), so a stray touchpad
+  tap can't send the wrong thing. It's the same native `scroll` layout as the
+  voice screen — full message in the natively-scrolled body, `tap = send`,
+  `dbl = cancel` — so a long dictation can be read back before it goes.
+- **Glasses-only guard.** The panel's quick-send / Dictate controls are explicit
+  buttons (not misclick-prone), so they still send directly via `commitVoice` /
+  `onSend`; don't add a panel confirm. The voice screen's tap now **reviews**
+  (`reviewDictation`, footer `tap = done`), it no longer sends — `commitVoice`
+  survives only for the panel's Stop button.
+- **Cancel returns to `pendingSend.back`:** the Compose menu for a canned send
+  (so re-pick is one tap; `listSelectIndex` is reset to match the rebuilt list),
+  the live session for a dictation (its mic is already closed). `backToList`
+  clears `pendingSend`; a deferred prompt still can't hijack the confirm screen
+  (it's not `session`+`live`, so `armPrompt` defers).
+
 ## Config & secrets
 
 - **Layering, runtime wins:** panel-saved settings (`claude-remote.settings` in

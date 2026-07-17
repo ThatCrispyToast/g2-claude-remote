@@ -25,7 +25,7 @@ import { composeActions, effortItems, modelItems, modeItems, type ComposeAction,
 import { VoiceDictation } from './input/voice'
 import { Panel } from './ui'
 
-type State = 'boot' | 'setup' | 'list' | 'session' | 'compose' | 'submenu' | 'voice' | 'permission' | 'question' | 'error'
+type State = 'boot' | 'setup' | 'list' | 'session' | 'compose' | 'submenu' | 'voice' | 'confirm' | 'permission' | 'question' | 'error'
 
 const CLICK = OsEventTypeList.CLICK_EVENT // 0
 const SCROLL_UP = OsEventTypeList.SCROLL_TOP_EVENT // 1
@@ -105,6 +105,13 @@ class App {
 
   // voice
   private interim = ''
+
+  // A canned or dictated message the wearer is about to send, held on the
+  // confirmation screen so a single stray tap in the Compose menu or the voice
+  // screen can't fire it. Tap Send commits; double-tap backs out to `back`
+  // without sending (the Compose menu for a canned send, the session view for a
+  // dictation — its mic is already closed by then). See confirmSend().
+  private pendingSend: { text: string; back: 'compose' | 'session' } | null = null
 
   // Blocking prompts (tool-permissions and questions). `prompts` is the FIFO of
   // UNRESOLVED blocking controls; `prompts[0]` is the ARMED one — published to
@@ -420,6 +427,7 @@ class App {
 
   private backToList(): void {
     this.teardownVoice() // an involuntary exit must never leave the mic hot
+    this.pendingSend = null // drop any unconfirmed send
     this.closeStream()
     this.sid = null
     this.session = null
@@ -787,17 +795,35 @@ class App {
     })
   }
 
-  private async commitVoice(): Promise<void> {
-    if (!this.voice) return
+  /** Stop the mic, clear the dictation UI, and return the trimmed transcript. */
+  private async finishDictation(): Promise<string> {
+    if (!this.voice) return ''
     const text = await this.voice.stop()
     this.interim = ''
     this.panel.setInterim('')
     this.panel.setDictating(false)
+    return text
+  }
+
+  /** Panel Stop button: finish dictating and send straight away — an explicit
+   *  press on a real button, not a stray glasses tap, so no confirm step. */
+  private async commitVoice(): Promise<void> {
+    const text = await this.finishDictation()
     if (text) await this.send(text)
     if (this.state === 'voice') {
       if (text) this.goLiveSession() // sent → watch it run
       else this.go('session')
     }
+  }
+
+  /** Glasses tap: finish dictating and REVIEW the transcript before it sends — a
+   *  stray tap while dictating shouldn't fire a half-finished message. An empty
+   *  transcript just drops back to the session. */
+  private async reviewDictation(): Promise<void> {
+    const text = await this.finishDictation()
+    if (this.state !== 'voice') return // involuntarily left the voice screen meanwhile
+    if (text) this.confirmSend(text, 'session')
+    else this.go('session')
   }
 
   private async cancelVoice(): Promise<void> {
@@ -806,6 +832,41 @@ class App {
     this.panel.setInterim('')
     this.panel.setDictating(false)
     if (this.state === 'voice') this.go('session')
+  }
+
+  // ── send confirmation (misclick guard) ─────────────────────────────────────
+  // The Compose menu is scroll-to-select-then-tap, so a stray tap lands on the
+  // wrong row and fires a canned send; a tap while dictating fires a possibly
+  // half-finished transcript. Both now route through one confirmation screen —
+  // the full message on a natively-scrolled body, tap to send, double-tap to back
+  // out (the same idiom as the voice screen). It's a glasses-only guard: the
+  // panel's quick-send / dictate controls are explicit buttons, not misclick-prone.
+
+  /** Hold a would-be message on the confirmation screen. `back` is where a cancel
+   *  returns: the Compose menu for a canned send, the session view for a dictation. */
+  private confirmSend(text: string, back: 'compose' | 'session'): void {
+    this.pendingSend = { text, back }
+    this.go('confirm')
+  }
+
+  /** Tapped Send on the confirmation screen → dispatch the held message. */
+  private commitPendingSend(): void {
+    const p = this.pendingSend
+    this.pendingSend = null
+    if (!p) {
+      this.go('session')
+      return
+    }
+    void this.send(p.text)
+    this.goLiveSession() // sent → watch it run
+  }
+
+  /** Double-tapped the confirmation screen → return without sending anything. */
+  private cancelPendingSend(): void {
+    const back = this.pendingSend?.back ?? 'session'
+    this.pendingSend = null
+    this.listSelectIndex = 0 // Compose rebuilds highlighted at row 0 — keep them in sync
+    this.go(back)
   }
 
   // ── EvenHub event routing (glasses only) ───────────────────────────────
@@ -875,7 +936,10 @@ class App {
         this.fireSubmenu()
         break
       case 'voice':
-        void this.commitVoice()
+        void this.reviewDictation() // finish dictating → review before sending
+        break
+      case 'confirm':
+        this.commitPendingSend() // tap = send the held message
         break
       case 'permission':
         void this.answerPermission(this.listSelectIndex >= 1 ? 'deny' : 'allow') // tap the highlighted Allow/Deny row
@@ -906,6 +970,9 @@ class App {
         break
       case 'voice':
         void this.cancelVoice()
+        break
+      case 'confirm':
+        this.cancelPendingSend() // dbl-tap = back out without sending
         break
       case 'permission':
         this.snoozePrompt() // dbl-tap sets the permission aside to answer later
@@ -1051,8 +1118,7 @@ class App {
         this.presentPrompt() // reopen the set-aside question / permission screen
         break
       case 'send':
-        void this.send(action.text)
-        this.goLiveSession()
+        this.confirmSend(action.text, 'compose') // confirm before firing a canned send
         break
       case 'voice':
         void this.startVoice()
@@ -1173,8 +1239,10 @@ class App {
           kind: 'scroll',
           header: `${HUD.RUN} Listening`,
           body: this.interim ? liveTail(this.interim) : '(speak now)',
-          footer: `tap = send ${HUD.SEP} dbl = cancel`,
+          footer: `tap = done ${HUD.SEP} dbl = cancel`,
         }
+      case 'confirm':
+        return this.confirmLayout()
       case 'setup':
         // A pinned header + footer (scroll layout) so the retry hint always shows
         // and the body never overflows into a scrollbar the way a full-screen text
@@ -1258,6 +1326,19 @@ class App {
       kind: 'list',
       header: `${HUD.ATTN} ${prefix}${clip(head, 84, HUD.ELL)}`,
       items: [...options.map(optionLabel), `${HUD.BACK} Dismiss`],
+    }
+  }
+
+  /** Confirm a canned or dictated message before it sends. The full message rides
+   *  in the natively-scrolled body (so a long dictation can be read back and
+   *  scrolled), and the tap = send / double-tap = cancel idiom matches the voice
+   *  screen the wearer may have just come from. */
+  private confirmLayout(): Layout {
+    return {
+      kind: 'scroll',
+      header: `${HUD.SEND} Send this message?`,
+      body: this.pendingSend?.text || '(empty)',
+      footer: `tap = send ${HUD.SEP} dbl = cancel`,
     }
   }
 

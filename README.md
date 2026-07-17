@@ -75,7 +75,8 @@ account. See [`server/README.md`](server/README.md) for flags and env vars.
 | **Session view** | native scroll — up into history, back down to live | open Compose menu | back to list |
 | **Compose menu** | move selection | fire action / enter submenu | back to session |
 | **Model / Mode / Effort submenu** | move selection | apply | back to Compose |
-| **Voice dictation** | scroll transcript | send | cancel |
+| **Voice dictation** | scroll transcript | done — review before it sends | cancel |
+| **Confirm send** | scroll the message | send | cancel |
 | **Permission prompt** | move between Allow / Deny | pick | set aside |
 | **Question** | move between options | pick (`Dismiss` cancels) | set aside |
 
@@ -85,6 +86,10 @@ back down and it re-attaches to the tail. The Compose menu leads with Dictate,
 then the configurable quick-sends (`Proceed`, `Run tests`, `Explain`),
 `Interrupt`, `Model`, `Mode`, `Effort` (reasoning effort:
 `auto`/`low`/`medium`/`high`/`xhigh`), and `Archive`.
+
+A canned send or a finished dictation never fires on that single tap - it lands
+on a confirmation screen showing the full message, so a stray tap on the touchpad
+can't send the wrong thing. Tap to send, double-tap to back out.
 
 When a session blocks on you, the matching Permission or Question screen
 appears. It appears immediately if you're watching the live tail; otherwise it
