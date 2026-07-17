@@ -1,232 +1,154 @@
 # Claude Remote
 
-Monitor and control **active** [Claude Code Remote
-Control](https://docs.anthropic.com/en/docs/claude-code) sessions from a pair of
-**Even Realities G2** glasses. Scroll the touchpad through your live Claude
-sessions, tap into one to watch its event stream roll across the HUD, and steer
-it hands-free — approve a permission prompt, answer a question, fire a canned
-reply, dictate a message by voice, interrupt, switch model or permission mode —
-all without a keyboard. A companion phone panel mirrors everything with a richer
+Monitor and steer [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+remote-control sessions from a pair of **Even Realities G2** smart glasses.
+
+Scroll through your live sessions on the HUD, tap into one to watch its event
+stream, and steer it hands-free: approve permission prompts, answer questions,
+send canned replies, dictate a message by voice, interrupt, or switch model and
+permission mode. A companion phone panel mirrors everything with a richer
 control surface.
 
-It is the glasses front-end to
-[`claude-rc-api`](https://github.com/ThatCrispyToast/claude-rc-api) (the
-unofficial Python client for the Claude Code Remote Control API), talking to it
-through a small bridge that runs on any machine logged in to Claude Code.
+Only sessions that are **active and connected** are ever shown or steered —
+archived and dead sessions are filtered out server-side, and every control
+action re-checks.
 
-> **Only active sessions, ever.** The app surfaces and steers *only* sessions
-> that are `active` **and** whose remote-control worker is `connected`. Archived
-> sessions and dead ones (worker gone) are filtered out server-side in the bridge
-> and every control action re-checks — you can never act on one.
-
-## Architecture
+## How it works
 
 ```
-┌───────────────────────────┐        ┌──────────────────────────────────────┐
-│ G2 glasses (576×288, BLE) │        │ your Claude Code host                  │
-│ touchpad + mic            │        │                                        │
-└─────────────┬─────────────┘        │  server/rc_bridge.py   0.0.0.0:8790    │
-   even_hub_sdk bridge                │   • active-only filter + 409 gate      │
-┌─────────────┴─────────────┐  HTTP  │   • bearer auth + CORS                 │
-│ Even phone app (WebView)  │  + SSE │   • answers permission prompts         │
-│  ┌─────────────────────┐  │───────▶│   • wraps claude-rc-api                │
-│  │ Claude Remote       │  │◀───────│         RemoteControlClient            │
-│  │  glasses + panel    │  │  SSE   └──────────────┬───────────────────────┘
-│  └─────────────────────┘  │                       ▼  OAuth (~/.claude)
-└─────────────┬─────────────┘              Anthropic /v1/code/sessions
-      mic PCM ─┘ ─▶ Deepgram wss (voice dictation → a message)
+G2 glasses (576×288 HUD · touchpad · mic)
+        │ BLE
+        ▼
+Even phone app — runs this app (glasses UI + companion panel)
+        │ HTTP + SSE · bearer token · LAN / Tailscale
+        ▼
+claude-remote-bridge (server/) — wraps claude-rc-api
+        │ your Claude Code OAuth login (~/.claude)
+        ▼
+Anthropic Remote Control API
 ```
 
-Two pieces:
+- **The bridge** ([`server/`](server/README.md), installable as
+  `claude-remote-bridge`) runs on any machine logged in to Claude Code. It's a
+  small, dependency-free JSON+SSE server over
+  [`claude-rc-api`](https://github.com/ThatCrispyToast/claude-rc-api) that adds
+  the active-only filter, bearer-token auth, and routes for answering blocking
+  permission prompts and questions (which the stock tooling cannot do). It uses
+  the host's own OAuth login and survives token rotation.
+- **The app** (`src/`, packed into an `.ehpk`) runs inside the Even phone app
+  and renders on the glasses. Bridge URL, token, and Deepgram key are entered
+  at runtime in the panel's Settings card, so distributed builds contain no
+  secrets.
 
-- **The bridge** (`server/`, installable as `claude-remote-bridge`) runs on the
-  machine where you're logged in to Claude Code. It is a dependency-free
-  `http.server` that reuses
-  `claude-rc-api`'s `RemoteControlClient`, so it adds no new Anthropic code —
-  just the active-only filter, a shared-secret guard (it binds beyond loopback
-  so the phone can reach it over Tailscale/LAN), CORS for the WebView, and
-  `control_response` builders for answering permission prompts and questions
-  (which the stock `claude-rc web` cannot do). It authenticates with the host's
-  own Claude Code OAuth login (`~/.claude/.credentials.json`) and **survives
-  token rotation** — when Claude Code (or anything else) refreshes the OAuth
-  tokens on disk, the long-running bridge picks the new ones up automatically.
-- **The app** (this repo's TypeScript, packed into a `.ehpk`) runs inside the
-  Even phone app and renders on the glasses. It is shipped as a prebuilt
-  artifact: bridge URL, token, and Deepgram key can all be entered at runtime in
-  the companion panel's **Settings** card (stored only on the device), so no
-  secrets are ever baked into a distributed build.
+Voice dictation streams mic audio from the phone to
+[Deepgram](https://deepgram.com) and sends the final transcript as a message.
 
-## Use it (three steps)
+## Quick start
 
 1. **Install the app** on your glasses — from the Even Hub, or sideload a
    packed `claude-remote-<version>.ehpk`.
 2. **Run the bridge** on the machine where you're logged in to Claude Code
-   (`claude` → `/login` with a claude.ai account, and at least one
-   `claude remote-control` session running). With
-   [uv](https://docs.astral.sh/uv/) installed, it's one command:
+   (needs [uv](https://docs.astral.sh/uv/)):
 
    ```bash
    uvx --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge
    ```
 
-   It prints every URL your phone can reach it at (localhost / LAN IP /
-   Tailscale IP) and a bearer token — a short word passphrase like
-   `coral-anvil-mango-scoop-visor-troll` (built to be typed by hand),
-   auto-generated on first run and persisted to
-   `~/.config/claude-remote/bridge-token`. Copy one URL + the token into the
-   app panel's **Settings** card. Done — the glasses show your live sessions.
-3. **Optionally add a [Deepgram](https://console.deepgram.com) API key** in the
-   same Settings card to enable voice dictation. Without one, voice quietly
-   disables itself and everything else still works.
+   It prints the URLs your phone can reach it at and a bearer token — a word
+   passphrase like `coral-anvil-mango-scoop-visor-troll`, generated on first
+   run and persisted to `~/.config/claude-remote/bridge-token`. Enter one URL
+   and the token in the panel's **Settings** card.
+3. **Optional:** add a [Deepgram](https://console.deepgram.com) API key in the
+   same Settings card to enable voice dictation. Without one, voice disables
+   itself and everything else still works.
 
-The pieces connect by local or Tailscale IP on your own network — no tunnel or
-public exposure is needed (or advisable). See [`server/README.md`](server/README.md)
-for bridge flags (`--port`, `--token`, `--open`, …) and env vars.
-
-## Develop / build from source
-
-Needs Node 18+ (the app) and Python 3.10+ with uv (the bridge).
-
-```bash
-git clone https://github.com/ThatCrispyToast/g2-claude-remote && cd g2-claude-remote
-npm install
-cp .env.example .env.local             # optional: bake defaults into your builds
-
-npm run bridge                         # the bridge, from the checkout → 0.0.0.0:8790
-npm run dev                            # the app's dev server → http://0.0.0.0:5175
-
-# load it on the glasses (phone on the same Wi-Fi / Tailscale network)
-npx @evenrealities/evenhub-cli qr --url http://<host>:5175 --external
-```
-
-`VITE_BRIDGE_TOKEN` in `.env.local` doubles as the bridge's shared secret — the
-bridge reads the same file, so setting it once configures both sides (an
-`RC_BRIDGE_TOKEN` env var overrides it; with neither set the bridge generates a
-token and prints it). Point `VITE_BRIDGE_URL` at a name the **phone** can
-reach — the host's Tailscale IP/MagicDNS name or a LAN IP. Developing on
-`claude-rc-api` at the same time? Clone it next to this repo — the bridge
-auto-detects the sibling checkout (`npm run bridge:uv` runs it through that
-checkout's uv environment).
-
-### Package for distribution
-
-```bash
-npm run pack                           # build → app.local.json → claude-remote-<version>.ehpk
-```
-
-`pack` builds the bundle, then generates `app.local.json` from `app.json` +
-`.env.local`: your bridge host is added to the manifest's network whitelist
-(plus anything in `VITE_NET_WHITELIST_EXTRA`) and the version is stamped from
-`package.json`. Values in `.env.local` are baked into the bundle as defaults,
-but every secret can be overridden at runtime from the panel's Settings card —
-so you can also pack with an empty `.env.local` and configure after install.
-
-> The tracked manifest whitelists `"*"`. If your Even app build enforces exact
-> origins instead of honoring the wildcard, repack with your bridge URL in
-> `.env.local` so the concrete origin is whitelisted too.
+Keep the bridge on a private network (LAN or Tailscale): the token is the only
+guard, and it can read and steer every remote-control session of the logged-in
+account. See [`server/README.md`](server/README.md) for flags and env vars.
 
 ## Controls
-
-Four gestures drive everything. Nothing is free-form: each screen presents a
-small ordered set of targets a cursor walks.
 
 | Screen | Scroll ↑ / ↓ | Tap | Double-tap |
 |---|---|---|---|
 | **Sessions list** | move selection | open session | exit app |
-| **Session view** | smooth native scroll — up drops into history, scroll back down returns to live | open Compose menu | back to list |
+| **Session view** | native scroll — up into history, back down to live | open Compose menu | back to list |
 | **Compose menu** | move selection | fire action / enter submenu | back to session |
 | **Model / Mode submenu** | move selection | apply | back to Compose |
-| **Voice dictation** | scroll the transcript | send transcript | cancel (mic off) |
-| **Permission prompt** | move between Allow / Deny | **pick** the highlighted action | **set aside** — answer later |
-| **Question** (dialog) | move between the options | **pick** it (or the `Dismiss` row to cancel) | **set aside** — answer later |
+| **Voice dictation** | scroll transcript | send | cancel |
+| **Permission prompt** | move between Allow / Deny | pick | set aside |
+| **Question** | move between options | pick (`Dismiss` cancels) | set aside |
 
-The session view is a fixed header + a **firmware-scrolled** transcript body (in a
-subtle frame that sets it off from the header and footer) + a fixed footer. The
-glasses scroll the body natively (the smooth "Text: basic" feel), so there's no
-software paging. **Every session opens on its tail** — the newest lines, budgeted
-by estimated visual rows so they always fit the body with nothing hidden below
-the fold (the firmware draws text top-aligned and never auto-scrolls, so an
-overflowing "live" body would hide exactly the newest output). While the session
-runs the tail auto-follows (`● live`); idle it just sits on the latest output
-(`○ latest`). Scrolling up freezes a multi-screen history window you swipe
-through; scrolling back down to the bottom re-attaches to the tail.
+Every session opens on its newest output and auto-follows while running
+(`● live`); scrolling up freezes a history window you swipe through, and
+scrolling back down re-attaches to the tail. The **Compose** menu leads with
+**Dictate**, followed by configurable quick-sends (`Continue`, `Yes`, …),
+`Interrupt`, `Model`, `Mode`, and `Archive`.
 
-**Compose** leads with **Dictate** (voice) — the primary open-ended input on a
-keyboard-less device — then your canned quick-sends (`Continue`, `Yes`, `Run the
-tests`, …, configurable), `Interrupt`, `Model ▸`, `Mode ▸`, and `Archive`. When a
-session blocks on you, the right screen appears: a **Permission** screen that
-lists Allow / Deny (with the tool + command in the header — scroll to one and tap
-to decide), or — for a question like `AskUserQuestion` or a plan dialog — a
-**Question** screen that lists the options so you scroll to one and tap to pick it
-(the `Dismiss` row cancels it outright). Prompts are **polite**: one shows
-immediately only while you're passively watching the live tail (or when you open a
-session that is already blocked); if you're mid-menu, mid-dictation, or reading
-back history it waits (footer shows `! needs you`) and presents itself when you
-come back. And **no blocking screen is a trap**: if it's just bad timing,
-**double-tap to set the prompt aside** — nothing is sent, it stays pending (the
-footer keeps nagging `! needs you`), and the Compose menu grows an **Answer
-question** / **Review permission** row so you reopen it on your own terms. Unlike
-an ordinary deferral, a set-aside prompt won't pop itself back up when you return
-to the live tail. Prompts you answer elsewhere (the panel, another controller, the
-terminal) retire themselves, and stale or replayed ones never resurface.
+When a session blocks on you, the matching **Permission** or **Question**
+screen appears — immediately if you're watching the live tail, otherwise once
+you return (the footer shows `! needs you` meanwhile). No blocking screen is a
+trap: double-tap **sets the prompt aside** without answering anything, and an
+**Answer question** / **Review permission** row appears in the Compose menu to
+reopen it on your own terms. Prompts answered elsewhere (the panel, the
+terminal, another controller) retire themselves.
 
-The **companion panel** (the same bundle, shown in the phone WebView) mirrors all
-of this and adds a free-text send box, a full un-clipped event log with tool
-inputs and usage/cost, one-click steering, and the **Settings** card for entering
-your bridge URL, token, and Deepgram key on the device.
+The **companion panel** in the phone WebView mirrors all of this and adds
+free-text sends, the full un-clipped event log with tool inputs and usage/cost,
+and the Settings card.
 
 ## Configuration
 
-Two layers, highest wins:
+Two layers on the app side, highest wins:
 
-1. **Runtime settings** — the panel's Settings card (bridge URL, bridge token,
-   Deepgram key). Stored in the WebView's localStorage, never leaves the device.
-   This is how a prebuilt `.ehpk` gets configured.
-2. **Build-time env** — `VITE_*` vars in `.env.local` (see `.env.example`),
-   baked in as defaults by Vite. Required for self-builds: `VITE_BRIDGE_URL`,
-   `VITE_BRIDGE_TOKEN`. Optional: `VITE_POLL_MS` (list refresh),
-   `VITE_LIVE_BODY_BYTES` / `VITE_HISTORY_BYTES` (session live-tail and
-   history-window sizes, in bytes), `VITE_QUICK_SENDS` (JSON list of canned
-   messages), and the Deepgram voice knobs (`VITE_DEEPGRAM_API_KEY`, …).
+1. **Runtime settings** — the panel's Settings card (bridge URL, token,
+   Deepgram key), stored in the device's localStorage. This is how a prebuilt
+   `.ehpk` is configured.
+2. **Build-time defaults** — `VITE_*` vars in `.env.local`, baked in by Vite.
+   See [`.env.example`](.env.example) for the full list (poll interval, HUD
+   window sizes, quick-sends, voice knobs).
 
-Bridge-side: CLI flags, or `RC_BRIDGE_HOST` / `RC_BRIDGE_PORT` /
-`RC_BRIDGE_TOKEN` / `RC_BRIDGE_TOKEN_WORDS` / `RC_BRIDGE_VERBOSE` — each read from
-the environment first, then from `.env.local` (where `VITE_BRIDGE_TOKEN` also
-counts as the token), so one file configures everything. With no token configured
-anywhere the bridge generates a word-passphrase token (`RC_BRIDGE_TOKEN_WORDS`
-words, default 6 ≈ 62 bits), persists it to
-`~/.config/claude-remote/bridge-token`, and prints it at startup.
+The bridge takes CLI flags and `RC_BRIDGE_*` env vars, and also reads
+`.env.local` (`VITE_BRIDGE_TOKEN` doubles as its token) — one file configures
+both sides.
 
-## Answering permission prompts and questions
+## Development
 
-A running session can block the turn on you in **two** ways, and the bridge closes
-both loops (neither `claude-rc web` nor `RemoteControlClient` can):
+Node 18+ for the app, Python 3.10+ with uv for the bridge.
 
-- **Tool-permission** (`control_request` `subtype: "can_use_tool"`) — the
-  `POST …/permission` route builds a `control_response` whose outer
-  `subtype:"success"` wraps an inner `behavior:"allow"|"deny"` keyed to the
-  prompt's `request_id`, sent via `RemoteControlClient.send_raw`.
-- **Question** — e.g. the `AskUserQuestion` tool. **Confirmed on live hardware:
-  this arrives as a `can_use_tool` permission** (not a `request_user_dialog`)
-  whose `input` carries `{questions:[{question, header, multiSelect, options}]}`.
-  The bridge parses those into `permissionRequest.questions`, and the
-  `POST …/dialog` route answers it **on the permission path** — an `allow` whose
-  `updatedInput` merges the picks into `answers`, a map **keyed by the question
-  text** (`{"<question>": "<label>"}`, a list for multi-select). An empty map is
-  the graceful *dismiss* ("The user did not answer the questions"); `updatedInput`
-  always echoes `questions` (the tool crashes without it). On the glasses you
-  scroll the options and tap to pick; on the panel they're buttons.
+```bash
+git clone https://github.com/ThatCrispyToast/g2-claude-remote && cd g2-claude-remote
+npm install
+cp .env.example .env.local     # fill in VITE_BRIDGE_URL / VITE_BRIDGE_TOKEN
 
-The permission/allow shapes are confirmed against live prompts. The old
-`{status, result}` dialog-result shape (`build_dialog_answer`) is retained only as
-an **unconfirmed** fallback for the rarer true `request_user_dialog` /
-`side_question` kinds (elicitation, MCP-approval, plan dialogs) — confirm that one
-against a live sample before trusting it.
+npm run bridge                 # bridge → 0.0.0.0:8790
+npm run dev                    # app dev server → http://0.0.0.0:5175
 
-## Running the bridge permanently
+# sideload onto the glasses (phone on the same Wi-Fi / Tailscale network)
+npx @evenrealities/evenhub-cli qr --url http://<host>:5175 --external
+```
 
-Any service manager works — the bridge is stateless. Install it once as a uv
-tool, then point a unit at the binary (adjust the user):
+Point `VITE_BRIDGE_URL` at an address the **phone** can reach — a Tailscale
+MagicDNS name or a LAN IP. Developing on `claude-rc-api` at the same time?
+Clone it next to this repo; `npm run bridge:uv` runs the bridge through that
+checkout's uv environment.
+
+### Packaging
+
+```bash
+npm run pack                   # → claude-remote-<version>.ehpk
+```
+
+Builds the bundle, then generates a local manifest (`app.local.json`,
+gitignored) with the version stamped from `package.json` and your bridge host
+added to the network whitelist. `.env.local` values are baked in as defaults —
+pack with an empty `.env.local` for a distributable build and configure
+everything after install. (The tracked manifest whitelists `"*"`; if your Even
+app build enforces exact origins, packing with your bridge URL in `.env.local`
+whitelists the concrete origin too.)
+
+### Running the bridge as a service
+
+The bridge is stateless — any service manager works:
 
 ```bash
 uv tool install "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server"
@@ -246,36 +168,22 @@ Restart=on-failure
 WantedBy=default.target
 ```
 
-Keep it on a private network (Tailscale/LAN) — the bearer token is the only
-guard, and the bridge can read and steer every remote-control session of the
-logged-in account. No public tunnel is needed or advisable.
-
 ## Project layout
 
 ```
-server/                 the bridge — a pip/uv package (claude-remote-bridge)
-  claude_remote_bridge/bridge.py  the JSON+SSE server (active-only) over claude-rc-api
-  rc_bridge.py          dev shim: python3 server/rc_bridge.py, no install needed
-  pyproject.toml        packaging (console script: claude-remote-bridge)
-scripts/prepack.mjs     generates app.local.json (whitelist + version) at pack time
+server/                the bridge — a pip/uv package (claude-remote-bridge)
+scripts/prepack.mjs    generates app.local.json (whitelist + version) at pack time
+assets/                app icons for the Even Hub listing
 src/
-  main.ts               entry: state machine, EvenHub event routing, stream lifecycle
-  config.ts             config: runtime settings (panel) → VITE_* env → defaults
-  glasses.ts            serialized 576×288 renderer: native text / list / scroll
-                        layouts, per-container in-place upgrades, safe-glyph set
-  ui.ts                 the companion browser panel (incl. the Settings card)
-  rc/
-    types.ts            the bridge ↔ app contract (ActiveSession, RcEvent, …)
-    client.ts           typed fetch wrappers over the bridge
-    stream.ts           SSE (EventSource) wrapper with resume + error framing
-  events/
-    log.ts              rolling, de-duped, paged event log
-    format.ts           one RcEvent → a compact HUD line
-  input/
-    compose.ts          the Compose / Model / Mode menu model
-    voice.ts            mic → Deepgram → final transcript orchestration
-  stt/deepgram.ts       streaming STT
-app.json                Even Hub manifest (g2-microphone + network whitelist)
+  main.ts              app state machine, event routing, stream lifecycle
+  glasses.ts           576×288 renderer: native text / list / scroll layouts
+  ui.ts                the companion browser panel (incl. the Settings card)
+  config.ts            config: runtime settings → VITE_* env → defaults
+  rc/                  bridge contract, typed fetch wrappers, SSE stream
+  events/              rolling event log + HUD line formatting
+  input/               Compose menu model, voice dictation orchestration
+  stt/deepgram.ts      streaming speech-to-text
+app.json               Even Hub manifest (microphone + network whitelist)
 ```
 
 ## License
