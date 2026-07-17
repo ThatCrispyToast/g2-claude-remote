@@ -10,8 +10,10 @@
 import type { QuickSend, ModelChoice, EffortChoice, PermissionMode } from './rc/types'
 
 // ─── Runtime settings (saved from the panel, stored on the device) ───────────
-/** localStorage key for user-entered connection settings. */
-const SETTINGS_KEY = 'claude-remote.settings'
+/** localStorage key for user-entered connection settings. Also the key under
+ *  which main.ts mirrors the same JSON into the Even App-side store, which — unlike
+ *  the WebView's browser localStorage — survives the app being closed and reopened. */
+export const SETTINGS_KEY = 'claude-remote.settings'
 
 export interface RuntimeSettings {
   bridgeUrl?: string

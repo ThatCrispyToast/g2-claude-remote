@@ -14,7 +14,7 @@
 import { OsEventTypeList, waitForEvenAppBridge } from '@evenrealities/even_hub_sdk'
 import type { EvenAppBridge, EvenHubEvent } from '@evenrealities/even_hub_sdk'
 
-import { APP_TITLE, APP_TITLE_SHORT, BRIDGE_URL, HISTORY_WINDOW_BYTES, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES, LIVE_BODY_ROWS, POLL_MS, currentBridge, isBridgeConfigured } from './config'
+import { APP_TITLE, APP_TITLE_SHORT, BRIDGE_URL, HISTORY_WINDOW_BYTES, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES, LIVE_BODY_ROWS, POLL_MS, SETTINGS_KEY, currentBridge, isBridgeConfigured } from './config'
 import { GlassesDisplay, HUD, clip, liveTail, screen, type Layout } from './glasses'
 import { HttpBridgeClient } from './rc/client'
 import { BridgeError } from './rc/types'
@@ -36,6 +36,12 @@ const DOUBLE_CLICK = OsEventTypeList.DOUBLE_CLICK_EVENT // 3
 // out, before we give up and just leave the last events on screen.
 const STREAM_MAX_RETRIES = 5
 const STREAM_RETRY_DELAY_MS = 2500
+
+/** Race a bridge RPC against a timeout so a slow or unimplemented native method
+ *  can never stall boot or a settings save; resolves to `fallback` on timeout. */
+function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return Promise.race([p, new Promise<T>((r) => setTimeout(() => r(fallback), ms))])
+}
 
 class App {
   // Rebuilt in place when the wearer saves new connection settings on the panel,
@@ -167,6 +173,9 @@ class App {
       window.addEventListener('beforeunload', () => this.cleanup())
     }
 
+    // Restore panel-saved bridge/token from the durable App-side store BEFORE the
+    // first connect, so a reopened app reconnects on its own (see hydrateSettings).
+    await this.hydrateSettings()
     await this.checkAuthAndLoad()
     this.pollTimer = setInterval(() => void this.poll(), POLL_MS)
   }
@@ -200,6 +209,7 @@ class App {
    *  the live bridge and re-renders both surfaces. */
   private async applySettings(): Promise<void> {
     this.backToList() // tears down any open stream / session / prompt state
+    await this.persistSettings() // mirror the just-saved settings to durable storage
     const { url, token } = currentBridge()
     this.origin = url
     this.rc = new HttpBridgeClient(url, token)
@@ -208,6 +218,53 @@ class App {
     this.panel.setConnection({ bridge: 'connecting', origin: this.origin, state: this.state })
     this.render()
     await this.checkAuthAndLoad()
+  }
+
+  // ── settings persistence ───────────────────────────────────────────────
+  // The panel writes bridge/token/Deepgram settings to the WebView's browser
+  // `window.localStorage` (config.ts). Inside the Even App that WebView storage
+  // is evicted between app launches, so those settings wouldn't survive a reopen
+  // and the wearer would re-enter them every time. The Even SDK's
+  // get/setLocalStorage persist on the NATIVE App side instead, so we treat that
+  // as the durable backing store and `window.localStorage` as an in-session cache:
+  // seed the cache from the App store at boot, mirror the cache back on save. In a
+  // plain browser (no Even bridge) there's nothing to do — browser localStorage
+  // already persists — so both are no-ops.
+
+  /** Boot: restore saved settings from the durable App-side store into the browser
+   *  cache, then rebuild the RC client so the first connect uses the restored
+   *  bridge/token. Only trusts a value that parses as our settings object. */
+  private async hydrateSettings(): Promise<void> {
+    if (!this.bridge) return
+    let stored: string
+    try {
+      stored = await withTimeout(this.bridge.getLocalStorage(SETTINGS_KEY), 1500, '')
+    } catch {
+      return // App-side store unavailable (older App build) — keep the cache as-is
+    }
+    if (!stored) return // empty string = nothing stored (also how a Reset clears it)
+    try {
+      const obj = JSON.parse(stored)
+      if (!obj || typeof obj !== 'object') return
+    } catch {
+      return
+    }
+    window.localStorage?.setItem(SETTINGS_KEY, stored)
+    const { url, token } = currentBridge()
+    this.origin = url
+    this.rc = new HttpBridgeClient(url, token)
+  }
+
+  /** Save: copy the just-saved settings (already in the browser cache, or absent
+   *  after a Reset) into the durable App-side store so they survive a reopen. */
+  private async persistSettings(): Promise<void> {
+    if (!this.bridge) return
+    try {
+      const raw = window.localStorage?.getItem(SETTINGS_KEY) ?? ''
+      await withTimeout(this.bridge.setLocalStorage(SETTINGS_KEY, raw), 1500, false)
+    } catch {
+      /* App-side store unavailable — the browser cache still holds it this session */
+    }
   }
 
   // ── active-session list ────────────────────────────────────────────────
@@ -1125,7 +1182,7 @@ class App {
         return {
           kind: 'scroll',
           header: `${APP_TITLE} ${HUD.SEP} setup`,
-          body: 'Not connected yet.\n\nOn this phone, open the panel and tap Settings, then enter the bridge URL and token.\n\nRun the bridge on your computer to get them.',
+          body: 'Not connected yet.\n\nIn the app, open the panel and tap Settings, then enter the bridge URL and token.\n\nRun the bridge on your computer to get your credentials.',
           footer: `tap = retry ${HUD.SEP} dbl-tap = exit`,
         }
       case 'error':

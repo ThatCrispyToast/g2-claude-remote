@@ -937,7 +937,7 @@ def serve(token_note: str) -> None:
             "    and steer your Claude sessions. Dev only."
         )
     print()
-    print(f"  If the phone can't connect, open port {PORT} in this host's firewall.")
+    print(f"  You might need to open port {PORT} in this host's firewall.")
     print()
     # The pairing banner must reach the terminal even when stdout is a pipe or
     # a log file (uvx | tee, systemd) — block buffering would sit on it forever.

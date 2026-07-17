@@ -147,6 +147,16 @@ npx @evenrealities/evenhub-cli qr --url http://<host>:5175   # sideload QR
   localStorage) → `VITE_*` baked from `.env.local` → defaults. When debugging
   "why THAT bridge/token", check localStorage before the env. Never make a
   `VITE_` secret required at build time.
+- **Panel settings persist via the SDK, not browser storage.** The Settings card
+  saves to the WebView's `window.localStorage`, but the Even app EVICTS that
+  between launches — so `main.ts` mirrors the same `claude-remote.settings` JSON
+  into the SDK's App-side store (`bridge.set/getLocalStorage`, which persists
+  natively). `hydrateSettings()` seeds the browser cache from it at boot, BEFORE
+  the first connect, so a reopened app reconnects itself; `persistSettings()`
+  writes it back on every save. Both are `withTimeout`-guarded (a slow/absent
+  native method can't stall boot) and no-op with no Even bridge (a plain browser
+  persists localStorage on its own). Without this the wearer re-enters the bridge
+  URL + token on every reopen.
 - **The bridge reads `.env.local` too** (`RC_BRIDGE_*` keys; `VITE_BRIDGE_TOKEN`
   doubles as the token; CLI flags and process env win). With no token configured
   it GENERATES a word passphrase (`RC_BRIDGE_TOKEN_WORDS` words from

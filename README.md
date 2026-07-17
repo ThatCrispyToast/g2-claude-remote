@@ -103,8 +103,9 @@ Settings card.
 The app side has two layers, and the higher one wins:
 
 1. Runtime settings - the panel's Settings card (bridge URL, token, Deepgram
-   key), stored in the device's localStorage. This is how you configure a
-   prebuilt `.ehpk`.
+   key), saved on the device and kept across app restarts. This is how you
+   configure a prebuilt `.ehpk`. Inside the Even app these persist through the
+   SDK's app-side store; a plain browser keeps them in localStorage.
 2. Build-time defaults - `VITE_*` vars in `.env.local`, baked in by Vite. See
    [`.env.example`](.env.example) for the full list (poll interval, HUD window
    sizes, quick-sends, voice knobs).
