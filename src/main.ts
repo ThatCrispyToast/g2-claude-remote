@@ -14,7 +14,7 @@
 import { OsEventTypeList, waitForEvenAppBridge } from '@evenrealities/even_hub_sdk'
 import type { EvenAppBridge, EvenHubEvent } from '@evenrealities/even_hub_sdk'
 
-import { APP_TITLE, APP_TITLE_SHORT, BRIDGE_URL, HISTORY_WINDOW_BYTES, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES, LIVE_BODY_ROWS, POLL_MS } from './config'
+import { APP_TITLE, APP_TITLE_SHORT, BRIDGE_URL, HISTORY_WINDOW_BYTES, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES, LIVE_BODY_ROWS, POLL_MS, currentBridge, isBridgeConfigured } from './config'
 import { GlassesDisplay, HUD, clip, liveTail, screen, type Layout } from './glasses'
 import { HttpBridgeClient } from './rc/client'
 import { BridgeError } from './rc/types'
@@ -25,7 +25,7 @@ import { composeActions, modelItems, modeItems, type ComposeAction, type Submenu
 import { VoiceDictation } from './input/voice'
 import { Panel } from './ui'
 
-type State = 'boot' | 'list' | 'session' | 'compose' | 'submenu' | 'voice' | 'permission' | 'question' | 'error'
+type State = 'boot' | 'setup' | 'list' | 'session' | 'compose' | 'submenu' | 'voice' | 'permission' | 'question' | 'error'
 
 const CLICK = OsEventTypeList.CLICK_EVENT // 0
 const SCROLL_UP = OsEventTypeList.SCROLL_TOP_EVENT // 1
@@ -38,7 +38,15 @@ const STREAM_MAX_RETRIES = 5
 const STREAM_RETRY_DELAY_MS = 2500
 
 class App {
-  private readonly rc = new HttpBridgeClient()
+  // Rebuilt in place when the wearer saves new connection settings on the panel,
+  // so a Settings change reconnects WITHOUT a page reload (a reload would drop
+  // the Even glasses bridge and freeze the HUD). `origin` tracks the URL it points
+  // at, for the panel's connection chip + error copy.
+  private rc = new HttpBridgeClient()
+  private origin = BRIDGE_URL
+  // The last known bridge connection status, so every render() reflects reality
+  // (a plain render must not claim 'ok' while we're on the setup/error screen).
+  private connBridge: 'ok' | 'down' | 'connecting' = 'connecting'
   private bridge: EvenAppBridge | null = null
   private glasses: GlassesDisplay | null = null
   private voice: VoiceDictation | null = null
@@ -131,10 +139,12 @@ class App {
       onCancelDialog: () => void this.submitQuestion('cancelled'),
       onStartVoice: () => void this.startVoice(),
       onStopVoice: () => void this.commitVoice(),
+      onApplySettings: () => void this.applySettings(),
       onExit: () => void this.exit(),
     })
     this.panel.mount(root)
-    this.panel.setConnection({ bridge: 'connecting', origin: BRIDGE_URL, state: this.state })
+    this.connBridge = 'connecting'
+    this.panel.setConnection({ bridge: 'connecting', origin: this.origin, state: this.state })
 
     // The Even App bridge may be absent (plain browser / browser-test). Race it
     // with a short timeout and degrade to panel-only mode if it never appears.
@@ -159,7 +169,8 @@ class App {
   private async checkAuthAndLoad(): Promise<void> {
     try {
       const who = await this.rc.whoami()
-      this.panel.setConnection({ bridge: 'ok', whoami: who, origin: BRIDGE_URL, state: this.state })
+      this.connBridge = 'ok'
+      this.panel.setConnection({ bridge: 'ok', whoami: who, origin: this.origin, state: this.state })
       if (!who.logged_in) {
         return this.fail(`Not logged in to Claude on the box.\n${who.error ?? ''}`)
       }
@@ -167,9 +178,31 @@ class App {
       this.listSelectIndex = 0
       this.go('list')
     } catch (e) {
-      this.panel.setConnection({ bridge: 'down', origin: BRIDGE_URL, state: this.state })
-      this.fail(`Bridge unreachable at ${BRIDGE_URL}.\n${(e as Error).message}`)
+      this.connBridge = 'down'
+      this.panel.setConnection({ bridge: 'down', origin: this.origin, state: this.state })
+      // First run with nothing configured yet → a welcoming setup screen, not a
+      // raw error. Once a bridge IS configured, an unreachable one is a real error.
+      if (!isBridgeConfigured()) return this.go('setup')
+      this.fail(`Bridge unreachable at ${this.origin}.\n${(e as Error).message}`)
     }
+  }
+
+  /** Re-apply connection settings saved from the panel Settings card WITHOUT a
+   *  page reload. A `location.reload()` tears down the WebView, which drops the
+   *  Even glasses bridge — the fresh boot's `createStartUpPageContainer` then
+   *  no-ops against the page still on the HUD, so renders are silently dropped and
+   *  the glasses freeze until the app is relaunched. Reconnecting in place keeps
+   *  the live bridge and re-renders both surfaces. */
+  private async applySettings(): Promise<void> {
+    this.backToList() // tears down any open stream / session / prompt state
+    const { url, token } = currentBridge()
+    this.origin = url
+    this.rc = new HttpBridgeClient(url, token)
+    this.state = 'boot'
+    this.connBridge = 'connecting'
+    this.panel.setConnection({ bridge: 'connecting', origin: this.origin, state: this.state })
+    this.render()
+    await this.checkAuthAndLoad()
   }
 
   // ── active-session list ────────────────────────────────────────────────
@@ -775,8 +808,9 @@ class App {
       case 'question':
         this.pickHighlighted() // tap the highlighted option (or the Dismiss row)
         break
+      case 'setup':
       case 'error':
-        void this.checkAuthAndLoad()
+        void this.checkAuthAndLoad() // retry the connection
         break
     }
   }
@@ -804,6 +838,7 @@ class App {
       case 'question':
         this.snoozePrompt() // dbl-tap sets the question aside to answer later
         break
+      case 'setup':
       case 'error':
         void this.exit()
         break
@@ -1018,7 +1053,7 @@ class App {
   }
 
   private render(): void {
-    this.panel.setConnection({ bridge: 'ok', origin: BRIDGE_URL, state: this.state })
+    this.panel.setConnection({ bridge: this.connBridge, origin: this.origin, state: this.state })
     if (!this.glasses) return // panel-only mode
     this.glasses.render(this.layout())
   }
@@ -1058,6 +1093,16 @@ class App {
           header: `${HUD.RUN} Listening`,
           body: this.interim ? liveTail(this.interim) : '(speak now)',
           footer: `tap = send ${HUD.SEP} dbl = cancel`,
+        }
+      case 'setup':
+        // A pinned header + footer (scroll layout) so the retry hint always shows
+        // and the body never overflows into a scrollbar the way a full-screen text
+        // container would. This is the friendly first-run landing (no bridge set).
+        return {
+          kind: 'scroll',
+          header: `${APP_TITLE} ${HUD.SEP} setup`,
+          body: 'Not connected yet.\n\nOn this phone, open the panel and tap Settings, then enter the bridge URL and token.\n\nRun the bridge on your computer to get them.',
+          footer: `tap = retry ${HUD.SEP} dbl-tap = exit`,
         }
       case 'error':
         return {

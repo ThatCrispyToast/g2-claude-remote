@@ -62,6 +62,12 @@ export const HUD = {
 
 const W = 576
 const H = 288
+// The header / footer strips are single-line text containers. The firmware draws
+// a scrollbar on ANY text container whose content overflows its height, and one
+// line of the (proportional) firmware font is ~26px tall — so a strip must be
+// tall enough that a line clears its height AND its top+bottom padding, or the
+// header and footer sprout a scrollbar. This height leaves comfortable margin.
+const STRIP_H = 42
 const MAX_ITEM_CHARS = 64 // SDK cap per list item
 // The firmware validates a text container by its UTF-8 BYTE length, not its
 // character count. The documented caps are ~1000 bytes for a (re)build and ~2000
@@ -170,13 +176,13 @@ export class GlassesDisplay {
         containerTotalNum: 2,
         // A thin header strip, then the framed native list — the same frame as the
         // scroll body, so the list is clearly set off from the header above it.
-        textObject: [textBox(HDR_ID, 'hdr', hdr, strip(0, 34), { capture: 0 })],
+        textObject: [textBox(HDR_ID, 'hdr', hdr, strip(0, STRIP_H), { capture: 0 })],
         listObject: [
           new ListContainerProperty({
             xPosition: 0,
-            yPosition: 38,
+            yPosition: STRIP_H + 4,
             width: W,
-            height: 250,
+            height: H - STRIP_H - 4,
             containerID: BODY_ID,
             containerName: 'list',
             isEventCapture: 1,
@@ -222,9 +228,9 @@ export class GlassesDisplay {
       await this.rebuild({
         containerTotalNum: 3,
         textObject: [
-          textBox(HDR_ID, 'hdr', hdr, strip(0, 32), { capture: 0 }),
-          textBox(BODY_ID, 'body', b, { x: 0, y: 34, w: W, h: 220, pad: 8 }, { capture: 1, frame: true }),
-          textBox(FTR_ID, 'ftr', ftr, strip(256, 32), { capture: 0 }),
+          textBox(HDR_ID, 'hdr', hdr, strip(0, STRIP_H), { capture: 0 }),
+          textBox(BODY_ID, 'body', b, { x: 0, y: STRIP_H + 2, w: W, h: H - 2 * STRIP_H - 4, pad: 8 }, { capture: 1, frame: true }),
+          textBox(FTR_ID, 'ftr', ftr, strip(H - STRIP_H, STRIP_H), { capture: 0 }),
         ],
       })
       this.kind = 'scroll'

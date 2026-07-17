@@ -43,6 +43,8 @@ export interface PanelCallbacks {
   /** Start / stop voice dictation into the send box. */
   onStartVoice: () => void
   onStopVoice: () => void
+  /** Connection settings were saved (or reset) → reconnect in place (no reload). */
+  onApplySettings: () => void
   /** Leave the whole app. */
   onExit: () => void
 }
@@ -148,6 +150,10 @@ export class Panel {
     const settingsHtml = `
         <section id="settingsCard" class="settings" hidden>
           <div class="view-title">Connection settings</div>
+          <div class="settings-conn">
+            <span class="field-label">Connected to</span>
+            <span id="origin" class="origin">—</span>
+          </div>
           <label class="field">
             <span class="field-label">Bridge URL</span>
             <input id="setBridgeUrl" class="set-input" type="url" autocapitalize="off" autocorrect="off"
@@ -165,21 +171,18 @@ export class Panel {
           </label>
           <div class="settings-hint">Stored only on this device. Overrides the values baked into the build; leave a field blank to use the built-in one.</div>
           <div class="perm-acts">
-            <button id="settingsSave" class="btn primary">Save &amp; reload</button>
+            <button id="settingsSave" class="btn primary">Save &amp; connect</button>
             <button id="settingsReset" class="btn">Reset</button>
           </div>
         </section>`
 
     root.innerHTML = `
       <main class="panel">
-        <header>
-          <h1>${escapeHtml(APP_TITLE)}</h1>
+        <header class="topbar">
+          <h1 class="wordmark">${escapeHtml(APP_TITLE)}</h1>
           <div class="head-side">
-            <button id="settingsBtn" class="btn ghost" title="Connection settings">Settings</button>
-            <div class="conn">
-              <div id="connChip" class="chip-conn down">down</div>
-              <div id="origin" class="origin"></div>
-            </div>
+            <div id="connChip" class="chip-conn down">down</div>
+            <button id="settingsBtn" class="btn ghost settings-btn" title="Connection settings" aria-label="Connection settings">Settings</button>
           </div>
         </header>
 ${settingsHtml}
@@ -294,9 +297,11 @@ ${settingsHtml}
     injectStyles()
   }
 
-  /** Connection settings: saved to localStorage, applied by reloading (the
-   *  config consts are read once at module load). Settings never leave the
-   *  device — the panel is where you input your own bridge/Deepgram secrets. */
+  /** Connection settings: saved to localStorage, then applied in place via
+   *  `onApplySettings` — main.ts reconnects with the new values WITHOUT a page
+   *  reload (a reload drops the Even glasses bridge and freezes the HUD). Settings
+   *  never leave the device — the panel is where you input your bridge/Deepgram
+   *  secrets. */
   private wireSettings(root: HTMLElement): void {
     const card = root.querySelector<HTMLElement>('#settingsCard')
     const url = root.querySelector<HTMLInputElement>('#setBridgeUrl')
@@ -311,11 +316,15 @@ ${settingsHtml}
         bridgeToken: token?.value ?? '',
         deepgramApiKey: dg?.value ?? '',
       })
-      window.location.reload()
+      if (card) card.hidden = true
+      this.cb.onApplySettings()
     })
     root.querySelector<HTMLButtonElement>('#settingsReset')?.addEventListener('click', () => {
       saveRuntimeSettings({})
-      window.location.reload()
+      if (url) url.value = ''
+      if (token) token.value = ''
+      if (dg) dg.value = ''
+      this.cb.onApplySettings()
     })
   }
 
@@ -362,7 +371,7 @@ ${settingsHtml}
       this.connChip.className = `chip-conn ${info.bridge}`
       const login = info.whoami && !info.whoami.logged_in ? ' · logged out' : ''
       this.connChip.textContent = info.bridge === 'ok' ? `ok${login}` : info.bridge
-      this.connChip.title = info.state
+      this.connChip.title = `${info.origin} · ${info.state}`
     }
     if (this.originEl) this.originEl.textContent = info.origin
   }
@@ -808,27 +817,29 @@ function injectStyles(): void {
       -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
       touch-action: manipulation; -webkit-text-size-adjust: 100%; overscroll-behavior: none; }
     #app { display: flex; height: 100%; }
-    .panel { display: flex; flex-direction: column; gap: 14px; width: 100%; overflow-y: auto;
+    .panel { display: flex; flex-direction: column; gap: 16px; width: 100%; overflow-y: auto;
       max-width: 620px; margin: 0 auto; padding: 16px var(--m) 24px; box-sizing: border-box; }
     ::-webkit-scrollbar { width: 8px; height: 8px; }
     ::-webkit-scrollbar-thumb { background: #CFCFCF; border-radius: 999px; }
     ::-webkit-scrollbar-track { background: transparent; }
 
-    /* ── Header ──────────────────────────────────────────────────────────── */
-    header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-    h1 { font-size: 20px; font-weight: 400; margin: 0; letter-spacing: -0.03em; color: var(--tc-1st); }
-    .conn { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+    /* ── Top bar ─────────────────────────────────────────────────────────── */
+    /* A slim, single-line app bar: wordmark left, connection + settings right.
+       The wordmark never wraps; the bridge origin lives in the Settings card
+       (not the bar), so a long hostname can never squeeze the title onto two
+       lines the way it used to. */
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 34px; }
+    .wordmark { font-size: 16px; font-weight: 500; margin: 0; letter-spacing: -0.01em; color: var(--tc-1st);
+      white-space: nowrap; flex: 0 0 auto; }
+    .head-side { display: flex; align-items: center; gap: 8px; flex: 0 1 auto; min-width: 0; }
+    .settings-btn { flex: 0 0 auto; }
     .chip-conn { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 400;
-      padding: 4px 11px; border-radius: 999px; white-space: nowrap; text-transform: lowercase;
+      padding: 4px 11px; border-radius: 999px; white-space: nowrap; text-transform: lowercase; flex: 0 0 auto;
       border: 1px solid var(--line); background: var(--bc-1st); }
     .chip-conn::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
     .chip-conn.ok { color: var(--tc-green); background: rgba(75,185,86,0.10); border-color: rgba(75,185,86,0.30); }
     .chip-conn.down { color: var(--tc-red); background: rgba(255,69,58,0.09); border-color: rgba(255,69,58,0.28); }
     .chip-conn.connecting { color: var(--tc-2nd); background: var(--bc-2nd); border-color: var(--line); }
-    .origin { font-size: 11px; color: var(--tc-2nd); font-variant-numeric: tabular-nums; max-width: 60vw;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-    .head-side { display: flex; align-items: center; gap: 8px; }
 
     /* ── Connection settings card ────────────────────────────────────────── */
     .settings { display: flex; flex-direction: column; gap: 10px; padding: 14px;
@@ -842,6 +853,9 @@ function injectStyles(): void {
     .set-input::placeholder { color: var(--tc-2nd); }
     .set-input:focus { background: var(--bc-1st); border-color: var(--tc-1st); }
     .settings-hint { font-size: 12px; font-weight: 300; color: var(--tc-2nd); line-height: 1.45; }
+    /* The bridge origin, relocated here from the top bar. */
+    .settings-conn { display: flex; flex-direction: column; gap: 3px; }
+    .origin { font-size: 12px; color: var(--tc-2nd); font-variant-numeric: tabular-nums; word-break: break-all; }
 
     /* ── View scaffolding ────────────────────────────────────────────────── */
     .view { display: flex; flex-direction: column; gap: 12px; }
@@ -931,8 +945,10 @@ function injectStyles(): void {
     .interim { font-size: 13px; color: var(--tc-2nd); font-style: italic; padding: 0 2px; }
     .interim[hidden] { display: none; }
     .composer-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-    .quick-row { display: flex; flex-wrap: wrap; gap: 6px; }
-    .quick-row .quick { flex: 1 1 auto; min-width: 90px; }
+    /* Canned sends: even, intentional widths (3-up then 2-up at phone width),
+       not a ragged auto-wrap. Each row's chips share the width equally. */
+    .quick-row { display: flex; flex-wrap: wrap; gap: 8px; }
+    .quick-row .quick { flex: 1 1 30%; min-width: 96px; }
 
     /* ── Steering ────────────────────────────────────────────────────────── */
     .steer { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-items: end; }
@@ -965,9 +981,9 @@ function injectStyles(): void {
 
     /* ── Toast (BC-1st + soft shadow; the doc's small informative toast, ~3s) ─ */
     .toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 10;
-      max-width: 90vw; padding: 11px 18px; font-size: 14px; font-weight: 400; color: var(--tc-1st);
-      background: var(--bc-1st); border: 1px solid var(--line); border-radius: var(--r);
-      box-shadow: var(--shadow); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      max-width: 88vw; padding: 11px 18px; font-size: 14px; font-weight: 400; line-height: 1.4;
+      text-align: center; color: var(--tc-1st); background: var(--bc-1st); border: 1px solid var(--line);
+      border-radius: var(--r); box-shadow: var(--shadow); }
     .toast[hidden] { display: none; }
   `
   const style = document.createElement('style')

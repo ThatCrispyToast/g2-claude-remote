@@ -30,8 +30,10 @@ export function loadRuntimeSettings(): RuntimeSettings {
   }
 }
 
-/** Persist panel-entered settings (empty strings clear a field). The caller
- *  reloads the page so the module-level consts below re-evaluate. */
+/** Persist panel-entered settings (empty strings clear a field). The caller then
+ *  reconnects in place (see `currentBridge`) — no page reload, which would drop
+ *  the glasses bridge. The `BRIDGE_*` consts stay at their load-time snapshot;
+ *  the `current*()` accessors re-read these live values. */
 export function saveRuntimeSettings(s: RuntimeSettings): void {
   try {
     const clean: RuntimeSettings = {}
@@ -67,15 +69,41 @@ function boolEnv(value: unknown, def: boolean): boolean {
 const env = import.meta.env
 
 // ─── The bridge (Claude Remote bridge → claude-rc-api → Anthropic) ───────────
+/** Resolve the effective bridge URL / token from a settings snapshot (runtime
+ *  setting wins over the baked `VITE_` value; then a sensible default). Shared by
+ *  the load-time consts and the live `currentBridge()` re-read below. */
+function resolveBridgeUrl(s: RuntimeSettings): string {
+  return strEnv(s.bridgeUrl ?? env.VITE_BRIDGE_URL, 'http://localhost:8790').replace(/\/+$/, '')
+}
+function resolveBridgeToken(s: RuntimeSettings): string {
+  return strEnv(s.bridgeToken ?? env.VITE_BRIDGE_TOKEN, '')
+}
 /**
  * Base URL of the bridge (server/rc_bridge.py). No trailing slash. Use a name
  * the phone can reach from anywhere you wear the glasses — e.g. the host's
  * Tailscale MagicDNS name (`http://my-box.tailXXXX.ts.net:8790`) or a LAN IP.
  */
-export const BRIDGE_URL = strEnv(runtime.bridgeUrl ?? env.VITE_BRIDGE_URL, 'http://localhost:8790').replace(/\/+$/, '')
+export const BRIDGE_URL = resolveBridgeUrl(runtime)
 /** Shared secret matching the bridge's RC_BRIDGE_TOKEN. Sent as a Bearer header
  *  (and as `?token=` on the SSE stream, which can't set headers). */
-export const BRIDGE_TOKEN = strEnv(runtime.bridgeToken ?? env.VITE_BRIDGE_TOKEN, '')
+export const BRIDGE_TOKEN = resolveBridgeToken(runtime)
+
+/** The bridge URL + token RIGHT NOW, re-reading saved settings so a Settings-card
+ *  change applies WITHOUT a full page reload (a reload drops the Even glasses
+ *  bridge). The consts above are the load-time snapshot; this is the live view. */
+export function currentBridge(): { url: string; token: string } {
+  const s = loadRuntimeSettings()
+  return { url: resolveBridgeUrl(s), token: resolveBridgeToken(s) }
+}
+
+/** Whether a bridge has been configured at all — a saved setting OR a baked
+ *  `VITE_` value. When false and the first connection fails, the app shows the
+ *  first-run setup screen (point the wearer at the panel's Settings card) rather
+ *  than a raw connection error. Live, so it re-evaluates after a settings save. */
+export function isBridgeConfigured(): boolean {
+  const s = loadRuntimeSettings()
+  return Boolean(s.bridgeUrl || s.bridgeToken || env.VITE_BRIDGE_URL || env.VITE_BRIDGE_TOKEN)
+}
 
 // ─── Polling / streaming ─────────────────────────────────────────────────────
 /** How often the active-session list is refreshed (ms). The list has no SSE. */
@@ -145,11 +173,9 @@ function parseQuickSends(raw: unknown): QuickSend[] {
     }
   }
   return [
-    { label: 'Continue', text: 'continue' },
-    { label: 'Yes', text: 'yes' },
-    { label: 'Run the tests', text: 'run the tests' },
-    { label: 'Explain', text: 'explain what you just did' },
     { label: 'Proceed', text: 'proceed' },
+    { label: 'Run tests', text: 'run the tests' },
+    { label: 'Explain', text: 'explain what you just did' },
   ]
 }
 export const QUICK_SENDS: QuickSend[] = parseQuickSends(env.VITE_QUICK_SENDS)
@@ -158,11 +184,24 @@ export const QUICK_SENDS: QuickSend[] = parseQuickSends(env.VITE_QUICK_SENDS)
 // Text INPUT on a keyboard-less device: hold-free voice dictation. Streams the
 // glasses PCM to Deepgram exactly like g2-live-captions; the final transcript
 // becomes a /send body. Off automatically when no Deepgram key is set.
-export const DEEPGRAM_API_KEY = strEnv(runtime.deepgramApiKey ?? env.VITE_DEEPGRAM_API_KEY, '')
+function resolveDeepgramKey(s: RuntimeSettings): string {
+  return strEnv(s.deepgramApiKey ?? env.VITE_DEEPGRAM_API_KEY, '')
+}
+export const DEEPGRAM_API_KEY = resolveDeepgramKey(runtime)
+/** The Deepgram key RIGHT NOW (re-reads saved settings — see `currentBridge`). */
+export function currentDeepgramKey(): string {
+  return resolveDeepgramKey(loadRuntimeSettings())
+}
 export const DEEPGRAM_MODEL = strEnv(env.VITE_DEEPGRAM_MODEL, 'nova-3')
 export const STT_LANGUAGE = strEnv(env.VITE_STT_LANGUAGE, 'en')
 /** Master switch for voice dictation (also needs the Deepgram key). */
-export const VOICE_ENABLED = boolEnv(env.VITE_VOICE_ENABLED, true) && DEEPGRAM_API_KEY.length > 0
+const VOICE_MASTER = boolEnv(env.VITE_VOICE_ENABLED, true)
+export const VOICE_ENABLED = VOICE_MASTER && DEEPGRAM_API_KEY.length > 0
+/** Live voice availability: the master switch plus a Deepgram key entered in the
+ *  Settings card (so adding a key enables voice without a reload). */
+export function voiceEnabled(): boolean {
+  return VOICE_MASTER && currentDeepgramKey().length > 0
+}
 
 /** G2 mic format is fixed: PCM signed-16 little-endian, mono, 16 kHz. */
 export const SAMPLE_RATE = 16000

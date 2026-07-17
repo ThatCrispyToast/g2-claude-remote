@@ -12,7 +12,7 @@
 // to bridge events itself.
 
 import type { EvenAppBridge } from '@evenrealities/even_hub_sdk'
-import { MIC_SILENCE_TIMEOUT_MS, VOICE_ENABLED, DEEPGRAM_API_KEY } from '../config'
+import { MIC_SILENCE_TIMEOUT_MS, voiceEnabled, currentDeepgramKey } from '../config'
 import { LiveCaptioner, type CaptionerStatus } from '../stt/deepgram'
 
 export type VoiceStatus = 'idle' | 'connecting' | 'listening' | 'reconnecting' | 'error'
@@ -53,9 +53,10 @@ export class VoiceDictation {
 
   constructor(private readonly bridge: EvenAppBridge) {}
 
-  /** True when Deepgram is configured — otherwise dictation is a no-op. */
+  /** True when Deepgram is configured — otherwise dictation is a no-op. Read live
+   *  so a key entered in the Settings card enables voice without a reload. */
   get available(): boolean {
-    return VOICE_ENABLED
+    return voiceEnabled()
   }
 
   /**
@@ -88,7 +89,7 @@ export class VoiceDictation {
     }
 
     this.lastPcmAt = performance.now()
-    this.captioner = new LiveCaptioner(DEEPGRAM_API_KEY, {
+    this.captioner = new LiveCaptioner(currentDeepgramKey(), {
       onFinal: (text) => {
         this.finals = this.finals ? `${this.finals} ${text}` : text
         this.interim = ''

@@ -82,8 +82,8 @@ account. See [`server/README.md`](server/README.md) for flags and env vars.
 Every session opens on its newest output and auto-follows while running
 (`● live`); scrolling up freezes a history window you swipe through, and
 scrolling back down re-attaches to the tail. The **Compose** menu leads with
-**Dictate**, followed by configurable quick-sends (`Continue`, `Yes`, …),
-`Interrupt`, `Model`, `Mode`, and `Archive`.
+**Dictate**, followed by configurable quick-sends (`Proceed`, `Run tests`,
+`Explain`), `Interrupt`, `Model`, `Mode`, and `Archive`.
 
 When a session blocks on you, the matching **Permission** or **Question**
 screen appears — immediately if you're watching the live tail, otherwise once
