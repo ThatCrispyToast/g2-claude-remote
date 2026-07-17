@@ -41,9 +41,11 @@ Run it — the goal is "one command and the glasses can connect":
 
 On startup it prints every URL the phone can use (localhost / LAN IP /
 Tailscale IP) and the bearer token. With no token configured anywhere it
-GENERATES one and persists it to ``~/.config/claude-remote/bridge-token``, so
-the pairing flow is: run the command, then copy one URL + the token into the
-app panel's Settings card. ``--open`` disables auth (dev only).
+GENERATES one — a short word passphrase like ``coral-anvil-mango-scoop-visor``
+(see ``wordlist``), made to be typed by hand, not a random blob — and persists
+it to ``~/.config/claude-remote/bridge-token``, so the pairing flow is: run the
+command, then copy one URL + the token into the app panel's Settings card.
+``--open`` disables auth (dev only).
 
 Config precedence (highest wins): CLI flags → ``RC_BRIDGE_*`` env vars →
 ``.env.local`` (in the CWD or the repo checkout; ``VITE_BRIDGE_TOKEN`` doubles
@@ -55,6 +57,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -66,6 +69,7 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
+from .wordlist import WORDS
 
 # In a repo checkout this file lives at server/claude_remote_bridge/bridge.py,
 # so parents[2] is the repo root (where .env.local and ../claude-rc-api live).
@@ -769,6 +773,33 @@ def _token_store() -> Path:
     return base / "claude-remote" / "bridge-token"
 
 
+# A generated token is a passphrase — this many words from wordlist.WORDS,
+# hyphen-joined — not a random base64 blob, because the end user reads it off
+# the startup banner and types it into the panel's Settings card by hand. Six
+# words over the 1295-word EFF short list is ~62 bits: comfortably past
+# brute-forcing a LAN/tailnet bridge (which does no rate-limiting) yet short
+# and unambiguous to type. Override the count with RC_BRIDGE_TOKEN_WORDS;
+# it is floored at 3 (~31 bits) so the knob can't foot-gun the token to nothing.
+_DEFAULT_TOKEN_WORDS = 6
+_MIN_TOKEN_WORDS = 3
+
+
+def _token_word_count() -> int:
+    try:
+        n = int(_cfg("RC_BRIDGE_TOKEN_WORDS", str(_DEFAULT_TOKEN_WORDS)))
+    except ValueError:
+        n = _DEFAULT_TOKEN_WORDS
+    return max(_MIN_TOKEN_WORDS, n)
+
+
+def _generate_passphrase(words: int) -> str:
+    """A human-typeable bearer token: `words` words drawn uniformly from the EFF
+    short list with `secrets.choice`, joined by hyphens (e.g. `coral-anvil-mango`).
+    Hyphens are URL-safe, so it rides unencoded on both the `Bearer` header and
+    the SSE `?token=` query."""
+    return "-".join(secrets.choice(WORDS) for _ in range(words))
+
+
 def _resolve_token(cli_token: Optional[str], open_mode: bool) -> tuple[str, str]:
     """The bearer token plus a human note about where it came from.
 
@@ -793,14 +824,16 @@ def _resolve_token(cli_token: Optional[str], open_mode: bool) -> tuple[str, str]
             return saved, f"saved in {store}"
     except OSError:
         pass
-    token = secrets.token_urlsafe(24)
+    words = _token_word_count()
+    token = _generate_passphrase(words)
+    strength = f"GENERATED {words}-word passphrase, ~{round(words * math.log2(len(WORDS)))}-bit"
     try:
         store.parent.mkdir(parents=True, exist_ok=True)
         store.write_text(token + "\n")
         os.chmod(store, 0o600)
-        return token, f"GENERATED — saved to {store}"
+        return token, f"{strength} — saved to {store}"
     except OSError:
-        return token, "GENERATED — could not persist, so it will CHANGE next run"
+        return token, f"{strength} — could not persist, so it will CHANGE next run"
 
 
 def _source_ip(probe: str) -> Optional[str]:
@@ -897,7 +930,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     ap.add_argument("--host", default=None, help="bind address (default 0.0.0.0)")
     ap.add_argument("--port", type=int, default=None, help="port (default 8790)")
-    ap.add_argument("--token", default=None, help="bearer token the app must present (default: env / .env.local / persisted / generated)")
+    ap.add_argument("--token", default=None, help="bearer token the app must present (default: env / .env.local / persisted / a generated word passphrase)")
     ap.add_argument("--open", action="store_true", help="run WITHOUT authentication (dev only)")
     ap.add_argument("--verbose", action="store_true", help="log every request")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")

@@ -168,8 +168,13 @@ app.json                Even Hub manifest (g2-microphone + network whitelist)
 - **The bridge reads `.env.local` too** (`RC_BRIDGE_*` keys, and
   `VITE_BRIDGE_TOKEN` doubles as the token; CWD first, then the repo checkout) —
   CLI flags and process env win. With no token configured anywhere it
-  GENERATES one and persists it to `~/.config/claude-remote/bridge-token`
-  (`--open` is the only unauthenticated mode). One file configures both sides;
+  GENERATES one — a **word passphrase** (`coral-anvil-mango-scoop-visor-troll`),
+  not a random blob, so the end user can read it off the banner and type it into
+  the panel by hand; `_generate_passphrase` picks `RC_BRIDGE_TOKEN_WORDS` words
+  (default 6 ≈ 62 bits, floor 3) from `wordlist.py` (the CC-BY EFF short list) —
+  and persists it to `~/.config/claude-remote/bridge-token`
+  (`--open` is the only unauthenticated mode). A user-set token (`--token` /
+  env / `.env.local`) is used verbatim, any format. One file configures both sides;
   `npm run bridge` needs no inline env. The end-user path is
   `uvx --from "git+…g2-claude-remote#subdirectory=server" claude-remote-bridge` —
   the startup banner prints the LAN + Tailscale URLs and the token to pair the

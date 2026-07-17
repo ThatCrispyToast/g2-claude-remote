@@ -70,8 +70,10 @@ Two pieces:
    ```
 
    It prints every URL your phone can reach it at (localhost / LAN IP /
-   Tailscale IP) and a bearer token — auto-generated on first run and persisted
-   to `~/.config/claude-remote/bridge-token`. Copy one URL + the token into the
+   Tailscale IP) and a bearer token — a short word passphrase like
+   `coral-anvil-mango-scoop-visor-troll` (built to be typed by hand),
+   auto-generated on first run and persisted to
+   `~/.config/claude-remote/bridge-token`. Copy one URL + the token into the
    app panel's **Settings** card. Done — the glasses show your live sessions.
 3. **Optionally add a [Deepgram](https://console.deepgram.com) API key** in the
    same Settings card to enable voice dictation. Without one, voice quietly
@@ -188,11 +190,12 @@ Two layers, highest wins:
    messages), and the Deepgram voice knobs (`VITE_DEEPGRAM_API_KEY`, …).
 
 Bridge-side: CLI flags, or `RC_BRIDGE_HOST` / `RC_BRIDGE_PORT` /
-`RC_BRIDGE_TOKEN` / `RC_BRIDGE_VERBOSE` — each read from the environment first,
-then from `.env.local` (where `VITE_BRIDGE_TOKEN` also counts as the token), so
-one file configures everything. With no token configured anywhere the bridge
-generates one, persists it to `~/.config/claude-remote/bridge-token`, and
-prints it at startup.
+`RC_BRIDGE_TOKEN` / `RC_BRIDGE_TOKEN_WORDS` / `RC_BRIDGE_VERBOSE` — each read from
+the environment first, then from `.env.local` (where `VITE_BRIDGE_TOKEN` also
+counts as the token), so one file configures everything. With no token configured
+anywhere the bridge generates a word-passphrase token (`RC_BRIDGE_TOKEN_WORDS`
+words, default 6 ≈ 62 bits), persists it to
+`~/.config/claude-remote/bridge-token`, and prints it at startup.
 
 ## Answering permission prompts and questions
 
