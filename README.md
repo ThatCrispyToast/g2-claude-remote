@@ -55,9 +55,10 @@ Voice dictation streams mic audio from the phone to
    ```
 
    It prints the URLs your phone can reach it at and a bearer token — a word
-   passphrase like `coral-anvil-mango-scoop-visor-troll`, generated on first
+   passphrase like `coral-anvil-mango-scoop-visor`, generated on first
    run and persisted to `~/.config/claude-remote/bridge-token`. Enter one URL
-   and the token in the panel's **Settings** card.
+   and the token in the panel's **Settings** card. If the phone can't connect,
+   open the bridge's port (default `8790`) in the host's firewall.
 3. **Optional:** add a [Deepgram](https://console.deepgram.com) API key in the
    same Settings card to enable voice dictation. Without one, voice disables
    itself and everything else still works.

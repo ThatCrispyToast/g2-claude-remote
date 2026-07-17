@@ -775,12 +775,12 @@ def _token_store() -> Path:
 
 # A generated token is a passphrase — this many words from wordlist.WORDS,
 # hyphen-joined — not a random base64 blob, because the end user reads it off
-# the startup banner and types it into the panel's Settings card by hand. Six
-# words over the 1295-word EFF short list is ~62 bits: comfortably past
+# the startup banner and types it into the panel's Settings card by hand. Five
+# words over the 1295-word EFF short list is ~52 bits: comfortably past
 # brute-forcing a LAN/tailnet bridge (which does no rate-limiting) yet short
 # and unambiguous to type. Override the count with RC_BRIDGE_TOKEN_WORDS;
 # it is floored at 3 (~31 bits) so the knob can't foot-gun the token to nothing.
-_DEFAULT_TOKEN_WORDS = 6
+_DEFAULT_TOKEN_WORDS = 5
 _MIN_TOKEN_WORDS = 3
 
 
@@ -903,6 +903,8 @@ def serve(token_note: str) -> None:
             "  ⚠ UNAUTHENTICATED (--open): anyone who can reach this port can read\n"
             "    and steer your Claude sessions. Dev only."
         )
+    print()
+    print(f"  If the phone can't connect, open port {PORT} in this host's firewall.")
     print()
     # The pairing banner must reach the terminal even when stdout is a pipe or
     # a log file (uvx | tee, systemd) — block buffering would sit on it forever.

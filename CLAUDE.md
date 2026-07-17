@@ -139,7 +139,7 @@ npx @evenrealities/evenhub-cli qr --url http://<host>:5175   # sideload QR
 - **The bridge reads `.env.local` too** (`RC_BRIDGE_*` keys; `VITE_BRIDGE_TOKEN`
   doubles as the token; CLI flags and process env win). With no token configured
   it GENERATES a word passphrase (`RC_BRIDGE_TOKEN_WORDS` words from
-  `wordlist.py`, default 6 ≈ 62 bits) and persists it to
+  `wordlist.py`, default 5 ≈ 52 bits) and persists it to
   `~/.config/claude-remote/bridge-token`; `--open` is the only unauthenticated
   mode. A user-set token is used verbatim.
 - **Deepgram key** lives in `.env.local` or the Settings card; voice

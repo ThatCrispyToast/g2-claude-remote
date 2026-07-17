@@ -13,12 +13,15 @@ uvx --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory
 
 That's it. On startup it prints the URLs the phone can reach (localhost, LAN IP,
 Tailscale IP) and a bearer token — a short word passphrase like
-`coral-anvil-mango-scoop-visor-troll`, generated on first run and persisted to
+`coral-anvil-mango-scoop-visor`, generated on first run and persisted to
 `~/.config/claude-remote/bridge-token` — which you copy into the Claude Remote
 app panel's **Settings** card once. The passphrase form is deliberate: it's made
 to be *read off the banner and typed by hand* without error, unlike a random
 blob. (Setting your own `--token` / `RC_BRIDGE_TOKEN` overrides it, any format.)
 No config files required.
+
+If the phone can't connect, open the bridge's port (default `8790`) in the
+host's firewall.
 
 Also works with `pip install "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server"`
 then `claude-remote-bridge`, or from a repo checkout via `python3 server/rc_bridge.py`.
@@ -37,7 +40,7 @@ Environment variables `RC_BRIDGE_HOST` / `RC_BRIDGE_PORT` / `RC_BRIDGE_TOKEN` /
 `RC_BRIDGE_VERBOSE` are honored, as is a `.env.local` in the working directory
 or repo checkout (`VITE_BRIDGE_TOKEN` doubles as the token, so the app repo's
 config file configures both sides). `RC_BRIDGE_TOKEN_WORDS` sets how many words
-a *generated* passphrase has (default 6 ≈ 62 bits; floored at 3).
+a *generated* passphrase has (default 5 ≈ 52 bits; floored at 3).
 
 ## What it does
 
