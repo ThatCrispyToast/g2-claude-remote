@@ -1,0 +1,19 @@
+node_modules/
+dist/
+*.ehpk
+
+# Generated at pack time from app.json + .env.local (may carry personal hosts)
+app.local.json
+
+# Local env — may contain API keys (e.g. Deepgram for voice dictation). Never commit.
+.env.local
+.env.*.local
+
+# Python bridge venv / cache
+server/.venv/
+__pycache__/
+*.pyc
+
+# Editor / OS cruft
+.DS_Store
+*.log
