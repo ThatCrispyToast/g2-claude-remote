@@ -45,6 +45,7 @@ server/                 the bridge — a pip/uv package: claude-remote-bridge
   pyproject.toml        console script + a DIRECT GIT URL dep on claude-rc-api
                         (uvx-from-repo needs it; PyPI would reject it — see README)
 scripts/prepack.mjs     pack-time manifest generator → app.local.json (gitignored)
+assets/                 24×24 monochrome app icons for the Even Hub listing (+10× preview)
 src/
   main.ts               App state machine, EvenHub event routing, stream lifecycle,
                         the session live⇄history scroll model, layout() builders
@@ -213,5 +214,17 @@ npx @evenrealities/evenhub-cli qr --url http://<box>.ts.net:5175   # sideload QR
 - **Bridge-absent = panel-only mode.** In a plain browser / `browser-test` the
   Even bridge never appears, so the glasses/gesture/mic paths are skipped and the
   session list + stream + steering all still work through the panel.
-- **Git:** private repo under `github.com/ThatCrispyToast`; no auto-push — commit +
-  push manually (as `server`) when asked.
+- **Git: this repo is PUBLIC** — origin is
+  `github.com/ThatCrispyToast/g2-claude-remote` (published 2026-07-16 as a single
+  squashed root commit; `claude-rc-api` was published the same way). Everything
+  committed here is world-readable: never commit tokens, tailnet hostnames/IPs,
+  or personal paths (`.env.local` / `app.local.json` / `*.ehpk` / `*.log` are
+  gitignored for exactly that reason). The local-only
+  `backup/pre-publish-history` branch holds the pre-squash history and must
+  NEVER be pushed; the old private `rc-g2` GitHub repo still exists and must
+  stay private. No auto-push — commit + push manually (as `server`) when asked.
+- **Releases:** `claude-remote-1.0.0.ehpk` (packed CLEAN, with `.env.local` set
+  aside) is the published artifact — delivered for the Even
+  Hub submission, along with `assets/icon.png` / `icon-white.png` (24×24
+  monochrome, spark-over-glasses). A pack made WITH `.env.local` present bakes
+  your token/keys in — personal builds only, never distribute one.
