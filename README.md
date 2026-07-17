@@ -74,7 +74,7 @@ account. See [`server/README.md`](server/README.md) for flags and env vars.
 | **Sessions list** | move selection | open session | exit app |
 | **Session view** | native scroll — up into history, back down to live | open Compose menu | back to list |
 | **Compose menu** | move selection | fire action / enter submenu | back to session |
-| **Model / Mode submenu** | move selection | apply | back to Compose |
+| **Model / Mode / Effort submenu** | move selection | apply | back to Compose |
 | **Voice dictation** | scroll transcript | send | cancel |
 | **Permission prompt** | move between Allow / Deny | pick | set aside |
 | **Question** | move between options | pick (`Dismiss` cancels) | set aside |
@@ -83,7 +83,8 @@ Every session opens on its newest output and auto-follows while running
 (`● live`); scrolling up freezes a history window you swipe through, and
 scrolling back down re-attaches to the tail. The **Compose** menu leads with
 **Dictate**, followed by configurable quick-sends (`Proceed`, `Run tests`,
-`Explain`), `Interrupt`, `Model`, `Mode`, and `Archive`.
+`Explain`), `Interrupt`, `Model`, `Mode`, `Effort` (reasoning effort:
+`auto`/`low`/`medium`/`high`/`xhigh`), and `Archive`.
 
 When a session blocks on you, the matching **Permission** or **Question**
 screen appears — immediately if you're watching the live tail, otherwise once

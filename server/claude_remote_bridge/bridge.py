@@ -3,7 +3,7 @@
 It is a purpose-built sibling of ``claude-rc``'s ``webui.py``: a dependency-free
 ``http.server`` that wraps :class:`claude_rc.client.RemoteControlClient` and
 exposes exactly what the glasses UI needs. It differs from the stock webui in
-four deliberate ways, each required by this app:
+five deliberate ways, each required by this app:
 
 1. **Active-only.** ``GET /api/sessions`` returns *only* sessions that are
    ``status == "active"`` **and** ``connection_status == "connected"`` — i.e.
@@ -32,6 +32,13 @@ four deliberate ways, each required by this app:
    (allow/deny) and ``POST …/dialog`` (answer a question — routes a ``can_use_tool``
    question back through the permission builder) — neither the webui nor
    ``RemoteControlClient`` can do these on their own.
+5. **Effort control with a working fallback.** ``POST …/effort`` calls
+   claude-rc-api's ``set_effort`` with wait+fallback: the protocol-correct
+   ``apply_flag_settings`` control is refused by current remote-control
+   workers, so on refusal the ``/effort <level>`` slash command is injected
+   instead — workers execute it as a zero-cost local command. NOTE that the
+   command path persists the worker machine's default effort (CLI semantics,
+   not session-scoped); the response's ``via`` says which path ran.
 
 Run it — the goal is "one command and the glasses can connect":
 
@@ -134,6 +141,10 @@ TOKEN = ""
 VERBOSE = False
 
 VALID_MODES = {"default", "plan", "acceptEdits", "bypassPermissions"}
+# Effort levels the worker's flag-settings schema accepts remotely. "max" is
+# session-scoped in the CLI and rejected on this path; "auto" maps to None
+# (an explicit null effortLevel clears back to the model default).
+VALID_EFFORTS = {"low", "medium", "high", "xhigh"}
 
 # --- route patterns (first hit wins) ---------------------------------------
 _SID = r"(?P<sid>[^/]+)"
@@ -146,6 +157,7 @@ _R_DIALOG = re.compile(rf"^/api/sessions/{_SID}/dialog$")
 _R_INTERRUPT = re.compile(rf"^/api/sessions/{_SID}/interrupt$")
 _R_MODEL = re.compile(rf"^/api/sessions/{_SID}/model$")
 _R_PERMMODE = re.compile(rf"^/api/sessions/{_SID}/permission_mode$")
+_R_EFFORT = re.compile(rf"^/api/sessions/{_SID}/effort$")
 _R_ARCHIVE = re.compile(rf"^/api/sessions/{_SID}/archive$")
 
 
@@ -676,6 +688,27 @@ class _Handler(BaseHTTPRequestHandler):
                     )
                 self.rc.set_permission_mode(m["sid"], mode)
                 return self._json({"ok": True})
+            m = _R_EFFORT.match(path)
+            if m:
+                self._require_active(m["sid"])
+                effort = (body.get("effort") or "").strip() or None
+                if effort == "auto":
+                    effort = None
+                if effort is not None and effort not in VALID_EFFORTS:
+                    return self._json(
+                        {"error": f"effort must be auto or one of {sorted(VALID_EFFORTS)}", "status": 400},
+                        status=400,
+                    )
+                # Current remote-control workers refuse the apply_flag_settings
+                # control, so set_effort waits for the worker's verdict and falls
+                # back to injecting the /effort slash command (which they DO
+                # execute). claude-rc-api < 0.2.0 predates set_effort — the
+                # command path alone still works there.
+                if hasattr(self.rc, "set_effort"):
+                    out = self.rc.set_effort(m["sid"], effort, wait=6.0, command_fallback=True)
+                    return self._json({"ok": True, "via": out.get("via", "control")})
+                self.rc.send_message(m["sid"], f"/effort {effort or 'auto'}")
+                return self._json({"ok": True, "via": "command"})
             m = _R_ARCHIVE.match(path)
             if m:
                 # Archiving is the one control that *ends* an active session, so it

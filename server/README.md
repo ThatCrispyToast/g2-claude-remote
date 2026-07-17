@@ -47,7 +47,7 @@ a *generated* passphrase has (default 5 ≈ 52 bits; floored at 3).
 Wraps [`claude-rc-api`](https://github.com/ThatCrispyToast/claude-rc-api)'s
 `RemoteControlClient` and exposes exactly what the glasses UI needs: an
 active-sessions-only list, per-session SSE event streams, send/interrupt/
-model/mode/archive controls, and — beyond what the stock tooling can do —
+model/mode/effort/archive controls, and — beyond what the stock tooling can do —
 routes that **answer blocking permission prompts and questions**. It adds no
 Anthropic protocol code of its own, keeps no state, and survives OAuth token
 rotation (the API client reloads rotated credentials from disk).

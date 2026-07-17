@@ -7,7 +7,7 @@
 // Everything else has a sensible default so the app runs with just a bridge
 // URL + token. See `.env.example`.
 
-import type { QuickSend, ModelChoice, PermissionMode } from './rc/types'
+import type { QuickSend, ModelChoice, EffortChoice, PermissionMode } from './rc/types'
 
 // ─── Runtime settings (saved from the panel, stored on the device) ───────────
 /** localStorage key for user-entered connection settings. */
@@ -153,6 +153,15 @@ export const MODELS: ModelChoice[] = [
 ]
 /** Permission modes offered in the Compose → Mode submenu. */
 export const MODES: PermissionMode[] = ['default', 'plan', 'acceptEdits', 'bypassPermissions']
+/** Effort levels offered in the Compose → Effort submenu. "auto" clears to the
+ *  model default; "max" is session-scoped in the CLI and can't be set remotely. */
+export const EFFORTS: EffortChoice[] = [
+  { id: null, label: 'auto' },
+  { id: 'low', label: 'low' },
+  { id: 'medium', label: 'medium' },
+  { id: 'high', label: 'high' },
+  { id: 'xhigh', label: 'xhigh' },
+]
 
 /**
  * Canned messages fired from the Compose menu with a single tap — the primary,

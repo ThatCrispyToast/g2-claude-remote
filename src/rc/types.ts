@@ -5,11 +5,20 @@ export type SessionStatus = 'active' | 'archived' | string
 export type WorkerStatus = 'idle' | 'running' | 'requires_action' | string
 export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected' | string
 export type PermissionMode = 'default' | 'plan' | 'acceptEdits' | 'bypassPermissions'
+/** Effort levels settable remotely ('max' is session-scoped in the CLI and the
+ *  worker's schema rejects it on this path); null = auto (the model default). */
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh'
 export type Decision = 'allow' | 'deny'
 
 /** A model offered in the Compose → Model submenu. */
 export interface ModelChoice {
   id: string
+  label: string
+}
+
+/** An effort level offered in the Compose → Effort submenu (null id = auto). */
+export interface EffortChoice {
+  id: EffortLevel | null
   label: string
 }
 
@@ -178,5 +187,7 @@ export interface BridgeClient {
   interrupt(sid: string): Promise<void>
   setModel(sid: string, model: string): Promise<void>
   setPermissionMode(sid: string, mode: PermissionMode): Promise<void>
+  /** Set the reasoning effort; null clears back to auto (the model default). */
+  setEffort(sid: string, effort: EffortLevel | null): Promise<void>
   archive(sid: string): Promise<void>
 }

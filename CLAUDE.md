@@ -28,6 +28,17 @@ above the baked `VITE_*` values in `config.ts`) is the end-user config path.
    the native scroll position. Steady-state changes are per-container
    `textContainerUpgrade`s (header / body / footer diffed independently); a full
    rebuild only when the layout kind or a native list's items change.
+4. **Effort is a fallback control.** Remote-control workers (through at least
+   2.1.212) REFUSE the `apply_flag_settings` control that carries `effortLevel`
+   ("REPL bridge does not handle…" — confirmed live), so claude-rc-api's
+   `set_effort(wait=…, command_fallback=True)` waits for the worker's verdict
+   and falls back to injecting the `/effort <level>` slash command, which RC
+   workers DO execute as a zero-cost local command (also confirmed live; slash
+   commands sent as user messages run locally in general). Mind the semantics:
+   the command path **persists that machine's default effort** for new sessions
+   (CLI behavior), it is not session-scoped; the bridge's response `via` field
+   says which path ran. No upstream field exposes the current effort — the
+   glasses mark only the last level applied from this app (`effortBySid`).
 
 ## Commands
 

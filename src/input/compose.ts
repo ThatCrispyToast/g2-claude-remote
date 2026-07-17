@@ -2,16 +2,16 @@
 // can fire on a session by scrolling to one and tapping. Pure data + tiny
 // helpers; the state machine in main.ts drives selection and dispatch.
 
-import { MODELS, MODES, QUICK_SENDS } from '../config'
+import { EFFORTS, MODELS, MODES, QUICK_SENDS } from '../config'
 import { HUD } from '../glasses'
-import type { PermissionMode } from '../rc/types'
+import type { EffortLevel, PermissionMode } from '../rc/types'
 
 export type ComposeAction =
   | { kind: 'prompt'; label: string }
   | { kind: 'send'; label: string; text: string }
   | { kind: 'voice'; label: string }
   | { kind: 'interrupt'; label: string }
-  | { kind: 'submenu'; label: string; menu: 'model' | 'mode' }
+  | { kind: 'submenu'; label: string; menu: 'model' | 'mode' | 'effort' }
   | { kind: 'archive'; label: string }
   | { kind: 'back'; label: string }
 
@@ -36,6 +36,7 @@ export function composeActions(opts: { voiceAvailable: boolean; pendingPrompt?: 
   actions.push({ kind: 'interrupt', label: `${HUD.STOP} Interrupt` })
   actions.push({ kind: 'submenu', label: `Model ${HUD.GO}`, menu: 'model' })
   actions.push({ kind: 'submenu', label: `Mode ${HUD.GO}`, menu: 'mode' })
+  actions.push({ kind: 'submenu', label: `Effort ${HUD.GO}`, menu: 'effort' })
   actions.push({ kind: 'archive', label: 'Archive session' })
   actions.push({ kind: 'back', label: `${HUD.BACK} Back` })
   return actions
@@ -64,6 +65,22 @@ export function modeItems(current: PermissionMode | string | null): SubmenuItem[
     label: `${m === current ? `${HUD.CUR} ` : '  '}${m}`,
     value: m,
     current: m === current,
+  }))
+  items.push({ label: `${HUD.BACK} Back`, value: '', current: false })
+  return items
+}
+
+/**
+ * The Effort submenu. The session object doesn't expose effort, so there is no
+ * upstream truth to mark — `current` is the last level applied FROM THIS APP
+ * (undefined = never set here, nothing marked). The auto row carries the
+ * sentinel value 'auto' because '' is the Back row's value.
+ */
+export function effortItems(current: EffortLevel | null | undefined): SubmenuItem[] {
+  const items: SubmenuItem[] = EFFORTS.map((e) => ({
+    label: `${current !== undefined && e.id === current ? `${HUD.CUR} ` : '  '}${e.label}`,
+    value: e.id ?? 'auto',
+    current: current !== undefined && e.id === current,
   }))
   items.push({ label: `${HUD.BACK} Back`, value: '', current: false })
   return items

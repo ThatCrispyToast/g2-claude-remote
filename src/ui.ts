@@ -16,7 +16,7 @@
 // monochrome surface and is not governed by this doc.)
 
 import type { ActiveSession, RcEvent, PermissionRequest, DialogQuestion, WhoAmI, Decision, PermissionMode } from './rc/types'
-import { MODELS, MODES, QUICK_SENDS, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, loadRuntimeSettings, saveRuntimeSettings } from './config'
+import { EFFORTS, MODELS, MODES, QUICK_SENDS, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, loadRuntimeSettings, saveRuntimeSettings } from './config'
 
 /** Everything the panel calls back into main.ts to do — main.ts owns the bridge. */
 export interface PanelCallbacks {
@@ -32,6 +32,8 @@ export interface PanelCallbacks {
   onSetModel: (model: string) => void
   /** Mode <select> changed. */
   onSetMode: (mode: PermissionMode) => void
+  /** Effort <select> changed ('auto' | 'low' | 'medium' | 'high' | 'xhigh'). */
+  onSetEffort: (effort: string) => void
   /** Archive the open session (main.ts confirms/executes; the button self-confirms too). */
   onArchive: (sid: string) => void
   /** Allow / Deny a blocking permission prompt. */
@@ -120,6 +122,7 @@ export class Panel {
   private interruptBtn: HTMLButtonElement | null = null
   private modelSel: HTMLSelectElement | null = null
   private modeSel: HTMLSelectElement | null = null
+  private effortSel: HTMLSelectElement | null = null
   private archiveBtn: HTMLButtonElement | null = null
   private toastEl: HTMLDivElement | null = null
 
@@ -143,6 +146,7 @@ export class Panel {
     ).join('')
     const modelOpts = MODELS.map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`).join('')
     const modeOpts = MODES.map((m) => `<option value="${m}">${m}</option>`).join('')
+    const effortOpts = EFFORTS.map((e) => `<option value="${e.id ?? 'auto'}">${e.label}</option>`).join('')
 
     // Settings prefill: the inputs hold the on-device overrides; the
     // placeholders show what the build falls back to without them.
@@ -228,6 +232,10 @@ ${settingsHtml}
               <span class="field-label">Mode</span>
               <select id="modeSel" class="select">${modeOpts}</select>
             </label>
+            <label class="field">
+              <span class="field-label">Effort</span>
+              <select id="effortSel" class="select">${effortOpts}</select>
+            </label>
             <button id="archiveBtn" class="btn danger archive">Archive</button>
           </div>
         </section>
@@ -253,6 +261,7 @@ ${settingsHtml}
     this.interruptBtn = root.querySelector<HTMLButtonElement>('#interruptBtn')
     this.modelSel = root.querySelector<HTMLSelectElement>('#modelSel')
     this.modeSel = root.querySelector<HTMLSelectElement>('#modeSel')
+    this.effortSel = root.querySelector<HTMLSelectElement>('#effortSel')
     this.archiveBtn = root.querySelector<HTMLButtonElement>('#archiveBtn')
     this.toastEl = root.querySelector<HTMLDivElement>('#toast')
 
@@ -282,6 +291,9 @@ ${settingsHtml}
     })
     this.modeSel?.addEventListener('change', () => {
       if (this.modeSel) this.cb.onSetMode(this.modeSel.value as PermissionMode)
+    })
+    this.effortSel?.addEventListener('change', () => {
+      if (this.effortSel) this.cb.onSetEffort(this.effortSel.value)
     })
 
     for (const btn of Array.from(root.querySelectorAll<HTMLButtonElement>('.quick'))) {

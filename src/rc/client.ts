@@ -13,6 +13,7 @@ import {
   type BridgeClient,
   type Decision,
   type DialogAnswer,
+  type EffortLevel,
   type PermissionMode,
   type RcEvent,
   type WhoAmI,
@@ -148,6 +149,10 @@ export class HttpBridgeClient implements BridgeClient {
 
   async setPermissionMode(sid: string, mode: PermissionMode): Promise<void> {
     await this.post(`/api/sessions/${this.sid(sid)}/permission_mode`, { mode })
+  }
+
+  async setEffort(sid: string, effort: EffortLevel | null): Promise<void> {
+    await this.post(`/api/sessions/${this.sid(sid)}/effort`, { effort })
   }
 
   async archive(sid: string): Promise<void> {

@@ -18,10 +18,10 @@ import { APP_TITLE, APP_TITLE_SHORT, BRIDGE_URL, HISTORY_WINDOW_BYTES, HUD_CHARS
 import { GlassesDisplay, HUD, clip, liveTail, screen, type Layout } from './glasses'
 import { HttpBridgeClient } from './rc/client'
 import { BridgeError } from './rc/types'
-import type { ActiveSession, Decision, DialogAnswer, DialogOption, DialogQuestion, PermissionMode, RcEvent } from './rc/types'
+import type { ActiveSession, Decision, DialogAnswer, DialogOption, DialogQuestion, EffortLevel, PermissionMode, RcEvent } from './rc/types'
 import { EventLog } from './events/log'
 import { isQuestionRequest } from './events/format'
-import { composeActions, modelItems, modeItems, type ComposeAction, type SubmenuItem } from './input/compose'
+import { composeActions, effortItems, modelItems, modeItems, type ComposeAction, type SubmenuItem } from './input/compose'
 import { VoiceDictation } from './input/voice'
 import { Panel } from './ui'
 
@@ -84,8 +84,12 @@ class App {
   private lastScrollAt = 0 // performance.now() of the last handled scroll (debounce)
 
   // compose / submenu
-  private submenuKind: 'model' | 'mode' = 'model'
+  private submenuKind: 'model' | 'mode' | 'effort' = 'model'
   private submenu: SubmenuItem[] = []
+  // Effort applied from this app, per session — the session object doesn't
+  // expose effort, so this is the only "current" the submenu can mark.
+  // Absent = never set here (a level set from the CLI is invisible to us).
+  private readonly effortBySid = new Map<string, EffortLevel | null>()
   // The Compose menu, snapshotted on entry. The list can vary (the leading
   // "Answer question" row appears only when a prompt is pending), and that
   // pending state can change from a stream event WHILE the wearer is in the
@@ -133,6 +137,7 @@ class App {
       onInterrupt: () => void this.interrupt(),
       onSetModel: (m) => void this.applyModel(m),
       onSetMode: (m) => void this.applyMode(m),
+      onSetEffort: (e) => void this.applyEffort(e),
       onArchive: () => void this.archive(),
       onAnswerPermission: (d) => void this.answerPermission(d),
       onPickDialogOption: (qIndex, label) => this.recordPick(qIndex, label),
@@ -413,6 +418,19 @@ class App {
     try {
       await this.rc.setPermissionMode(this.sid, mode)
       this.panel.setToast(`Mode → ${mode}`)
+    } catch (e) {
+      this.onActionError(e)
+    }
+  }
+
+  /** Set reasoning effort; the sentinel 'auto' clears back to the model default. */
+  private async applyEffort(effort: string): Promise<void> {
+    if (!this.sid) return
+    const level = effort === 'auto' ? null : (effort as EffortLevel)
+    try {
+      await this.rc.setEffort(this.sid, level)
+      this.effortBySid.set(this.sid, level)
+      this.panel.setToast(`Effort → ${effort}`)
     } catch (e) {
       this.onActionError(e)
     }
@@ -1006,9 +1024,14 @@ class App {
     }
   }
 
-  private openSubmenu(kind: 'model' | 'mode'): void {
+  private openSubmenu(kind: 'model' | 'mode' | 'effort'): void {
     this.submenuKind = kind
-    this.submenu = kind === 'model' ? modelItems(this.session?.model ?? null) : modeItems(this.session?.permissionMode ?? null)
+    this.submenu =
+      kind === 'model'
+        ? modelItems(this.session?.model ?? null)
+        : kind === 'mode'
+          ? modeItems(this.session?.permissionMode ?? null)
+          : effortItems(this.sid ? this.effortBySid.get(this.sid) : undefined)
     this.listSelectIndex = 0 // native list starts highlighted at the top row
     this.go('submenu')
   }
@@ -1020,7 +1043,8 @@ class App {
       return
     }
     if (this.submenuKind === 'model') void this.applyModel(item.value)
-    else void this.applyMode(item.value as PermissionMode)
+    else if (this.submenuKind === 'mode') void this.applyMode(item.value as PermissionMode)
+    else void this.applyEffort(item.value)
     this.go('session')
   }
 
@@ -1078,7 +1102,7 @@ class App {
       case 'submenu':
         return {
           kind: 'list',
-          header: `${this.submenuKind === 'model' ? 'Model' : 'Permission mode'} ${HUD.SEP} tap ${HUD.SEP} dbl = back`,
+          header: `${this.submenuKind === 'model' ? 'Model' : this.submenuKind === 'mode' ? 'Permission mode' : 'Effort'} ${HUD.SEP} tap ${HUD.SEP} dbl = back`,
           items: this.submenu.map((i) => i.label),
         }
       case 'session':
