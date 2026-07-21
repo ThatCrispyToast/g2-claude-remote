@@ -90,11 +90,30 @@ npx @evenrealities/evenhub-cli qr --url http://<host>:5175   # sideload QR
   can't guarantee that. Every session opens on this tail (`● live` running /
   `○ latest` idle); scroll-up enters history.
 - **Content caps are BYTES, not chars** (~1000 per rebuild, ~2000 per upgrade,
-  999 in the simulator), and HUD glyphs are 2–3 bytes each — an oversize body is
-  **silently dropped** (the screen just freezes). `glasses.ts` byte-clamps every
-  body (`BODY_BYTE_CAP`) and checks the rebuild/upgrade return value; the log
-  packs windows by bytes (`LIVE_BODY_BYTES` / `HISTORY_WINDOW_BYTES`). Never
-  size a body by char count.
+  999 in the simulator; native lists: 20 rows, ~63 bytes per item), and HUD
+  glyphs are 2–3 bytes each — an oversize container is **silently dropped** (the
+  screen just freezes). `glasses.ts` byte-clamps every body (`BODY_BYTE_CAP`)
+  and list item (`MAX_ITEM_BYTES`); the log packs windows by bytes
+  (`LIVE_BODY_BYTES` / `HISTORY_WINDOW_BYTES`). Never size anything by chars.
+- **A failed/hung write must invalidate the display mirror.** `glasses.ts`
+  commits its per-container "what's on screen" state only when the SDK call
+  returns `true`, races every call against a timeout (a BLE call that never
+  settles would wedge the serialized pump and freeze the HUD for good), and on
+  any failure forgets the page so the next render repaints from scratch. Don't
+  "optimize" the mirror updates back to unconditional.
+- **A list rebuild resets the firmware highlight to row 0 — resync or misfire.**
+  The app's `listSelectIndex` mirrors the firmware's highlight, but taps on row
+  0 arrive with `currentSelectItemIndex` protobuf-dropped, so a stale index
+  fires the WRONG row (opens the wrong session, wrong menu action, Deny instead
+  of Allow). `GlassesDisplay.onListRebuild` fires after every full list build and
+  main.ts resets the index there; when a tap carries no index, the row is
+  resolved from `currentSelectItemName` against `GlassesDisplay.listItems`. Keep
+  both paths when touching list code — this bug class was reproduced live
+  (tapping "Dictate" opened the Commands submenu).
+- **The session list is sorted by title, client-side.** The bridge orders by
+  recent activity, which churns every poll — each reorder is a rebuild that
+  yanks the highlight to the top and re-routes the next tap. Don't surface the
+  bridge's order on a native list.
 - **Exactly one `isEventCapture:1` container per page** (the scroll/tap target).
 - **Gesture events are messy:** they arrive as `listEvent` OR `textEvent` OR
   `sysEvent` — coalesce all three. `CLICK_EVENT` is `0`, which protobuf drops,

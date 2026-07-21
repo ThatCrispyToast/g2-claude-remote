@@ -173,6 +173,14 @@ class App {
 
     if (this.bridge) {
       this.glasses = new GlassesDisplay(this.bridge)
+      // Every full list (re)build resets the firmware's selection highlight to
+      // row 0 — resync the tracked index or the next row-0 tap (protobuf drops
+      // index 0, so it arrives indexless) would fire whatever stale row this
+      // still pointed at: the wrong session, the wrong menu entry, or Deny
+      // instead of Allow.
+      this.glasses.onListRebuild = () => {
+        this.listSelectIndex = 0
+      }
       this.voice = new VoiceDictation(this.bridge)
       await this.glasses.init(`${APP_TITLE}\n\nconnecting`)
       this.bridge.onEvenHubEvent((e) => this.onHubEvent(e))
@@ -277,6 +285,12 @@ class App {
   // ── active-session list ────────────────────────────────────────────────
   private async refreshSessions(): Promise<void> {
     const list = await this.rc.listActive()
+    // The bridge orders by recent activity, which CHURNS between polls — on the
+    // glasses every reorder is a list rebuild that yanks the highlight to the
+    // top mid-scroll, and a tap can land on a different session than the one
+    // the wearer picked. Sort by title (id tiebreak) so rows hold still; the
+    // status dot already says which sessions are busy.
+    list.sort((a, b) => a.title.localeCompare(b.title) || a.id.localeCompare(b.id))
     this.sessions = list
     // The firmware owns the list highlight now, so no cursor to clamp here.
     // Keep the open session's metadata fresh, and detect if it went inactive.
@@ -884,9 +898,18 @@ class App {
     if (!envelope) return
     if (e.sysEvent?.imuData) return // an IMU frame, not a gesture (IMU is never enabled)
     // On native-list pages the firmware moves the highlight itself and reports
-    // the selected row here (on both scroll and tap) — track it for onTap.
-    if (e.listEvent && typeof e.listEvent.currentSelectItemIndex === 'number') {
-      this.listSelectIndex = e.listEvent.currentSelectItemIndex
+    // the selected row here (on both scroll and tap) — track it for onTap. When
+    // the index is absent (protobuf drops index 0; some firmware omits it more
+    // broadly) fall back to resolving the row by its reported item TEXT against
+    // the labels actually on the glass, so a tap still fires the highlighted row
+    // instead of whatever this last pointed at.
+    if (e.listEvent) {
+      if (typeof e.listEvent.currentSelectItemIndex === 'number') {
+        this.listSelectIndex = e.listEvent.currentSelectItemIndex
+      } else if (typeof e.listEvent.currentSelectItemName === 'string' && this.glasses) {
+        const i = this.glasses.listItems.indexOf(e.listEvent.currentSelectItemName)
+        if (i >= 0) this.listSelectIndex = i
+      }
     }
     // CLICK_EVENT is 0 and protobuf omits zero-value fields, so a tap arrives with
     // eventType === undefined → coalesce to CLICK.

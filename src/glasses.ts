@@ -62,13 +62,25 @@ export const HUD = {
 
 const W = 576
 const H = 288
+// Every SDK page call is raced against this timeout: the pump is serialized, so
+// ONE bridge promise that never settles (a BLE hiccup, the app backgrounded
+// mid-call) would otherwise wedge `busy` forever and freeze the HUD for the rest
+// of the session while the panel kept working. A timeout is treated as a failed
+// apply: the state mirror is invalidated so the next render retries from scratch.
+const BRIDGE_CALL_TIMEOUT_MS = 4000
 // The header / footer strips are single-line text containers. The firmware draws
 // a scrollbar on ANY text container whose content overflows its height, and one
 // line of the (proportional) firmware font is ~26px tall — so a strip must be
 // tall enough that a line clears its height AND its top+bottom padding, or the
 // header and footer sprout a scrollbar. This height leaves comfortable margin.
 const STRIP_H = 42
-const MAX_ITEM_CHARS = 64 // SDK cap per list item
+// Firmware caps per native list, both validated on (re)build — an over-cap page
+// is REJECTED WHOLE and the screen silently keeps its old contents. Rows beyond
+// 20 are dropped; item text is clamped by UTF-8 BYTES (a 64-char row holding
+// multi-byte HUD glyphs would blow a byte-measured firmware buffer even though
+// its char count looks fine — same trap as the text-container caps below).
+const MAX_LIST_ITEMS = 20
+const MAX_ITEM_BYTES = 63
 // The firmware validates a text container by its UTF-8 BYTE length, not its
 // character count. The documented caps are ~1000 bytes for a (re)build and ~2000
 // for an in-place upgrade — but our HUD glyphs (● ◆ » · → …) are 2–3 bytes each,
@@ -100,8 +112,20 @@ export class GlassesDisplay {
   private curBody = '' // 'scroll' body
   private curFooter = '' // 'scroll' footer
   private curItemsSig = '' // 'list' items signature
+  private curItems: string[] = [] // 'list' items as applied (clamped), for tap resolution
+
+  /** Fired after every full (re)build of a native list — the firmware resets its
+   *  selection highlight to row 0 then, so the owner must resync any tracked
+   *  index or a later row-0 tap (whose index protobuf drops) fires a stale row. */
+  onListRebuild: (() => void) | null = null
 
   constructor(private readonly bridge: EvenAppBridge) {}
+
+  /** The item labels of the native list currently on the glasses, exactly as
+   *  applied (clamped) — what listEvent.currentSelectItemName echoes back. */
+  get listItems(): readonly string[] {
+    return this.curItems
+  }
 
   /** Create the initial page (a text screen). Call once before anything else. */
   async init(initial = ''): Promise<boolean> {
@@ -154,25 +178,26 @@ export class GlassesDisplay {
   private async applyText(raw: string): Promise<void> {
     const content = clampBytes(raw, BODY_BYTE_CAP, 'head')
     if (this.kind !== 'text') {
-      await this.rebuild({ containerTotalNum: 1, textObject: [textBox(BODY_ID, 'display', content, full())] })
+      if (!(await this.rebuild({ containerTotalNum: 1, textObject: [textBox(BODY_ID, 'display', content, full())] }))) return
       this.kind = 'text'
       this.curText = content
       return
     }
     if (content === this.curText) return
-    await this.upgrade(BODY_ID, 'display', content)
-    this.curText = content
+    if (await this.upgrade(BODY_ID, 'display', content)) this.curText = content
   }
 
   // ── list (fixed header + native list) ──────────────────────────────────
   private async applyList(header: string, rawItems: string[]): Promise<void> {
-    const items = (rawItems.length ? rawItems : ['(none)']).map((i) => i.replace(/\s+/g, ' ').slice(0, MAX_ITEM_CHARS))
+    const items = (rawItems.length ? rawItems : ['(none)'])
+      .slice(0, MAX_LIST_ITEMS)
+      .map((i) => clampBytes(i.replace(/\s+/g, ' '), MAX_ITEM_BYTES, 'head'))
     const itemsSig = items.join('')
     const hdr = header.slice(0, 200)
 
     if (this.kind !== 'list' || itemsSig !== this.curItemsSig) {
       // Items can't be mutated in place — (re)build the whole page.
-      await this.rebuild({
+      const ok = await this.rebuild({
         containerTotalNum: 2,
         // A thin header strip, then the framed native list — the same frame as the
         // scroll body, so the list is clearly set off from the header above it.
@@ -199,18 +224,20 @@ export class GlassesDisplay {
           }),
         ],
       })
+      if (!ok) return
       this.kind = 'list'
       this.curHeader = hdr
       this.curItemsSig = itemsSig
+      this.curItems = items
       this.curBody = ''
       this.curFooter = ''
+      this.onListRebuild?.() // firmware highlight is back at row 0 now
       return
     }
     // Same items, header text changed → upgrade only the header strip (keeps the
     // firmware's current row highlight; a rebuild would reset it to the top).
     if (hdr !== this.curHeader) {
-      await this.upgrade(HDR_ID, 'hdr', hdr)
-      this.curHeader = hdr
+      if (await this.upgrade(HDR_ID, 'hdr', hdr)) this.curHeader = hdr
     }
   }
 
@@ -225,7 +252,7 @@ export class GlassesDisplay {
       // owns the whole middle, and a thin footer strip. The body's frame is what
       // sets it apart from the header/footer so the regions never run together.
       const b = clampBytes(body, BODY_BYTE_CAP, 'tail')
-      await this.rebuild({
+      const ok = await this.rebuild({
         containerTotalNum: 3,
         textObject: [
           textBox(HDR_ID, 'hdr', hdr, strip(0, STRIP_H), { capture: 0 }),
@@ -233,6 +260,7 @@ export class GlassesDisplay {
           textBox(FTR_ID, 'ftr', ftr, strip(H - STRIP_H, STRIP_H), { capture: 0 }),
         ],
       })
+      if (!ok) return
       this.kind = 'scroll'
       this.curHeader = hdr
       this.curBody = b
@@ -244,31 +272,57 @@ export class GlassesDisplay {
     // body is only upgraded when its text actually changes (i.e. while live —
     // history keeps a frozen body, so this diff skips it and scroll stays put).
     if (hdr !== this.curHeader) {
-      await this.upgrade(HDR_ID, 'hdr', hdr)
-      this.curHeader = hdr
+      if (await this.upgrade(HDR_ID, 'hdr', hdr)) this.curHeader = hdr
     }
     const b = clampBytes(body, BODY_BYTE_CAP, 'tail')
     if (b !== this.curBody) {
-      await this.upgrade(BODY_ID, 'body', b)
-      this.curBody = b
+      if (await this.upgrade(BODY_ID, 'body', b)) this.curBody = b
     }
     if (ftr !== this.curFooter) {
-      await this.upgrade(FTR_ID, 'ftr', ftr)
-      this.curFooter = ftr
+      if (await this.upgrade(FTR_ID, 'ftr', ftr)) this.curFooter = ftr
     }
   }
 
   // ── low-level bridge calls ─────────────────────────────────────────────
-  private async rebuild(config: ConstructorParameters<typeof RebuildPageContainer>[0]): Promise<void> {
-    const ok = await this.bridge.rebuildPageContainer(new RebuildPageContainer(config))
+  // Both return whether the write was APPLIED; the callers commit their state
+  // mirror only then. On a rejection or a timed-out bridge promise the mirror is
+  // instead invalidated, so the next render diffs against nothing and repaints
+  // the page from scratch — without this, one dropped write desyncs the mirror
+  // from the glass and every later diff "already matches", freezing the HUD.
+  private async rebuild(config: ConstructorParameters<typeof RebuildPageContainer>[0]): Promise<boolean> {
+    const ok = await this.timed(this.bridge.rebuildPageContainer(new RebuildPageContainer(config)))
     // A `false` here means the firmware validated the page away (usually an
     // oversize container) and the screen silently kept its old contents.
-    if (ok === false) console.warn('[glasses] rebuildPageContainer rejected — layout not applied')
+    if (ok !== true) {
+      console.warn('[glasses] rebuildPageContainer rejected/timed out — layout not applied')
+      this.invalidate()
+    }
+    return ok === true
   }
 
-  private async upgrade(containerID: number, containerName: string, content: string): Promise<void> {
-    const ok = await this.bridge.textContainerUpgrade(new TextContainerUpgrade({ containerID, containerName, content }))
-    if (ok === false) console.warn(`[glasses] textContainerUpgrade(${containerName}) rejected — content not applied`)
+  private async upgrade(containerID: number, containerName: string, content: string): Promise<boolean> {
+    const ok = await this.timed(this.bridge.textContainerUpgrade(new TextContainerUpgrade({ containerID, containerName, content })))
+    if (ok !== true) {
+      console.warn(`[glasses] textContainerUpgrade(${containerName}) rejected/timed out — content not applied`)
+      this.invalidate()
+    }
+    return ok === true
+  }
+
+  /** Race a bridge write against BRIDGE_CALL_TIMEOUT_MS (null = timed out). */
+  private timed(p: Promise<boolean>): Promise<boolean | null> {
+    return Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), BRIDGE_CALL_TIMEOUT_MS))])
+  }
+
+  /** Forget what's on screen so the next render rebuilds the page from scratch. */
+  private invalidate(): void {
+    this.kind = null
+    this.curText = ''
+    this.curHeader = ''
+    this.curBody = ''
+    this.curFooter = ''
+    this.curItemsSig = ''
+    this.curItems = []
   }
 
   /** Tear down the glasses page (exit the app). 0 = exit now. */

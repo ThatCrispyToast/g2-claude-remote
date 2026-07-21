@@ -140,8 +140,6 @@ export const HUD_CHARS_PER_ROW = numEnv(env.VITE_HUD_CHARS_PER_ROW, 40)
  * Kept under glasses.ts's per-container byte ceiling (BODY_BYTE_CAP ≈ 980).
  */
 export const HISTORY_WINDOW_BYTES = numEnv(env.VITE_HISTORY_BYTES, 900)
-/** Max sessions / menu rows shown on one list screen (SDK caps list items at 20). */
-export const MAX_LIST_ROWS = numEnv(env.VITE_MAX_LIST_ROWS, 12)
 /** Clip a tool command / permission input to this many chars on the HUD. */
 export const INPUT_CLIP_CHARS = numEnv(env.VITE_INPUT_CLIP_CHARS, 140)
 
