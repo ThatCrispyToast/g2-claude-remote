@@ -1,7 +1,7 @@
 {
   "name": "claude-remote",
   "private": true,
-  "version": "1.4.1",
+  "version": "1.5.0",
   "repository": "github:ThatCrispyToast/g2-claude-remote",
   "description": "Monitor and steer Claude Code Remote Control sessions from Even Realities G2 glasses",
   "license": "MIT",
@@ -12,7 +12,7 @@
     "bridge:uv": "uv run --project ../claude-rc-api python server/rc_bridge.py",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "pack": "npm run build && node scripts/prepack.mjs && evenhub pack app.local.json dist -o claude-remote-$npm_package_version.ehpk",
+    "pack": "npm run build && node scripts/check-versions.mjs && evenhub pack app.json dist -o claude-remote-$npm_package_version.ehpk",
     "simulate": "evenhub-simulator http://localhost:5175"
   },
   "dependencies": {

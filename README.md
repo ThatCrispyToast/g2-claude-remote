@@ -117,11 +117,13 @@ The app side has two layers, and the higher one wins:
 
 1. Runtime settings - the panel's Settings card (bridge URL, token, Deepgram
    key), saved on the device and kept across app restarts. This is how you
-   configure a prebuilt `.ehpk`. Inside the Even app these persist through the
+   configure a packed `.ehpk`. Inside the Even app these persist through the
    SDK's app-side store; a plain browser keeps them in localStorage.
-2. Build-time defaults - `VITE_*` vars in `.env.local`, baked in by Vite. See
-   [`.env.example`](.env.example) for the full list (poll interval, HUD window
-   sizes, quick-sends, voice knobs).
+2. Dev-server defaults - `VITE_*` vars in `.env.local`, read by `npm run dev`
+   only. See [`.env.example`](.env.example) for the full list (poll interval,
+   HUD window sizes, quick-sends, voice knobs). Packs never include them:
+   `npm run pack` builds with env resolution disabled, so an `.ehpk` carries no
+   keys or hosts no matter what is in `.env.local`.
 
 The bridge takes CLI flags and `RC_BRIDGE_*` env vars, and also reads
 `.env.local` (`VITE_BRIDGE_TOKEN` doubles as its token), so one file configures
@@ -154,13 +156,11 @@ checkout's uv environment.
 npm run pack                   # → claude-remote-<version>.ehpk
 ```
 
-This builds the bundle, then generates a local manifest (`app.local.json`,
-gitignored) with the version stamped from `package.json` and your bridge host
-added to the network whitelist. It bakes `.env.local` values in as defaults, so
-pack with an empty `.env.local` for a distributable build and configure
-everything after install. (The tracked manifest whitelists `"*"`; if your Even
-app build enforces exact origins, packing with your bridge URL in `.env.local`
-whitelists the concrete origin too.)
+This builds the bundle and packs it with the tracked `app.json`. Every pack is
+distributable: the build resolves no `VITE_*` vars, so nothing from `.env.local`
+ends up in the artifact - all configuration happens after install, in the
+panel's Settings card. The pack refuses to run if `package.json` and `app.json`
+disagree on the version (bump both together).
 
 ### Running the bridge as a service
 
@@ -188,13 +188,13 @@ WantedBy=default.target
 
 ```
 server/                the bridge — a pip/uv package (claude-remote-bridge)
-scripts/prepack.mjs    generates app.local.json (whitelist + version) at pack time
+scripts/               pack-time guard (package.json ↔ app.json version check)
 assets/                app icons for the Even Hub listing
 src/
   main.ts              app state machine, event routing, stream lifecycle
   glasses.ts           576×288 renderer: native text / list / scroll layouts
   ui.ts                the companion browser panel (incl. the Settings card)
-  config.ts            config: runtime settings → VITE_* env → defaults
+  config.ts            config: runtime settings → dev-only VITE_* env → defaults
   rc/                  bridge contract, typed fetch wrappers, SSE stream
   events/              rolling event log + HUD line formatting
   input/               Compose menu model, voice dictation orchestration

@@ -6,9 +6,10 @@ has the architecture, controls, and project layout; this file is the operating
 notes and sharp edges.
 
 Ship model: the client is distributed as a prebuilt `.ehpk`; the bridge runs on
-any host logged in to Claude Code. So no secret may ever be REQUIRED at build
-time — the panel's Settings card (runtime settings in localStorage, layered
-above the baked `VITE_*` values in `config.ts`) is the end-user config path.
+any host logged in to Claude Code. Builds carry NO configuration at all — every
+pack is a distribution pack — so the panel's Settings card (runtime settings in
+localStorage) is the end-user config path, and no secret may ever be required
+at build time.
 
 ## Rules
 
@@ -46,18 +47,21 @@ above the baked `VITE_*` values in `config.ts`) is the end-user config path.
 npm run dev          # app dev server → 0.0.0.0:5175
 npm run bridge       # bridge → 0.0.0.0:8790 (config from .env.local)
 npm run bridge:uv    # bridge through ../claude-rc-api's uv env (sibling checkout)
-npm run pack         # build + prepack → claude-remote-<version>.ehpk
+npm run pack         # env-free build + version check → claude-remote-<version>.ehpk
 npx @evenrealities/evenhub-cli qr --url http://<host>:5175   # sideload QR
 ```
 
 - **Bump `version` in both `package.json` and `app.json`** (kept identical) on
-  every code/manifest change — `pack` stamps it into the artifact name.
-- **`pack` packs `app.local.json`, not `app.json`.** Prepack folds `.env.local`'s
-  bridge host (+ `VITE_NET_WHITELIST_EXTRA`) into the gitignored local manifest.
-  A pack made WITH `.env.local` present bakes your token/keys in — personal
-  builds only; distribute only packs made with `.env.local` set aside. (The
-  tracked manifest whitelists `"*"`; whether phones honor the wildcard is
-  unverified on hardware.)
+  every code/manifest change — `pack` stamps it into the artifact name, and
+  `scripts/check-versions.mjs` fails the pack if the two drift.
+- **Every pack is a distribution pack.** `pack` packs the tracked `app.json`
+  verbatim, and the build resolves NO `VITE_*` vars (`envPrefix` is swapped to a
+  never-matching prefix for `vite build` — see vite.config.ts), so `.env.local`
+  never enters an artifact: no keys, no tokens, no personal hosts. There is no
+  personal-pack flavor; `VITE_*` vars affect `npm run dev` only. Connectivity
+  therefore rides `app.json`'s `"*"` network-whitelist entry (whether phones
+  honor the wildcard is unverified on hardware — there is no per-host whitelist
+  folding anymore).
 - **The simulator runs headlessly.** `@evenrealities/sim-linux-x64` is a
   GTK/WebKit binary: run under `xvfb-run` (on NixOS, put its libs on
   `NIX_LD_LIBRARY_PATH` via nix-ld) with `--automation-port 9898`, then drive it
@@ -186,7 +190,7 @@ npx @evenrealities/evenhub-cli qr --url http://<host>:5175   # sideload QR
   effort control's fallback uses — see rule 4). The Compose → Commands submenu
   (`commandItems`, `fireSlashCommand`) and the panel's `/` autocomplete both go
   through the existing `send`/`onSend` path. Adding a command is a `SLASH_COMMANDS`
-  config entry (`VITE_SLASH_COMMANDS` to override), never new bridge code.
+  config entry (`VITE_SLASH_COMMANDS` overrides it in dev), never new bridge code.
 - **Curate to fire-and-observe commands only, and VALIDATE live.** Not every
   command works over remote-control, and the failure modes are silent-ish:
   - **Refused by the worker** — some print `"/<name> isn't available over Remote
@@ -229,9 +233,10 @@ npx @evenrealities/evenhub-cli qr --url http://<host>:5175   # sideload QR
 ## Config & secrets
 
 - **Layering, runtime wins:** panel-saved settings (`claude-remote.settings` in
-  localStorage) → `VITE_*` baked from `.env.local` → defaults. When debugging
+  localStorage) → `VITE_*` from `.env.local` (DEV SERVER ONLY — builds resolve
+  no env, so on a packed build this layer is empty) → defaults. When debugging
   "why THAT bridge/token", check localStorage before the env. Never make a
-  `VITE_` secret required at build time.
+  `VITE_` value required at build time — packs must work with none set.
 - **Panel settings persist via the SDK, not browser storage.** The Settings card
   saves to the WebView's `window.localStorage`, but the Even app EVICTS that
   between launches — so `main.ts` mirrors the same `claude-remote.settings` JSON
@@ -258,9 +263,8 @@ npx @evenrealities/evenhub-cli qr --url http://<host>:5175   # sideload QR
 
 - **PUBLIC** — origin is `github.com/ThatCrispyToast/g2-claude-remote`.
   Everything committed is world-readable: never commit tokens, tailnet
-  hostnames/IPs, or personal paths (`.env.local` / `app.local.json` / `*.ehpk` /
-  `*.log` are gitignored for exactly that reason). Distribution packs must be
-  made with `.env.local` set aside.
+  hostnames/IPs, or personal paths (`.env.local` / `*.ehpk` / `*.log` are
+  gitignored for exactly that reason).
 - The local-only `backup/pre-publish-history` branch holds the pre-squash
   history and must NEVER be pushed; the old private `rc-g2` GitHub repo stays
   private. No auto-push — commit + push manually when asked.

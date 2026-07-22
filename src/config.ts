@@ -1,9 +1,11 @@
 // Central configuration for Claude Remote.
 //
 // Secrets and per-user overrides come from two layers (highest wins):
-//   1. Runtime settings saved from the companion panel (localStorage) — so a
-//      packed build never needs secrets baked in.
-//   2. Vite env vars (prefix `VITE_`, in `.env.local`), baked in at build time.
+//   1. Runtime settings saved from the companion panel (localStorage) — the
+//      only config path on an installed build.
+//   2. Vite env vars (prefix `VITE_`, in `.env.local`) — DEV SERVER ONLY.
+//      `vite build` resolves no env vars (see `envPrefix` in vite.config.ts),
+//      so a pack never carries them; every pack is a distribution pack.
 // Everything else has a sensible default so the app runs with just a bridge
 // URL + token. See `.env.example`.
 
@@ -68,12 +70,14 @@ function boolEnv(value: unknown, def: boolean): boolean {
   return String(value).toLowerCase() !== 'false'
 }
 
+// In a build every `VITE_*` read below is undefined by construction (see
+// vite.config.ts), so packs land on the defaults + runtime settings.
 const env = import.meta.env
 
 // ─── The bridge (Claude Remote bridge → claude-rc-api → Anthropic) ───────────
 /** Resolve the effective bridge URL / token from a settings snapshot (runtime
- *  setting wins over the baked `VITE_` value; then a sensible default). Shared by
- *  the load-time consts and the live `currentBridge()` re-read below. */
+ *  setting wins over the dev-only `VITE_` value; then a sensible default). Shared
+ *  by the load-time consts and the live `currentBridge()` re-read below. */
 function resolveBridgeUrl(s: RuntimeSettings): string {
   return strEnv(s.bridgeUrl ?? env.VITE_BRIDGE_URL, 'http://localhost:8790').replace(/\/+$/, '')
 }
@@ -98,7 +102,7 @@ export function currentBridge(): { url: string; token: string } {
   return { url: resolveBridgeUrl(s), token: resolveBridgeToken(s) }
 }
 
-/** Whether a bridge has been configured at all — a saved setting OR a baked
+/** Whether a bridge has been configured at all — a saved setting OR a dev-only
  *  `VITE_` value. When false and the first connection fails, the app shows the
  *  first-run setup screen (point the wearer at the panel's Settings card) rather
  *  than a raw connection error. Live, so it re-evaluates after a settings save. */
