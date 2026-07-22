@@ -11,17 +11,17 @@ to dictate. A companion phone panel mirrors it all with a fuller control surface
 
 ## Quick start
 
-1. **Install the app** on your glasses - from the Even Hub, or sideload a packed
+1. **Install the app** on your glasses from the Even Hub, or sideload a packed
    `claude-remote-<version>.ehpk`.
 
 2. **Run the bridge** on the machine where you're logged in to Claude Code (needs
-   [uv](https://docs.astral.sh/uv/)):
+   [uv](https://docs.astral.sh/uv/)) or an analagous python manager:
 
    ```bash
    uvx --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge
    ```
 
-   It prints the URLs your phone can reach it at and a bearer token - a word
+   It prints the URLs your phone can reach it at and a bearer token: a word
    passphrase like `coral-anvil-mango-scoop-visor`, generated on first run and
    saved to `~/.config/claude-remote/bridge-token`.
 
@@ -30,9 +30,9 @@ to dictate. A companion phone panel mirrors it all with a fuller control surface
    dictation; leave it blank and voice disables itself.
 
 Can't connect? Open the bridge's port (default `8790`) in the host firewall.
-Keep the bridge on a private network - LAN or Tailscale. The token is the only
-guard, and it can read and steer every remote-control session of the logged-in
-account. Flags and env vars: [`server/README.md`](server/README.md).
+
+> [!CAUTION]
+> Keep the bridge on a private network i.e. LAN or Tailscale. The token is the only guard, and it can read and steer every remote-control session of the logged-in account. Flags and env vars: [`server/README.md`](server/README.md).
 
 ## What it does
 
@@ -44,12 +44,8 @@ account. Flags and env vars: [`server/README.md`](server/README.md).
 - **Steer hands-free** - interrupt, switch model / permission mode / reasoning
   effort, fire slash commands (`/context`, `/usage`, `/compact`, …), send canned
   replies, or dictate by voice.
-- **Nothing fires on a stray tap** - every canned send and finished dictation
-  lands on a confirm screen showing the full message first.
 - **Active sessions only** - archived and dead ones never reach the glasses, and
   every control action re-checks before it acts.
-- **No secrets in the build** - the packed app carries no keys or hosts. You set
-  the bridge URL, token, and Deepgram key at runtime, in the panel's Settings card.
 
 <p align="center">
   <img src="assets/store/01-sessions.png" width="49%" alt="Sessions list">
