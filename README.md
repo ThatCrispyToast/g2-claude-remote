@@ -79,7 +79,7 @@ answering blocking prompts.
 
 | Screen | Scroll ↑ / ↓ | Tap | Double-tap |
 |---|---|---|---|
-| **Sessions list** | move selection | open session | exit app |
+| **Sessions list** | move selection | open session | exit dialog |
 | **Session view** | native scroll - up into history, down to live | open Compose menu | back to list |
 | **Compose menu** | move selection | fire action / enter submenu | back to session |
 | **Commands submenu** | move selection | fire slash command | back to Compose |

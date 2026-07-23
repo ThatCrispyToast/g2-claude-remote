@@ -325,7 +325,8 @@ export class GlassesDisplay {
     this.curItems = []
   }
 
-  /** Tear down the glasses page (exit the app). 0 = exit now. */
+  /** Tear down the glasses page (exit the app). 0 = exit immediately;
+   *  1 = system exit-confirm dialog — Even Hub requires 1 on the root page. */
   async shutdown(exitMode = 0): Promise<void> {
     try {
       await this.bridge.shutDownPageContainer(exitMode)

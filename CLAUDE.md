@@ -119,6 +119,14 @@ npx @evenrealities/evenhub-cli qr --url http://<host>:5175   # sideload QR
   yanks the highlight to the top and re-routes the next tap. Don't surface the
   bridge's order on a native list.
 - **Exactly one `isEventCapture:1` container per page** (the scroll/tap target).
+- **Root-page exit MUST be `shutDownPageContainer(1)`** (the system exit-confirm
+  dialog) — Even Hub review REJECTS a mode-0 immediate exit on the root page
+  (rejection received 2026-07-22; see hub.evenrealities.com/docs/ship/app-submission,
+  which also floors `min_sdk_version` at 0.0.12). Because the user can cancel
+  that dialog, `exit()` must NOT tear anything down — cleanup belongs to
+  `SYSTEM_EXIT_EVENT` / `beforeunload` only. The simulator doesn't render the
+  dialog (it just blanks the glasses page); the confirm layer is only visible
+  on hardware via a beta build.
 - **Gesture events are messy:** they arrive as `listEvent` OR `textEvent` OR
   `sysEvent` — coalesce all three. `CLICK_EVENT` is `0`, which protobuf drops,
   so a tap arrives as `eventType === undefined`. IMU frames are ignored.

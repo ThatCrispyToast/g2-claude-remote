@@ -1243,9 +1243,18 @@ class App {
     this.go('error')
   }
 
+  /** Root-page exit: request the SYSTEM exit dialog (mode 1). Even Hub review
+   *  rejects an immediate mode-0 exit on the root page. The user can cancel
+   *  the dialog, so nothing is torn down here — cleanup runs only when the
+   *  confirmed exit arrives as SYSTEM_EXIT_EVENT (or on beforeunload). In
+   *  panel-only mode there is no system dialog; the Exit button just stops
+   *  the app (the browser tab owns the page lifecycle). */
   private async exit(): Promise<void> {
-    this.cleanup()
-    await this.glasses?.shutdown(0)
+    if (!this.glasses) {
+      this.cleanup()
+      return
+    }
+    await this.glasses.shutdown(1)
   }
 
   private render(): void {
