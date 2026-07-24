@@ -11,8 +11,9 @@ to dictate. A companion phone panel mirrors it all with a fuller control surface
 
 ## Quick start
 
-1. **Install the app** on your glasses from the Even Hub, or sideload a packed
-   `claude-remote-<version>.ehpk`.
+1. **Install the app** on your glasses from the
+   [Even Hub](https://evenhub.evenrealities.com/landing?package_id=com.thatcrispytoast.clauderemote),
+   or sideload a packed `claude-remote-<version>.ehpk`.
 
 2. **Run the bridge** on the machine where you're logged in to Claude Code (needs
    [uv](https://docs.astral.sh/uv/)) or an analagous python manager:
