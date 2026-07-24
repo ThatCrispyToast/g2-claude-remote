@@ -1,7 +1,7 @@
 {
   "name": "claude-remote",
   "private": true,
-  "version": "1.5.1",
+  "version": "1.5.2",
   "repository": "github:ThatCrispyToast/g2-claude-remote",
   "description": "Monitor and steer Claude Code Remote Control sessions from Even Realities G2 glasses",
   "license": "MIT",

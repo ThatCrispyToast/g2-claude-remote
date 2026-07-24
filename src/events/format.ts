@@ -178,7 +178,7 @@ export function isQuestionRequest(e: RcEvent): boolean {
   return tool === 'AskUserQuestion'
 }
 
-/** `claude-opus-4-8` → `opus-4-8`; '' → 'unknown'. */
+/** `claude-opus-5` → `opus-5`; '' → 'unknown'. */
 function modelTail(m: string | null): string {
   if (!m) return 'unknown'
   return m.replace(/^claude-/, '')
