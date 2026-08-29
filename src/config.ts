@@ -21,6 +21,9 @@ export interface RuntimeSettings {
   bridgeUrl?: string
   bridgeToken?: string
   deepgramApiKey?: string
+  /** Deepgram language code for dictation (`en`, `de`, `multi`, …). Unset = the
+   *  build default (see `STT_LANGUAGE`). */
+  sttLanguage?: string
   /** Ids of baked release notices already dismissed on this device (notices.ts).
    *  Rides the same blob so the main.ts SDK-store mirror persists it for free. */
   seenNotices?: string[]
@@ -47,8 +50,9 @@ export function saveRuntimeSettings(s: RuntimeSettings): void {
     if (s.bridgeUrl?.trim()) clean.bridgeUrl = s.bridgeUrl.trim()
     if (s.bridgeToken?.trim()) clean.bridgeToken = s.bridgeToken.trim()
     if (s.deepgramApiKey?.trim()) clean.deepgramApiKey = s.deepgramApiKey.trim()
+    if (s.sttLanguage?.trim()) clean.sttLanguage = s.sttLanguage.trim().toLowerCase()
     // Seen-notice ids are NOT connection settings: the Settings card's Save and
-    // Reset pass only their three fields, and neither may resurrect notices the
+    // Reset pass only their own fields, and neither may resurrect notices the
     // wearer already dismissed — so when the caller doesn't provide the list
     // (only notices.ts does), carry the stored one forward.
     const seen = s.seenNotices ?? loadRuntimeSettings().seenNotices
@@ -288,7 +292,19 @@ export function currentDeepgramKey(): string {
   return resolveDeepgramKey(loadRuntimeSettings())
 }
 export const DEEPGRAM_MODEL = strEnv(env.VITE_DEEPGRAM_MODEL, 'nova-3')
-export const STT_LANGUAGE = strEnv(env.VITE_STT_LANGUAGE, 'en')
+/** Deepgram language code sent as `?language=` (`en`, `de`, `multi` for mixed
+ *  speech, …). Runtime setting wins over the dev-only `VITE_` value; the build
+ *  default is English. Nova-3 accepts any of Deepgram's language codes here. */
+function resolveSttLanguage(s: RuntimeSettings): string {
+  return strEnv(s.sttLanguage ?? env.VITE_STT_LANGUAGE, 'en')
+}
+export const STT_LANGUAGE = resolveSttLanguage(runtime)
+/** The dictation language RIGHT NOW (re-reads saved settings — see `currentBridge`),
+ *  so a language saved in the Settings card applies to the next dictation without
+ *  a reload. */
+export function currentSttLanguage(): string {
+  return resolveSttLanguage(loadRuntimeSettings())
+}
 /** Master switch for voice dictation (also needs the Deepgram key). */
 const VOICE_MASTER = boolEnv(env.VITE_VOICE_ENABLED, true)
 /** Live voice availability: the master switch plus a Deepgram key entered in the

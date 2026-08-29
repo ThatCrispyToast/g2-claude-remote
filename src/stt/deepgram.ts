@@ -21,7 +21,7 @@ import {
   RECONNECT_MAX_DELAY_MS,
   SAMPLE_RATE,
   STOP_FLUSH_TIMEOUT_MS,
-  STT_LANGUAGE,
+  currentSttLanguage,
 } from '../config'
 
 export type CaptionerStatus = 'connecting' | 'live' | 'reconnecting' | 'stopped'
@@ -164,7 +164,10 @@ export class LiveCaptioner {
       smart_format: 'true',
       punctuate: 'true',
     })
-    if (STT_LANGUAGE) qs.set('language', STT_LANGUAGE)
+    // Read live so a language saved in the Settings card applies to the next
+    // dictation (and to reconnects) without a reload.
+    const language = currentSttLanguage()
+    if (language) qs.set('language', language)
 
     // Browsers can't set an Authorization header on a WebSocket, so Deepgram
     // accepts the key as a `token` subprotocol.

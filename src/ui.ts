@@ -29,7 +29,7 @@ import type {
   WorkerState,
 } from './rc/types'
 import type { Notice } from './notices'
-import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, loadRuntimeSettings, saveRuntimeSettings } from './config'
+import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, STT_LANGUAGE, loadRuntimeSettings, saveRuntimeSettings } from './config'
 import { cleanUserEcho, isQuestionRequest, settingsLine } from './events/format'
 
 /** A side question on show: asking (answer + error null), answered, or failed. */
@@ -247,6 +247,11 @@ export class Panel {
             <input id="setDeepgramKey" class="set-input" type="password" autocapitalize="off"
               placeholder="${DEEPGRAM_API_KEY ? '(using built-in key)' : '(voice disabled)'}" value="${escapeHtml(rt.deepgramApiKey ?? '')}" />
           </label>
+          <label class="field">
+            <span class="field-label">Dictation language (Deepgram code: en, de, fr, multi…)</span>
+            <input id="setSttLanguage" class="set-input" type="text" autocapitalize="off" autocorrect="off"
+              spellcheck="false" placeholder="${escapeHtml(STT_LANGUAGE)}" value="${escapeHtml(rt.sttLanguage ?? '')}" />
+          </label>
           <div class="settings-hint">Stored only on this device. A blank field falls back to the default shown in it.</div>
           <div class="perm-acts">
             <button id="settingsSave" class="btn primary">Save &amp; connect</button>
@@ -441,6 +446,7 @@ ${settingsHtml}
     const url = root.querySelector<HTMLInputElement>('#setBridgeUrl')
     const token = root.querySelector<HTMLInputElement>('#setBridgeToken')
     const dg = root.querySelector<HTMLInputElement>('#setDeepgramKey')
+    const lang = root.querySelector<HTMLInputElement>('#setSttLanguage')
     root.querySelector<HTMLButtonElement>('#settingsBtn')?.addEventListener('click', () => {
       if (card) card.hidden = !card.hidden
     })
@@ -449,6 +455,7 @@ ${settingsHtml}
         bridgeUrl: url?.value ?? '',
         bridgeToken: token?.value ?? '',
         deepgramApiKey: dg?.value ?? '',
+        sttLanguage: lang?.value ?? '',
       })
       if (card) card.hidden = true
       this.cb.onApplySettings()
@@ -458,6 +465,7 @@ ${settingsHtml}
       if (url) url.value = ''
       if (token) token.value = ''
       if (dg) dg.value = ''
+      if (lang) lang.value = ''
       this.cb.onApplySettings()
     })
   }

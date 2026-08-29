@@ -137,7 +137,7 @@ it to the next launch - and acknowledging on either surface retires it on both.
 Two layers on the app side; the higher wins.
 
 1. **Runtime settings** - the panel's Settings card (bridge URL, token, Deepgram
-   key), stored on the device across app restarts. This is how a packed `.ehpk` is
+   key, dictation language), stored on the device across app restarts. This is how a packed `.ehpk` is
    configured.
 2. **Dev-server defaults** - `VITE_*` vars in `.env.local`, read by `npm run dev`
    only ([`.env.example`](.env.example) lists them all). Packs never include them:
