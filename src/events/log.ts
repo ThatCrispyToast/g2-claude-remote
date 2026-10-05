@@ -24,13 +24,24 @@ export class EventLog {
   // a 27-tool run costs a few rows instead of 27. -1 = no chain open.
   private chainStart = -1
   private chainEntries: string[] = []
+  // The last appended block, when it was a LONE single-line text block: its base
+  // line and how many consecutive events rendered exactly that line. Repeat spam
+  // is real — the worker persists a fresh `system/init` on EVERY controller
+  // attach (each claude.ai open of a session mints one or two, confirmed live),
+  // so an idle session's newest events would render as a wall of identical
+  // "session started" lines. A repeat folds in place to `line xN` instead — the
+  // tool chains' idiom. '' = the last block isn't foldable (multi-line, carried
+  // tools, or no block yet).
+  private foldLine = ''
+  private foldCount = 0
 
   /**
    * Ingest one event: dedupe by sequenceNum, render it, and append the
    * resulting line(s). Events that render to nothing are dropped from the log
    * but still tracked as the latest raw event. A blank spacer line is inserted
    * BETWEEN successive blocks (never leading) so distinct turns are visually
-   * separated on the HUD instead of blurring into one wall of text.
+   * separated on the HUD instead of blurring into one wall of text. A run of
+   * events that each render to one identical line folds into `line xN`.
    *
    * Consecutive tool_uses join one chain block rather than taking a line each.
    * A dropped event does NOT break that run — a tool_result echo lands between
@@ -52,12 +63,27 @@ export class EventLog {
     if (text) {
       this.chainStart = -1
       this.chainEntries = []
+      // An event that renders to the SAME single line as the previous block
+      // folds in place to `line xN` (see foldLine above) instead of stacking a
+      // wall of identical lines. Only the tail line is rewritten, so frozen
+      // history-window indices stay valid — and a line that differs at all
+      // (say an init after a model switch) still gets its own block.
+      if (tools.length === 0 && text === this.foldLine) {
+        this.foldCount++
+        this.lines[this.lines.length - 1] = `${text} x${this.foldCount}`
+        return true
+      }
       if (this.lines.length > 0) this.lines.push('') // spacer between blocks
       for (const line of text.split('\n')) this.lines.push(line)
+      this.foldLine = tools.length === 0 && !text.includes('\n') ? text : ''
+      this.foldCount = 1
     }
     // `attached`: these tools belong to the event whose prose we just wrote, so
     // they stay welded to it instead of opening a spacer-separated block.
-    if (tools.length > 0) this.extendChain(tools, Boolean(text))
+    if (tools.length > 0) {
+      this.foldLine = '' // a chain block ends the foldable run
+      this.extendChain(tools, Boolean(text))
+    }
     this.trim()
     return true
   }
@@ -195,6 +221,8 @@ export class EventLog {
     this.last = undefined
     this.chainStart = -1
     this.chainEntries = []
+    this.foldLine = ''
+    this.foldCount = 0
   }
 }
 

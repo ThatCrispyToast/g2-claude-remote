@@ -123,6 +123,21 @@ npx @evenrealities/evenhub-cli qr --url http://<host>:5175   # sideload QR
   makes every chain exactly one tool long. Only real content (prose, a result, a
   prompt) closes it. The chain re-packs its block IN PLACE on each new tool, and
   only ever rewrites tail lines so frozen history-window indices stay valid.
+- **Workers persist a fresh `system/init` on EVERY controller attach — fold it,
+  don't render it raw.** Confirmed live (2026-08-21, raw wire data): each
+  claude.ai open of a session sends an `initialize` control_request (often
+  twice), and the worker's reply mints one or two `system/init` events — same
+  CLI `session_id`, distinct uuids, no `/clear` or compact involved — plus a
+  burst at process start. So an idle session's newest events are often nothing
+  BUT inits, which used to render as a wall of `☉ session started` lines filling
+  the live tail (checking a session from the phone literally built the wall).
+  Both surfaces fold a run of identically-rendered simple rows in place:
+  `line xN` in `EventLog.append` (tail-line rewrite only, so frozen
+  history-window indices stay valid), `row ×N` in the panel's `appendNode`;
+  conversation bubbles / tool blocks never fold. The fold keys on the RENDERED
+  line being identical — an init that differs (e.g. after a model switch) still
+  gets its own row, which is signal. Don't narrow it to init-specific
+  suppression.
 - **Content caps are BYTES, not chars** (~1000 per rebuild, ~2000 per upgrade,
   999 in the simulator; native lists: 20 rows, ~63 bytes per item), and HUD
   glyphs are 2–3 bytes each — an oversize container is **silently dropped** (the

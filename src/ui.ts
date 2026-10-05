@@ -139,6 +139,13 @@ export class Panel {
   private toastTimer: number | null = null
   /** sequenceNums already rendered in the log — dedupes the history↔stream seam. */
   private seen = new Set<number>()
+  /** The last appended log row, when it was a simple element-less text row: its
+   *  fold key/base and how many consecutive events rendered identically. The
+   *  panel twin of EventLog's fold — the worker persists a `system/init` on
+   *  every controller attach, so without this an idle session's log tail is a
+   *  wall of identical "session started" rows. Conversation bubbles and tool
+   *  blocks (rows with child elements) never fold. */
+  private lastFold: { key: string; base: string; count: number; el: HTMLDivElement } | null = null
   // The `/`-autocomplete popover over the send box: the commands matching what's
   // been typed after the leading slash, and the keyboard-highlighted row.
   private cmdMatches: SlashCommand[] = []
@@ -677,10 +684,10 @@ ${settingsHtml}
     if (!this.logEl) return
     this.logEl.textContent = ''
     this.seen = new Set()
+    this.lastFold = null
     for (const e of events) {
       if (e.sequenceNum != null) this.seen.add(e.sequenceNum)
-      const node = renderEventNode(e)
-      if (node) this.logEl.appendChild(node)
+      this.appendNode(e)
     }
     this.autoScroll()
   }
@@ -693,10 +700,25 @@ ${settingsHtml}
       if (this.seen.has(e.sequenceNum)) return
       this.seen.add(e.sequenceNum)
     }
+    this.appendNode(e)
+    this.autoScroll()
+  }
+
+  /** Render one event into the log, folding a run of identically-rendered
+   *  simple rows into a single `… ×N` row (see `lastFold`). */
+  private appendNode(e: RcEvent): void {
+    if (!this.logEl) return
     const node = renderEventNode(e)
     if (!node) return
+    const foldable = node.childElementCount === 0
+    const key = foldable ? `${node.className}\0${node.textContent ?? ''}` : ''
+    if (foldable && this.lastFold?.key === key) {
+      this.lastFold.count++
+      this.lastFold.el.textContent = `${this.lastFold.base} ×${this.lastFold.count}`
+      return
+    }
     this.logEl.appendChild(node)
-    this.autoScroll()
+    this.lastFold = foldable ? { key, base: node.textContent ?? '', count: 1, el: node } : null
   }
 
   /** Follow the newest event unless the reader scrolled up into history. */
