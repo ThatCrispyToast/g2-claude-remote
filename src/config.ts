@@ -165,10 +165,10 @@ export const TOOL_ARG_CHARS = numEnv(env.VITE_TOOL_ARG_CHARS, 18)
 // ─── Steering vocabulary ─────────────────────────────────────────────────────
 /** Models offered in the Compose → Model submenu (matches the claude-rc web SPA). */
 export const MODELS: ModelChoice[] = [
-  { id: 'claude-opus-5', label: 'Opus 5' },
-  { id: 'claude-sonnet-5', label: 'Sonnet 5' },
+  { id: 'claude-opus-5-5', label: 'Opus 5.5' },
+  { id: 'claude-sonnet-5-5', label: 'Sonnet 5.5' },
   { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
-  { id: 'claude-fable-5', label: 'Fable 5' },
+  { id: 'claude-fable-5-1', label: 'Fable 5.1' },
 ]
 /** Permission modes offered in the Compose → Mode submenu. */
 export const MODES: PermissionMode[] = ['default', 'plan', 'acceptEdits', 'bypassPermissions']
