@@ -1,6 +1,6 @@
 # Claude Remote
 
-Steer live [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+Steer live [Claude Code](https://code.claude.com/docs)
 remote-control sessions from [Even Realities G2](https://www.evenrealities.com)
 glasses: the event stream on the HUD, the touchpad to approve and reply, the mic
 to dictate. A companion phone panel mirrors it all with a fuller control surface.
@@ -12,11 +12,11 @@ to dictate. A companion phone panel mirrors it all with a fuller control surface
 ## Quick start
 
 1. **Install the app** on your glasses from the
-   [Even Hub](https://evenhub.evenrealities.com/landing?package_id=com.thatcrispytoast.clauderemote),
+   [Even Hub](https://hub.evenrealities.com/landing?package_id=com.thatcrispytoast.clauderemote),
    or sideload a packed `claude-remote-<version>.ehpk`.
 
 2. **Run the bridge** on the machine where you're logged in to Claude Code (needs
-   [uv](https://docs.astral.sh/uv/)) or an analagous python manager:
+   [uv](https://docs.astral.sh/uv/)) or an analogous Python manager:
 
    ```bash
    uvx --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge
@@ -106,12 +106,12 @@ un-clipped event log with tool inputs and usage/cost, free-text sends with `/`
 slash-command autocomplete, every steering control, and the Settings card. It
 still works as a plain-browser web app with no glasses connected.
 
-App updates can also carry a **release notice** — a slim dismissible card above
+App updates can also carry a **release notice** - a slim dismissible card above
 the session list for anything important (say, "update your bridge"). Notices are
 baked into the build (nothing is fetched), and each one shows until dismissed,
 then never again on that device. On the glasses the same notice appears once as
-a scrollable screen right after connect — tap acknowledges it, double-tap defers
-it to the next launch — and acknowledging on either surface retires it on both.
+a scrollable screen right after connect - tap acknowledges it, double-tap defers
+it to the next launch - and acknowledging on either surface retires it on both.
 
 <p align="center">
   <img src="assets/store/08-panel.png" width="45%" alt="Companion phone panel">

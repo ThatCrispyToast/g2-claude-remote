@@ -63,6 +63,7 @@ npm run bridge       # bridge → 0.0.0.0:8790 (config from .env.local)
 npm run bridge:uv    # bridge through ../claude-rc-api's uv env (sibling checkout)
 npm run pack         # env-free build + version check → claude-remote-<version>.ehpk
 npx @evenrealities/evenhub-cli qr --url http://<host>:5175   # sideload QR
+python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any token)
 ```
 
 - **Bump `version` in both `package.json` and `app.json`** (kept identical) on
@@ -84,6 +85,13 @@ npx @evenrealities/evenhub-cli qr --url http://<host>:5175   # sideload QR
   Relaunch after every edit — Vite HMR does NOT reload the entry module. The sim
   caps text containers at 999 bytes. Real hardware is still needed for the mic
   and true native scroll.
+- **Point the simulator at the mock bridge, never a real one.** Run the dev
+  server with `VITE_BRIDGE_URL=http://localhost:8791 VITE_BRIDGE_TOKEN=x` (process
+  env beats `.env.local`). A tap on a real session list can fire into a live
+  session, and `assets/store/` must never show real session names — the repo is
+  public. The store shots are staged this way: `--question` blocks
+  payment-service on an AskUserQuestion instead of a Bash permission, and a long
+  `VITE_QUICK_SENDS` text stages the confirm screen.
 - **No Even bridge (plain browser) = panel-only mode** — glasses/gesture/mic
   paths skip; the session list, stream, and steering still work via the panel.
 
