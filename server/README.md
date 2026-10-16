@@ -48,6 +48,7 @@ then `claude-remote-bridge`, or from a repo checkout via `python3 server/rc_brid
 --token TOKEN   bearer token the app must present
 --open          run WITHOUT authentication (dev only)
 --verbose       log every request
+--version       print the bridge version and exit
 ```
 
 Environment variables `RC_BRIDGE_HOST` / `RC_BRIDGE_PORT` / `RC_BRIDGE_TOKEN` /

@@ -62,6 +62,7 @@ as the token) → the persisted token file → generate-and-persist.
 from __future__ import annotations
 
 import argparse
+import hmac
 import ipaddress
 import json
 import math
@@ -490,7 +491,7 @@ class _Handler(BaseHTTPRequestHandler):
     def rc(self) -> RemoteControlClient:
         return self.server.rc  # type: ignore[attr-defined]
 
-    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
+    def log_message(self, fmt: str, *args: Any) -> None:
         if VERBOSE:
             super().log_message(fmt, *args)
 
@@ -518,12 +519,13 @@ class _Handler(BaseHTTPRequestHandler):
     def _authed(self) -> bool:
         if not TOKEN:
             return True  # dev mode: no token configured
+        # Constant-time comparisons, so response timing can't leak how much of a
+        # guessed token matched.
+        expected = TOKEN.encode()
         auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer ") and auth[7:] == TOKEN:
+        if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].encode(), expected):
             return True
-        if self._query().get("token", [None])[0] == TOKEN:
-            return True
-        return False
+        return hmac.compare_digest(self._query().get("token", [""])[0].encode(), expected)
 
     # -- response helpers --------------------------------------------------
     def _cors(self) -> None:
@@ -564,14 +566,14 @@ class _Handler(BaseHTTPRequestHandler):
         return s
 
     # -- OPTIONS (CORS preflight) ------------------------------------------
-    def do_OPTIONS(self) -> None:  # noqa: N802
+    def do_OPTIONS(self) -> None:
         self.send_response(204)
         self._cors()
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     # -- GET ---------------------------------------------------------------
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         path = urlparse(self.path).path
         if not self._authed():
             return self._unauth()
@@ -608,7 +610,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(exc)
 
     # -- POST --------------------------------------------------------------
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         path = urlparse(self.path).path
         body = self._body()  # always drain the body (keep-alive correctness)
         if not self._authed():
