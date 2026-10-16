@@ -95,9 +95,9 @@ function resolveBridgeToken(s: RuntimeSettings): string {
   return strEnv(s.bridgeToken ?? env.VITE_BRIDGE_TOKEN, '')
 }
 /**
- * Base URL of the bridge (server/rc_bridge.py). No trailing slash. Use a name
- * the phone can reach from anywhere you wear the glasses — e.g. the host's
- * Tailscale MagicDNS name (`http://my-box.tailXXXX.ts.net:8790`) or a LAN IP.
+ * Base URL of the bridge (`claude-remote-bridge`, server/). No trailing slash.
+ * Use a name the phone can reach from anywhere you wear the glasses — e.g. the
+ * host's Tailscale MagicDNS name (`http://my-box.tailXXXX.ts.net:8790`) or a LAN IP.
  */
 export const BRIDGE_URL = resolveBridgeUrl(runtime)
 /** Shared secret matching the bridge's RC_BRIDGE_TOKEN. Sent as a Bearer header
@@ -167,7 +167,7 @@ export const TOOL_ARG_CHARS = numEnv(env.VITE_TOOL_ARG_CHARS, 18)
 export const MODELS: ModelChoice[] = [
   { id: 'claude-opus-5-5', label: 'Opus 5.5' },
   { id: 'claude-sonnet-5-5', label: 'Sonnet 5.5' },
-  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
+  { id: 'claude-haiku-5-5', label: 'Haiku 5.5' },
   { id: 'claude-fable-5-1', label: 'Fable 5.1' },
 ]
 /** Permission modes offered in the Compose → Mode submenu. */

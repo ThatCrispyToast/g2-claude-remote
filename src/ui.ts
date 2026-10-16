@@ -18,7 +18,7 @@
 import type { ActiveSession, RcEvent, PermissionRequest, DialogQuestion, WhoAmI, Decision, PermissionMode, SlashCommand } from './rc/types'
 import type { Notice } from './notices'
 import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, loadRuntimeSettings, saveRuntimeSettings } from './config'
-import { cleanUserEcho } from './events/format'
+import { cleanUserEcho, isQuestionRequest } from './events/format'
 
 /** Everything the panel calls back into main.ts to do — main.ts owns the bridge. */
 export interface PanelCallbacks {
@@ -190,7 +190,7 @@ export class Panel {
             <input id="setDeepgramKey" class="set-input" type="password" autocapitalize="off"
               placeholder="${DEEPGRAM_API_KEY ? '(using built-in key)' : '(voice disabled)'}" value="${escapeHtml(rt.deepgramApiKey ?? '')}" />
           </label>
-          <div class="settings-hint">Stored only on this device. Overrides the values baked into the build; leave a field blank to use the built-in one.</div>
+          <div class="settings-hint">Stored only on this device. A blank field falls back to the default shown in it.</div>
           <div class="perm-acts">
             <button id="settingsSave" class="btn primary">Save &amp; connect</button>
             <button id="settingsReset" class="btn">Reset</button>
@@ -890,7 +890,7 @@ function escapeHtml(s: string): string {
 
 /**
  * One RcEvent → a rich log node (or null to drop it: partial stream deltas,
- * control responses, bare tool_result echoes). Unlike the HUD's renderEvent,
+ * control responses, bare tool_result echoes). Unlike the HUD's renderEventParts,
  * this shows the FULL tool input and full usage line — the phone has room.
  */
 function renderEventNode(e: RcEvent): HTMLDivElement | null {
@@ -952,9 +952,7 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
       const row = document.createElement('div')
       row.className = 'ev ev-perm'
       const p = e.permissionRequest
-      const sub = p?.subtype ?? e.blockingSubtype ?? ''
-      const isQuestion = sub === 'request_user_dialog' || sub === 'side_question' || (p?.questions?.length ?? 0) > 0 || p?.toolName === 'AskUserQuestion'
-      if (isQuestion) {
+      if (isQuestionRequest(e)) {
         const gist = p?.questions?.[0]?.question || p?.questions?.[0]?.header || p?.prompt || 'a question'
         row.textContent = `⚠ asks: ${gist}`
       } else {

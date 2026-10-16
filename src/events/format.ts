@@ -65,7 +65,8 @@ export function cleanProse(text: string): string {
  * `<local-command-caveat>` block is addressed to the MODEL ("DO NOT respond to
  * these messages…"), never the reader, so it's stripped first; an event that was
  * only the caveat cleans to '' and is dropped from the log. Shared by the HUD
- * (`renderEvent`) and the panel (`ui.ts`) so both render command echoes the same.
+ * (`renderEventParts`) and the panel (`ui.ts`) so both render command echoes
+ * the same.
  */
 export function cleanUserEcho(text: string): string {
   const stripped = text.replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/g, '').trim()
@@ -295,7 +296,8 @@ export function renderEventParts(e: RcEvent): EventParts {
 
 /** A blocking control is a QUESTION (dialog) rather than a tool-permission when
  *  its subtype is a dialog/side-question, or it carries parsed question options,
- *  or it is the AskUserQuestion tool. Kept here so the log + main.ts agree. */
+ *  or it is the AskUserQuestion tool. Kept here so the HUD log, the panel log
+ *  and main.ts's prompt routing all agree. */
 export function isQuestionRequest(e: RcEvent): boolean {
   const p = e.permissionRequest
   const sub = p?.subtype ?? e.blockingSubtype ?? ''

@@ -1,10 +1,10 @@
 // Claude Remote — monitor & control ACTIVE Claude Code Remote Control sessions from Even
 // Realities G2 glasses.
 //
-// The app drives two surfaces from one bundle: the glasses (a single full-screen
-// text container over BLE) and a companion browser panel. It talks to an on-box
-// bridge (server/rc_bridge.py) that wraps claude-rc-api and only ever exposes
-// active, connected sessions — never archived or dead ones.
+// The app drives two surfaces from one bundle: the glasses (the firmware's native
+// text/list widgets over BLE — see glasses.ts) and a companion browser panel. It
+// talks to the bridge (`claude-remote-bridge`, server/) that wraps claude-rc-api
+// and only ever exposes active, connected sessions — never archived or dead ones.
 //
 // Boot tolerates the absence of the Even App bridge (a plain browser / the
 // headless browser-test harness): it falls back to "panel-only" mode, where the
@@ -415,7 +415,6 @@ class App {
       }
       this.panel.setActiveSession(this.session)
       this.panel.setEvents(history)
-      this.initSessionView() // live only if running; else freeze the latest history
       // A session that is blocked on the user RIGHT NOW opens straight onto its
       // prompt: the tail-most control_request with no resolution after it
       // (answered ones are followed by their control_response / the turn's
@@ -1104,26 +1103,15 @@ class App {
     else this.historyNewer() // at the bottom of the window → newer window / live
   }
 
-  /** Scrolled up off the live tail → freeze a history window (wearer-driven). */
+  /** Scrolled up off the live tail → freeze the newest lines into a history window. */
   private enterHistory(): void {
     if (this.log.lineCount === 0) return
-    this.freezeTail()
-    this.render()
-  }
-
-  /** Point the frozen window at the newest lines (no render). Shared by the
-   *  wearer's scroll-up and the idle-session default in initSessionView. */
-  private freezeTail(): void {
-    if (this.log.lineCount === 0) {
-      this.histMode = 'live'
-      this.histBody = ''
-      return
-    }
     const w = this.log.tailWindow(HISTORY_WINDOW_BYTES)
     this.histTop = w.startLine
     this.histEnd = this.log.lineCount
     this.histBody = w.text
     this.histMode = 'history'
+    this.render()
   }
 
   /** Load the window immediately above the current one (older). */
@@ -1161,15 +1149,6 @@ class App {
     this.render()
   }
 
-  /** Every session opens on the tail: the row-budgeted newest lines always fit
-   *  the body, so the latest output is immediately visible — auto-following if
-   *  the session is running, simply sitting there if it's idle. Scrolling up
-   *  drops into the frozen history windows either way. */
-  private initSessionView(): void {
-    this.histMode = 'live'
-    this.histBody = ''
-  }
-
   /** Jump to the tail because we just gave the session work (a send / dictate /
    *  answer) — that's what to watch now, even if the wearer had scrolled back. */
   private goLiveSession(): void {
@@ -1182,6 +1161,10 @@ class App {
     return s?.workerStatus === 'running'
   }
 
+  /** Every session opens on the tail: the row-budgeted newest lines always fit
+   *  the body, so the latest output is immediately visible — auto-following if
+   *  the session is running, simply sitting there if it's idle. Scrolling up
+   *  drops into the frozen history windows either way. */
   private resetSessionView(): void {
     this.histMode = 'live'
     this.histBody = ''
@@ -1423,7 +1406,7 @@ class App {
       // The live tail is ROW-budgeted so it always fits the body with no
       // overflow — the firmware draws text top-aligned and never auto-scrolls,
       // so an overflowing tail would hide exactly the newest lines.
-      body: this.log.count ? this.log.tailRows(LIVE_BODY_ROWS, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES) : '(no events yet)',
+      body: this.log.lineCount ? this.log.tailRows(LIVE_BODY_ROWS, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES) : '(no events yet)',
       footer: `${attn}${tailTag} ${HUD.SEP} up = history ${HUD.SEP} tap = menu`,
     }
   }

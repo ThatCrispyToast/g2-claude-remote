@@ -1,4 +1,4 @@
-// Typed client for the Claude Remote bridge (server/rc_bridge.py).
+// Typed client for the Claude Remote bridge (server/claude_remote_bridge/bridge.py).
 //
 // Thin fetch wrappers over the bridge's JSON+SSE surface. Every request carries
 // the shared bearer token. A non-2xx response becomes a `BridgeError` whose

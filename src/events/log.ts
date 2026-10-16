@@ -4,9 +4,9 @@
 // open, which can overlap the stream). We dedupe by sequenceNum, render each
 // event via renderEventParts (dropping the ones that map to nothing), fold runs
 // of tool_uses into compact chain lines, and keep the rendered lines. The
-// session view scrolls these natively on the glasses, so
-// instead of software pages we hand it whole-line WINDOWS (tailWindow /
-// windowBefore / windowFrom) sized to a char budget, never splitting a line.
+// session view scrolls these natively on the glasses, so instead of software
+// pages we hand it whole-line WINDOWS (tailRows / tailWindow / windowBefore /
+// windowFrom) sized to a byte budget, never splitting a line.
 
 import { renderEventParts, packToolChain } from './format'
 import { byteLen, HUD } from '../glasses'
@@ -18,7 +18,6 @@ const MAX_LINES = 500
 export class EventLog {
   private lines: string[] = []
   private seen = new Set<number>()
-  private last: RcEvent | undefined
   // The OPEN tool chain: where its block starts in `lines`, and every entry it
   // holds. A RUN of tool_uses is one block that grows and re-packs in place, so
   // a 27-tool run costs a few rows instead of 27. -1 = no chain open.
@@ -38,10 +37,10 @@ export class EventLog {
   /**
    * Ingest one event: dedupe by sequenceNum, render it, and append the
    * resulting line(s). Events that render to nothing are dropped from the log
-   * but still tracked as the latest raw event. A blank spacer line is inserted
-   * BETWEEN successive blocks (never leading) so distinct turns are visually
-   * separated on the HUD instead of blurring into one wall of text. A run of
-   * events that each render to one identical line folds into `line xN`.
+   * (but still count as seen). A blank spacer line is inserted BETWEEN
+   * successive blocks (never leading) so distinct turns are visually separated
+   * on the HUD instead of blurring into one wall of text. A run of events that
+   * each render to one identical line folds into `line xN`.
    *
    * Consecutive tool_uses join one chain block rather than taking a line each.
    * A dropped event does NOT break that run — a tool_result echo lands between
@@ -57,7 +56,6 @@ export class EventLog {
       if (this.seen.has(e.sequenceNum)) return false
       this.seen.add(e.sequenceNum)
     }
-    this.last = e
     const { text, tools } = renderEventParts(e)
     if (!text && tools.length === 0) return true // drops without breaking the chain
     if (text) {
@@ -118,16 +116,6 @@ export class EventLog {
     } else {
       this.chainStart -= dropped
     }
-  }
-
-  /** All rendered lines joined oldest→newest. */
-  get text(): string {
-    return this.lines.join('\n')
-  }
-
-  /** Number of rendered log lines currently retained. */
-  get count(): number {
-    return this.lines.length
   }
 
   /** Number of rendered lines — the indexing space for the history windows. */
@@ -210,15 +198,9 @@ export class EventLog {
     return { text: this.lines.slice(s, end).join('\n'), endLine: end }
   }
 
-  /** The most recently appended raw event (regardless of whether it rendered). */
-  latest(): RcEvent | undefined {
-    return this.last
-  }
-
   clear(): void {
     this.lines = []
     this.seen = new Set<number>()
-    this.last = undefined
     this.chainStart = -1
     this.chainEntries = []
     this.foldLine = ''

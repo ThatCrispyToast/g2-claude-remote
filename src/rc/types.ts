@@ -1,5 +1,6 @@
-// Shared types — the contract between the bridge (server/rc_bridge.py) and the
-// app. These mirror the bridge's camelCase JSON EXACTLY; keep them in lockstep.
+// Shared types — the contract between the bridge (server/claude_remote_bridge/
+// bridge.py) and the app. These mirror the bridge's camelCase JSON EXACTLY; keep
+// them in lockstep.
 
 export type SessionStatus = 'active' | 'archived' | string
 export type WorkerStatus = 'idle' | 'running' | 'requires_action' | string
