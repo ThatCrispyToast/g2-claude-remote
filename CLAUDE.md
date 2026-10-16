@@ -14,11 +14,13 @@ at build time.
 ## Rules
 
 1. **The bridge adds no Anthropic code.** It reuses `claude-rc-api`'s
-   `RemoteControlClient` (checked out at `../claude-rc-api`) and layers on only
-   the active+connected filter, a bearer/CORS guard, and the `control_response`
-   builders for the two blocking flavors. Session control, streaming, and OAuth
-   (including rotated-token reload) live in `claude-rc-api` — don't reimplement
-   or add credential logic here.
+   `RemoteControlClient` (checked out at `../claude-rc-api`; the bridge needs
+   ≥ 0.3.0 and exits with a `--refresh` hint on an older one) and layers on
+   only the active+connected filter, a bearer/CORS guard, and the JSON shaping
+   for the app. Session control, prompt answers (`respond_permission` /
+   `answer_question`), side questions, streaming, and OAuth (including
+   rotated-token reload) live in `claude-rc-api` — don't reimplement protocol
+   or credential logic here.
 2. **Only-active, always.** Surface and steer only sessions that are `active`
    **and** `connected`. The bridge filters server-side and every control action
    re-checks; a `409` (`BridgeError.isInactive`) means "gone" → toast + back to
@@ -43,17 +45,26 @@ at build time.
    the resolved git dep, so they need one `--refresh` run to pick it up. The
    permission / question / interrupt control paths were never gated; only
    message injection was.
-5. **Effort is a fallback control.** Remote-control workers (through at least
-   2.1.212) REFUSE the `apply_flag_settings` control that carries `effortLevel`
-   ("REPL bridge does not handle…" — confirmed live), so claude-rc-api's
-   `set_effort(wait=…, command_fallback=True)` waits for the worker's verdict
-   and falls back to injecting the `/effort <level>` slash command, which RC
-   workers DO execute as a zero-cost local command (also confirmed live; slash
-   commands sent as user messages run locally in general). Mind the semantics:
-   the command path **persists that machine's default effort** for new sessions
-   (CLI behavior), it is not session-scoped; the bridge's response `via` field
-   says which path ran. No upstream field exposes the current effort — the
-   glasses mark only the last level applied from this app (`effortBySid`).
+5. **Effort is a control, with a command fallback.** 2.1.301 workers apply
+   the `apply_flag_settings` control (`effortLevel` low…`max`, null = auto)
+   **session-scoped**, persisting nothing, and re-emit `system/init` with the
+   new `effort` (verified live 2026-10-16). Workers through at least 2.1.212
+   REFUSED it, so claude-rc-api's `set_effort(wait=…, command_fallback=True)`
+   waits for the verdict and falls back to injecting `/effort <level>` — which
+   **also saves that level as the machine's default for the model** (CLI
+   semantics). The bridge's response `via` says which path ran, and the app's
+   toast says so when it was the command. The current effort is real now:
+   `workerState.effort` (events) → the session's `effort` (metadata) → the
+   last level applied from this app (`effortBySid`, for workers too old to
+   report it).
+6. **The live settings come from events, not the session object.** The
+   session object has NO permission mode (`permissionMode` is always null);
+   `system/init` / `system/status` carry `model` / `effort` / `permissionMode`,
+   surfaced by the bridge as `RcEvent.workerState` and merged by main.ts
+   (`noteEvent` — a status event carries only the mode, so its nulls must never
+   erase the model or effort). The header, the Mode / Effort marks, and the
+   panel selects all read the merged state. Unknown stays blank: never guess
+   `default` (the pre-1.8.0 header claimed `default` for every session).
 
 ## Commands
 
@@ -131,14 +142,17 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   makes every chain exactly one tool long. Only real content (prose, a result, a
   prompt) closes it. The chain re-packs its block IN PLACE on each new tool, and
   only ever rewrites tail lines so frozen history-window indices stay valid.
-- **Workers persist a fresh `system/init` on EVERY controller attach — fold it,
-  don't render it raw.** Confirmed live (2026-08-21, raw wire data): each
-  claude.ai open of a session sends an `initialize` control_request (often
-  twice), and the worker's reply mints one or two `system/init` events — same
-  CLI `session_id`, distinct uuids, no `/clear` or compact involved — plus a
-  burst at process start. So an idle session's newest events are often nothing
-  BUT inits, which used to render as a wall of `☉ session started` lines filling
-  the live tail (checking a session from the phone literally built the wall).
+- **Workers persist a fresh `system/init` on EVERY controller attach AND every
+  model / mode / effort change — it's a settings snapshot, so render it as one
+  (`☉ opus-5-5 · max effort · bypass`, via `settingsLine`) and fold repeats.**
+  Confirmed live (2026-08-21 and 2026-10-16, raw wire data): each claude.ai open
+  of a session sends an `initialize` control_request (often twice), and the
+  worker's reply mints one or two `system/init` events — same CLI `session_id`,
+  distinct uuids, no `/clear` or compact involved — plus a burst at process
+  start. So an idle session's newest events are often nothing BUT inits, which
+  used to render as a wall of `☉ session started` lines filling the live tail
+  (checking a session from the phone literally built the wall). An older bridge
+  sends no `workerState`, so the line falls back to `session started`.
   Both surfaces fold a run of identically-rendered simple rows in place:
   `line xN` in `EventLog.append` (tail-line rewrite only, so frozen
   history-window indices stay valid), `row ×N` in the panel's `appendNode`;
@@ -186,6 +200,13 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
 
 ## Blocking prompts
 
+- **Only the WORKER's prompts block.** `isBlockingControl` comes from
+  claude-rc-api: a `can_use_tool` / `request_user_dialog` control_request whose
+  envelope `source` isn't `client`. Controllers' own requests (a side question
+  from this app or claude.ai's "btw", a `get_context_usage`…) echo through the
+  stream as control_requests too; before claude-rc-api 0.3.0 a `side_question`
+  was misread as a blocking question and would have popped a bogus question
+  screen.
 - **Two kinds, two screens, both native lists.** A blocking `control_request`
   is either a **tool-permission** (the `permission` screen: `[Allow, Deny]`,
   Allow=row 0; answered via `/permission` — the full tool input lives on the
@@ -194,14 +215,14 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   double-tap **sets the prompt aside** (sends nothing — see below).
 - **`AskUserQuestion` arrives as a `can_use_tool` permission** (confirmed live),
   NOT a `request_user_dialog`: its `input` carries the `questions`, and `/dialog`
-  answers it on the PERMISSION path — `build_question_answer` sends an `allow`
-  whose `updatedInput` echoes `questions` (the tool crashes without it) plus
-  `answers`, a map keyed by **question TEXT** → chosen label (list for
-  multi-select; empty map = graceful dismiss). Discriminator:
-  `isQuestionRequest` in `events/format.ts`. The `{status, result}` shape
-  (`build_dialog_answer`) is an UNCONFIRMED fallback for true
-  `request_user_dialog` / `side_question` kinds — verify against a live sample
-  before trusting it.
+  answers it on the PERMISSION path — claude-rc-api's `answer_question` sends
+  an `allow` whose `updatedInput` echoes `questions` (the tool crashes without
+  it; the bridge's `_question_input` rebuilds them if lost) plus `answers`, a
+  map keyed by **question TEXT** → chosen label (list for multi-select; empty
+  map = graceful dismiss). Discriminator: `isQuestionRequest` in
+  `events/format.ts`. The `{status, result}` shape (`cli_dialog_response`) is
+  an UNCONFIRMED fallback for true `request_user_dialog` kinds — verify
+  against a live sample before trusting it.
 - **Prompts QUEUE; they never hijack.** Three guards against stale/replayed
   requests: the bridge fetches history `desc` (newest events) so the stream
   resume cursor is never ancient; `EventLog.append` seq-dedupe gates all UI
@@ -224,6 +245,39 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   normally while set aside. Because the Compose list varies with pending state,
   it is snapshotted into `composeItems` on entry so a mid-menu stream event
   can't desync the firmware row → action map.
+
+## Side questions ("Ask aside")
+
+- **What it is:** the `side_question` control — claude.ai's "btw". The worker
+  answers from its conversation in one model call, without interrupting the
+  turn or adding anything to the transcript; a `null` answer means there is no
+  conversation yet. Verified live on 2.1.301 (~2–3 s on Haiku); the bridge
+  waits up to 150 s (`ASIDE_TIMEOUT_S`), and on timeout claude-rc-api withdraws
+  the question with a `control_cancel_request`.
+- **No confirm step.** It can't change the session, so canned asides
+  (`ASIDE_QUESTIONS`, `VITE_ASIDE_QUESTIONS`) fire on tap and a dictated one
+  (voice purpose `aside`) is asked as soon as dictation ends. The send-confirm
+  screen stays for real sends.
+- **Follow-ups carry history.** The last `ASIDE_HISTORY` exchanges per session
+  ride along as `history`, so "and then?" reads in context. `asideSeq` drops a
+  late answer to a question that was replaced or whose session was left; a late
+  answer still lands on the panel card, never yanking the glasses.
+
+## Session info
+
+- **Mostly free.** The session object's `external_metadata` (polled every
+  `POLL_MS` with the list) carries `effort_level`, `context_usage`, the server's
+  `post_turn_summary` (`status_detail`, `needs_action`) and the worker's Claude
+  Code version; background tasks come live from
+  `system/background_tasks_changed`. None of that costs a request.
+- **Plan usage + git changes are on demand** (`GET …/info` → `get_usage` +
+  `get_workspace_diff`): fetched when the screen opens and on tap = refresh,
+  one fetch at a time, never polled — each fetch leaves control
+  request/response pairs in the session's event log (hidden on both surfaces,
+  but other controllers can see them).
+- The header stays one line: title, model, effort, a non-default mode, and
+  `ctx N%` once context passes `CTX_WARN_PCT`; the title gets what the tail
+  leaves of `HEADER_CHARS` (56 fits the strip in the simulator).
 
 ## Send confirmation
 

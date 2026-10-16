@@ -10,12 +10,14 @@ import { openEventStream, type StreamHandlers } from './stream'
 import {
   BridgeError,
   type ActiveSession,
+  type AsideTurn,
   type BridgeClient,
   type Decision,
   type DialogAnswer,
   type EffortLevel,
   type PermissionMode,
   type RcEvent,
+  type SessionInfo,
   type WhoAmI,
 } from './types'
 
@@ -55,8 +57,8 @@ export class HttpBridgeClient implements BridgeClient {
     return data as T
   }
 
-  private post(path: string, body?: unknown): Promise<{ ok: boolean }> {
-    return this.req(path, {
+  private post<T = { ok: boolean }>(path: string, body?: unknown): Promise<T> {
+    return this.req<T>(path, {
       method: 'POST',
       headers: this.headers(true),
       body: JSON.stringify(body ?? {}),
@@ -151,11 +153,29 @@ export class HttpBridgeClient implements BridgeClient {
     await this.post(`/api/sessions/${this.sid(sid)}/permission_mode`, { mode })
   }
 
-  async setEffort(sid: string, effort: EffortLevel | null): Promise<void> {
-    await this.post(`/api/sessions/${this.sid(sid)}/effort`, { effort })
+  async setEffort(sid: string, effort: EffortLevel | null): Promise<string> {
+    const { via } = await this.post<{ via?: string }>(`/api/sessions/${this.sid(sid)}/effort`, { effort })
+    return via ?? 'control'
   }
 
   async archive(sid: string): Promise<void> {
     await this.post(`/api/sessions/${this.sid(sid)}/archive`, {})
+  }
+
+  // -- worker queries (bridge 0.4.0+; an older bridge answers 404) ---------
+  async ask(sid: string, question: string, history: AsideTurn[]): Promise<string | null> {
+    const { answer } = await this.post<{ answer: string | null }>(`/api/sessions/${this.sid(sid)}/aside`, {
+      question,
+      history,
+    })
+    return answer ?? null
+  }
+
+  info(sid: string): Promise<SessionInfo> {
+    return this.req<SessionInfo>(`/api/sessions/${this.sid(sid)}/info`, { headers: this.headers() })
+  }
+
+  async stopTask(sid: string, taskId: string): Promise<void> {
+    await this.post(`/api/sessions/${this.sid(sid)}/stop_task`, { task_id: taskId })
   }
 }

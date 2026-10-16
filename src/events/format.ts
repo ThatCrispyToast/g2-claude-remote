@@ -15,7 +15,7 @@
 // the left edge — `»` you, plain text = assistant, `◆` a tool, `◇` a result,
 // `☉` a system line, `!` a question/permission.
 
-import type { RcEvent, ToolUse } from '../rc/types'
+import type { RcEvent, ToolUse, WorkerState } from '../rc/types'
 import { clip, HUD } from '../glasses'
 import { TOOL_ARG_CHARS, HUD_CHARS_PER_ROW } from '../config'
 
@@ -272,7 +272,13 @@ export function renderEventParts(e: RcEvent): EventParts {
     }
 
     case 'system': {
-      if (e.subtype === 'init') return { text: `${HUD.SYS} session started ${HUD.SEP} ${modelTail(e.model)}`, tools: [] }
+      // A worker re-posts init on every controller attach and every model / mode
+      // / effort change, so it reads as "settings now", not "session started"
+      // (that's all an older bridge, with no workerState, can say).
+      if (e.subtype === 'init') {
+        const line = e.workerState ? settingsLine(e.workerState) : `session started ${HUD.SEP} ${modelShort(e.model)}`
+        return { text: `${HUD.SYS} ${line}`, tools: [] }
+      }
       if (e.subtype === 'compact_boundary') return { text: `${HUD.SYS} context compacted`, tools: [] }
       return NOTHING
     }
@@ -295,20 +301,35 @@ export function renderEventParts(e: RcEvent): EventParts {
 }
 
 /** A blocking control is a QUESTION (dialog) rather than a tool-permission when
- *  its subtype is a dialog/side-question, or it carries parsed question options,
- *  or it is the AskUserQuestion tool. Kept here so the HUD log, the panel log
- *  and main.ts's prompt routing all agree. */
+ *  its subtype is a dialog, or it carries parsed question options, or it is the
+ *  AskUserQuestion tool. Kept here so the HUD log, the panel log and main.ts's
+ *  prompt routing all agree. */
 export function isQuestionRequest(e: RcEvent): boolean {
   const p = e.permissionRequest
   const sub = p?.subtype ?? e.blockingSubtype ?? ''
-  if (sub === 'request_user_dialog' || sub === 'side_question') return true
+  if (sub === 'request_user_dialog') return true
   if (p?.questions && p.questions.length > 0) return true
   const tool = p?.toolName ?? ''
   return tool === 'AskUserQuestion'
 }
 
-/** `claude-opus-5-5` → `opus-5-5`; '' → 'unknown'. */
-function modelTail(m: string | null): string {
-  if (!m) return 'unknown'
-  return m.replace(/^claude-/, '')
+/** `claude-opus-5-5` → `opus-5-5` (a dated id loses its date); null → '?'. */
+export function modelShort(m: string | null | undefined): string {
+  if (!m) return '?'
+  return m.replace(/^claude-/, '').replace(/-\d{8}$/, '')
+}
+
+/** A permission mode, short enough for a HUD header: `bypassPermissions` → `bypass`. */
+export function modeShort(mode: string | null | undefined): string {
+  if (mode === 'bypassPermissions') return 'bypass'
+  if (mode === 'acceptEdits') return 'edits'
+  return mode ?? ''
+}
+
+/** `opus-5-5 · max effort · bypass` — whatever the worker reported. */
+export function settingsLine(ws: WorkerState): string {
+  const parts = [modelShort(ws.model)]
+  if (ws.effort) parts.push(`${ws.effort} effort`)
+  if (ws.permissionMode) parts.push(modeShort(ws.permissionMode))
+  return parts.join(` ${HUD.SEP} `)
 }

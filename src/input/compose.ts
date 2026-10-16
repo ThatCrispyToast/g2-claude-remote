@@ -2,24 +2,28 @@
 // can fire on a session by scrolling to one and tapping. Pure data + tiny
 // helpers; the state machine in main.ts drives selection and dispatch.
 
-import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS } from '../config'
+import { ASIDE_QUESTIONS, EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS } from '../config'
 import { HUD } from '../glasses'
-import type { EffortLevel, PermissionMode } from '../rc/types'
+import type { PermissionMode } from '../rc/types'
+
+export type SubmenuKind = 'model' | 'mode' | 'effort' | 'command' | 'aside'
 
 export type ComposeAction =
   | { kind: 'prompt'; label: string }
   | { kind: 'send'; label: string; text: string }
   | { kind: 'voice'; label: string }
   | { kind: 'interrupt'; label: string }
-  | { kind: 'submenu'; label: string; menu: 'model' | 'mode' | 'effort' | 'command' }
+  | { kind: 'info'; label: string }
+  | { kind: 'submenu'; label: string; menu: SubmenuKind }
   | { kind: 'archive'; label: string }
   | { kind: 'back'; label: string }
 
 /**
  * The top-level Compose menu, in display order — ordered by how often the wearer
  * reaches for each on a keyboard-less device. Dictate leads (it's the only
- * open-ended input path), then the one-tap canned sends, then the run controls
- * (Interrupt), then the rarer steering (Model / Mode), then Archive, then Back.
+ * open-ended input path), then Ask aside (check in without derailing the
+ * session), the one-tap canned sends, the run controls (Interrupt), Session
+ * info, the rarer steering (Commands / Model / Mode / Effort), Archive, Back.
  */
 export function composeActions(opts: { voiceAvailable: boolean; pendingPrompt?: string | null }): ComposeAction[] {
   const actions: ComposeAction[] = []
@@ -30,12 +34,15 @@ export function composeActions(opts: { voiceAvailable: boolean; pendingPrompt?: 
   // 1) Dictate — the primary, open-ended input. Top of the list. `»` reads as
   //    "say" (the mic glyph isn't in the firmware font). Omitted with no key.
   if (opts.voiceAvailable) actions.push({ kind: 'voice', label: `${HUD.USER} Dictate a message` })
-  // 2) One-tap canned sends.
+  // 2) A side question — read-only, so it sits with the inputs, not the steering.
+  actions.push({ kind: 'submenu', label: `? Ask aside ${HUD.GO}`, menu: 'aside' })
+  // 3) One-tap canned sends.
   for (const q of QUICK_SENDS) actions.push({ kind: 'send', label: `${HUD.SEND} ${q.label}`, text: q.text })
-  // 3) Run controls, then steering, then the destructive/exit tail. Commands leads
-  //    the submenu cluster; the `/` reads as "slash command" (a plain-ASCII glyph
-  //    the firmware font always renders).
+  // 4) Run controls, then the session's status, then steering, then the
+  //    destructive/exit tail. Commands leads the submenu cluster; the `/` reads as
+  //    "slash command" (a plain-ASCII glyph the firmware font always renders).
   actions.push({ kind: 'interrupt', label: `${HUD.STOP} Interrupt` })
+  actions.push({ kind: 'info', label: `${HUD.SYS} Session info` })
   if (SLASH_COMMANDS.length) actions.push({ kind: 'submenu', label: `/ Commands ${HUD.GO}`, menu: 'command' })
   actions.push({ kind: 'submenu', label: `Model ${HUD.GO}`, menu: 'model' })
   actions.push({ kind: 'submenu', label: `Mode ${HUD.GO}`, menu: 'mode' })
@@ -77,6 +84,22 @@ export function commandItems(): SubmenuItem[] {
   return items
 }
 
+/** Value of the Ask aside submenu's dictation row (a question is never this). */
+export const ASIDE_DICTATE = '@dictate'
+
+/**
+ * The Ask aside submenu: dictate a question (voice), or one of the canned ones.
+ * `value` is the question itself — the state machine asks it directly, with no
+ * confirm step: a side question can't change the session.
+ */
+export function asideItems(voiceAvailable: boolean): SubmenuItem[] {
+  const items: SubmenuItem[] = []
+  if (voiceAvailable) items.push({ label: `${HUD.USER} Dictate a question`, value: ASIDE_DICTATE, current: false })
+  for (const q of ASIDE_QUESTIONS) items.push({ label: `? ${q}`, value: q, current: false })
+  items.push({ label: `${HUD.BACK} Back`, value: '', current: false })
+  return items
+}
+
 /** The Mode submenu — current permission mode marked. */
 export function modeItems(current: PermissionMode | string | null): SubmenuItem[] {
   const items: SubmenuItem[] = MODES.map((m) => ({
@@ -89,16 +112,16 @@ export function modeItems(current: PermissionMode | string | null): SubmenuItem[
 }
 
 /**
- * The Effort submenu. The session object doesn't expose effort, so there is no
- * upstream truth to mark — `current` is the last level applied FROM THIS APP
- * (undefined = never set here, nothing marked). The auto row carries the
- * sentinel value 'auto' because '' is the Back row's value.
+ * The Effort submenu, the worker's current level marked (`undefined` = unknown,
+ * nothing marked — older workers don't report it). The auto row carries the
+ * sentinel value 'auto' because '' is the Back row's value; a worker reports
+ * its effective level, never "auto", so that row is never marked.
  */
-export function effortItems(current: EffortLevel | null | undefined): SubmenuItem[] {
+export function effortItems(current: string | null | undefined): SubmenuItem[] {
   const items: SubmenuItem[] = EFFORTS.map((e) => ({
-    label: `${current !== undefined && e.id === current ? `${HUD.CUR} ` : '  '}${e.label}`,
+    label: `${current != null && e.id === current ? `${HUD.CUR} ` : '  '}${e.label}`,
     value: e.id ?? 'auto',
-    current: current !== undefined && e.id === current,
+    current: current != null && e.id === current,
   }))
   items.push({ label: `${HUD.BACK} Back`, value: '', current: false })
   return items

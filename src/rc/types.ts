@@ -6,9 +6,8 @@ export type SessionStatus = 'active' | 'archived' | string
 export type WorkerStatus = 'idle' | 'running' | 'requires_action' | string
 export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected' | string
 export type PermissionMode = 'default' | 'plan' | 'acceptEdits' | 'bypassPermissions'
-/** Effort levels settable remotely ('max' is session-scoped in the CLI and the
- *  worker's schema rejects it on this path); null = auto (the model default). */
-export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh'
+/** Effort levels settable remotely; null = auto (the model default). */
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type Decision = 'allow' | 'deny'
 
 /** A model offered in the Compose → Model submenu. */
@@ -51,6 +50,13 @@ export interface SlashCommand {
   confirm?: boolean
 }
 
+/** How full a session's context window is (from the session's metadata). */
+export interface ContextUsage {
+  usedTokens: number
+  maxTokens: number
+  percent: number
+}
+
 /**
  * A session as the bridge returns it — ALREADY guaranteed active+connected by
  * the server-side filter (GET /api/sessions never returns archived or dead ones).
@@ -63,11 +69,56 @@ export interface ActiveSession {
   connectionStatus: ConnectionStatus // always 'connected' from the bridge
   statusBucket: string | null
   model: string | null
+  /** Always null in practice: the session object has no permission mode — the
+   *  live one comes from the event stream (`RcEvent.workerState`). */
   permissionMode: PermissionMode | null
   lastEventAt: string | null
   unread: boolean
   userMessageCount: number
   pendingAction: unknown | null // external_metadata.pending_action (permission summary)
+  /** The worker's current effort level (absent on older workers). */
+  effort: EffortLevel | string | null
+  context: ContextUsage | null
+  /** The server's one-line post-turn summary of where the session stands. */
+  summary: string | null
+  /** What it is waiting on you for, when it is. */
+  needsAction: string | null
+  /** The worker's Claude Code version. */
+  ccVersion: string | null
+}
+
+/** The worker's live settings, from a `system/init` or `system/status` event
+ *  (workers re-emit init on every model / mode / effort change). */
+export interface WorkerState {
+  model: string | null
+  effort: EffortLevel | string | null
+  permissionMode: PermissionMode | string | null
+  ccVersion: string | null
+}
+
+/** A running background task (a backgrounded shell command, a Monitor…). */
+export interface BackgroundTask {
+  id: string
+  type: string | null
+  description: string
+}
+
+/** One side-question exchange — the history sent along with a follow-up. */
+export interface AsideTurn {
+  question: string
+  response: string
+}
+
+/** What GET …/info asks the worker for; each part is null when it didn't answer. */
+export interface SessionInfo {
+  usage: {
+    /** The plan's usage windows: `session` (5-hour), `weekly_all`, and
+     *  `weekly_scoped` (one model's own weekly cap — `model` names it). */
+    limits: { kind: string; percent: number | null; resetsAt: string | null; model: string | null }[]
+    costUsd: number | null
+  } | null
+  /** Uncommitted git changes; null outside a git repo. */
+  diff: { files: number; added: number; removed: number } | null
 }
 
 /** A tool_use content block. */
@@ -83,7 +134,7 @@ export interface DialogOption {
   description: string
 }
 
-/** One question inside a `request_user_dialog` / `side_question` blocking control. */
+/** One question inside a blocking question (AskUserQuestion / `request_user_dialog`). */
 export interface DialogQuestion {
   header: string
   question: string
@@ -95,9 +146,9 @@ export interface DialogQuestion {
  * The details out of a blocking control request. Covers BOTH flavors:
  *  - a tool-permission (`subtype: "can_use_tool"`) — answered allow/deny; the
  *    tool + its `input` describe what Claude wants to run.
- *  - a QUESTION (`subtype: "request_user_dialog"` | `"side_question"`) — answered
- *    by picking option(s); `dialogKind` + `questions` (or a plain `prompt`)
- *    describe what Claude is asking. `toolName`/`input` are usually null here.
+ *  - a QUESTION — AskUserQuestion (a `can_use_tool` whose input holds the
+ *    questions) or a `request_user_dialog` — answered by picking option(s);
+ *    `dialogKind` + `questions` (or a plain `prompt`) describe what is asked.
  */
 export interface PermissionRequest {
   subtype: string | null
@@ -135,6 +186,8 @@ export interface RcEvent {
   type: 'user' | 'assistant' | 'system' | 'result' | 'control_request' | 'control_response' | 'stream_event' | string | null
   subtype: string | null
   role: 'user' | 'assistant' | null
+  /** 'client' = a controller wrote it (this app, claude.ai…); 'worker' = Claude Code. */
+  source: 'client' | 'worker' | string | null
   text: string
   toolUses: ToolUse[]
   sequenceNum: number | null
@@ -149,6 +202,10 @@ export interface RcEvent {
   toolUseId: string | null
   permissionRequest: PermissionRequest | null
   usage: Usage | null
+  /** On `system/init` / `system/status`: the worker's settings as of this event. */
+  workerState: WorkerState | null
+  /** On `system/background_tasks_changed`: the whole running background set. */
+  tasks: BackgroundTask[] | null
 }
 
 /** Login/token status from GET /api/whoami. */
@@ -210,7 +267,15 @@ export interface BridgeClient {
   interrupt(sid: string): Promise<void>
   setModel(sid: string, model: string): Promise<void>
   setPermissionMode(sid: string, mode: PermissionMode): Promise<void>
-  /** Set the reasoning effort; null clears back to auto (the model default). */
-  setEffort(sid: string, effort: EffortLevel | null): Promise<void>
+  /** Set the reasoning effort; null clears back to auto (the model default).
+   *  Resolves to how it was applied: 'control' (session-scoped) or 'command'
+   *  (the /effort fallback, which also saves it as the host's default). */
+  setEffort(sid: string, effort: EffortLevel | null): Promise<string>
   archive(sid: string): Promise<void>
+  /** Ask a side question ("btw"): answered from the conversation without
+   *  interrupting it or adding to it. Null = nothing to answer from yet. */
+  ask(sid: string, question: string, history: AsideTurn[]): Promise<string | null>
+  /** Plan usage + uncommitted git changes, asked of the worker. */
+  info(sid: string): Promise<SessionInfo>
+  stopTask(sid: string, taskId: string): Promise<void>
 }

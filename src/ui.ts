@@ -15,10 +15,36 @@
 // No framework. (The glasses HUD in glasses.ts is a separate, firmware-native
 // monochrome surface and is not governed by this doc.)
 
-import type { ActiveSession, RcEvent, PermissionRequest, DialogQuestion, WhoAmI, Decision, PermissionMode, SlashCommand } from './rc/types'
+import type {
+  ActiveSession,
+  BackgroundTask,
+  RcEvent,
+  PermissionRequest,
+  DialogQuestion,
+  WhoAmI,
+  Decision,
+  PermissionMode,
+  SessionInfo,
+  SlashCommand,
+  WorkerState,
+} from './rc/types'
 import type { Notice } from './notices'
 import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, loadRuntimeSettings, saveRuntimeSettings } from './config'
-import { cleanUserEcho, isQuestionRequest } from './events/format'
+import { cleanUserEcho, isQuestionRequest, settingsLine } from './events/format'
+
+/** A side question on show: asking (answer + error null), answered, or failed. */
+export interface AsideView {
+  question: string
+  answer: string | null
+  error: string | null
+}
+
+/** The session card's on-demand part: plan usage + git changes. */
+export interface InfoView {
+  info: SessionInfo | null
+  error: string | null
+  loading: boolean
+}
 
 /** Everything the panel calls back into main.ts to do — main.ts owns the bridge. */
 export interface PanelCallbacks {
@@ -47,6 +73,14 @@ export interface PanelCallbacks {
   /** Start / stop voice dictation into the send box. */
   onStartVoice: () => void
   onStopVoice: () => void
+  /** Ask the send box's text as a side question (answered without interrupting). */
+  onAskAside: (question: string) => void
+  /** The aside card's × — forget the shown exchange. */
+  onDismissAside: () => void
+  /** Fetch plan usage + git changes for the session card. */
+  onLoadInfo: () => void
+  /** Stop a running background task. */
+  onStopTask: (taskId: string) => void
   /** Connection settings were saved (or reset) → reconnect in place (no reload). */
   onApplySettings: () => void
   /** A release notice's × was tapped → record it seen and re-render (notices.ts). */
@@ -87,6 +121,18 @@ function modelLabel(id: string | null): string {
   return MODELS.find((m) => m.id === id)?.label ?? id
 }
 
+/** `ctx 44%`, or '' when the session doesn't report context use. */
+function contextLabel(s: ActiveSession): string {
+  return s.context ? `ctx ${s.context.percent}%` : ''
+}
+
+/** The plan-usage line: `5h 69% · week 18% · Fable 4%`. */
+function planLabel(info: SessionInfo): string {
+  const label = (kind: string, model: string | null): string =>
+    kind === 'session' ? '5h' : kind === 'weekly_all' ? 'week' : kind === 'weekly_scoped' ? (model ?? 'scoped') : kind
+  return (info.usage?.limits ?? []).map((l) => `${label(l.kind, l.model)} ${l.percent ?? '?'}%`).join(' · ')
+}
+
 /** Cost/turns suffix for a result row, e.g. ` · 5 turns · $0.12`, or ''. */
 function usageSuffix(e: RcEvent): string {
   const u = e.usage
@@ -117,7 +163,11 @@ export class Panel {
   private detailView: HTMLElement | null = null
   private detailTitle: HTMLDivElement | null = null
   private detailMeta: HTMLDivElement | null = null
+  private detailSummary: HTMLDivElement | null = null
   private permBanner: HTMLDivElement | null = null
+  private asideCard: HTMLDivElement | null = null
+  private infoBody: HTMLDivElement | null = null
+  private asideBtn: HTMLButtonElement | null = null
   private logEl: HTMLDivElement | null = null
   private sendInput: HTMLTextAreaElement | null = null
   private sendBtn: HTMLButtonElement | null = null
@@ -136,6 +186,13 @@ export class Panel {
   private dictating = false
   /** The currently-open session id (for onArchive), or null in the list view. */
   private currentSid: string | null = null
+  // The open session as last pushed, its live worker settings, background
+  // tasks, and the on-demand info — the header meta and the session card are
+  // rendered from these together.
+  private session: ActiveSession | null = null
+  private worker: WorkerState | null = null
+  private tasks: BackgroundTask[] = []
+  private infoView: InfoView | null = null
   private toastTimer: number | null = null
   /** sequenceNums already rendered in the log — dedupes the history↔stream seam. */
   private seen = new Set<number>()
@@ -222,10 +279,12 @@ ${settingsHtml}
             <div class="detail-headings">
               <div id="detailTitle" class="detail-title"></div>
               <div id="detailMeta" class="detail-meta"></div>
+              <div id="detailSummary" class="detail-summary" hidden></div>
             </div>
           </div>
 
           <div id="permBanner" class="perm" hidden></div>
+          <div id="asideCard" class="aside-card" hidden></div>
 
           <div id="log" class="log"></div>
 
@@ -236,11 +295,20 @@ ${settingsHtml}
             <div id="interim" class="interim"></div>
             <div class="composer-row">
               <button id="sendBtn" class="btn primary">Send</button>
+              <button id="asideBtn" class="btn" title="Answered from the conversation without interrupting it or adding to it">Ask aside</button>
               <button id="dictateBtn" class="btn">Dictate</button>
               <button id="interruptBtn" class="btn danger">Interrupt</button>
             </div>
             <div class="quick-row">${quickHtml}</div>
           </div>
+
+          <section class="info-card">
+            <div class="info-head">
+              <span class="view-title">Session</span>
+              <button id="infoBtn" class="btn ghost">Plan &amp; changes</button>
+            </div>
+            <div id="infoBody" class="info-body"></div>
+          </section>
 
           <div class="steer">
             <label class="field">
@@ -257,6 +325,7 @@ ${settingsHtml}
             </label>
             <button id="archiveBtn" class="btn danger archive">Archive</button>
           </div>
+
         </section>
 
         <div id="toast" class="toast" hidden></div>
@@ -271,7 +340,11 @@ ${settingsHtml}
     this.detailView = root.querySelector<HTMLElement>('#detailView')
     this.detailTitle = root.querySelector<HTMLDivElement>('#detailTitle')
     this.detailMeta = root.querySelector<HTMLDivElement>('#detailMeta')
+    this.detailSummary = root.querySelector<HTMLDivElement>('#detailSummary')
     this.permBanner = root.querySelector<HTMLDivElement>('#permBanner')
+    this.asideCard = root.querySelector<HTMLDivElement>('#asideCard')
+    this.infoBody = root.querySelector<HTMLDivElement>('#infoBody')
+    this.asideBtn = root.querySelector<HTMLButtonElement>('#asideBtn')
     this.logEl = root.querySelector<HTMLDivElement>('#log')
     this.sendInput = root.querySelector<HTMLTextAreaElement>('#sendInput')
     this.sendBtn = root.querySelector<HTMLButtonElement>('#sendBtn')
@@ -332,6 +405,8 @@ ${settingsHtml}
     })
 
     this.interruptBtn?.addEventListener('click', () => this.cb.onInterrupt())
+    this.asideBtn?.addEventListener('click', () => this.doAside())
+    root.querySelector<HTMLButtonElement>('#infoBtn')?.addEventListener('click', () => this.cb.onLoadInfo())
 
     this.modelSel?.addEventListener('change', () => {
       if (this.modelSel) this.cb.onSetModel(this.modelSel.value)
@@ -422,6 +497,21 @@ ${settingsHtml}
     if (this.sendInput) {
       this.sendInput.value = ''
       this.sendInput.blur() // dismiss the mobile keyboard
+    }
+  }
+
+  /** Ask the send box's text as a side question; the card shows the answer. */
+  private doAside(): void {
+    const text = this.sendInput?.value.trim() ?? ''
+    if (!text) {
+      this.setToast('Type a question to ask on the side.')
+      return
+    }
+    this.hideCommandMenu()
+    this.cb.onAskAside(text)
+    if (this.sendInput) {
+      this.sendInput.value = ''
+      this.sendInput.blur()
     }
   }
 
@@ -620,13 +710,20 @@ ${settingsHtml}
 
     const sub = document.createElement('div')
     sub.className = 'session-sub'
-    const bits = [modelLabel(s.model), s.permissionMode ?? 'default']
-    const when = relTime(s.lastEventAt)
-    if (when) bits.push(when)
-    sub.textContent = bits.join(' · ')
+    const bits = [modelLabel(s.model), s.effort ?? '', contextLabel(s), relTime(s.lastEventAt)]
+    sub.textContent = bits.filter(Boolean).join(' · ')
 
     body.appendChild(name)
     body.appendChild(sub)
+    // The server's one-line summary of where it stands — or, louder, what it
+    // is waiting on you for.
+    const gist = s.needsAction || s.summary
+    if (gist) {
+      const line = document.createElement('div')
+      line.className = `session-gist${s.needsAction ? ' needs' : ''}`
+      line.textContent = gist
+      body.appendChild(line)
+    }
     row.appendChild(dotEl)
     row.appendChild(body)
 
@@ -656,27 +753,132 @@ ${settingsHtml}
     const showDetail = session !== null
     if (this.listView) this.listView.hidden = showDetail
     if (this.detailView) this.detailView.hidden = !showDetail
-    if (!session) return
-
+    if (!session) {
+      this.session = null
+      return
+    }
     if (this.detailTitle) this.detailTitle.textContent = session.title || 'Untitled session'
+    this.refreshSession(session)
+  }
+
+  /** The open session's fresh metadata (every list poll): status, settings,
+   *  context, summary, and whether Interrupt applies. */
+  refreshSession(session: ActiveSession): void {
+    if (session.id !== this.currentSid) return
+    this.session = session
+    this.renderMeta()
+  }
+
+  /** The worker's live settings (from the event stream): model, effort, mode. */
+  setWorkerState(worker: WorkerState | null): void {
+    this.worker = worker
+    this.renderMeta()
+  }
+
+  private renderMeta(): void {
+    const s = this.session
+    if (!s) return
+    const w = this.worker
+    const model = w?.model ?? s.model
+    const effort = w?.effort ?? s.effort
+    const mode = w?.permissionMode ?? s.permissionMode
     if (this.detailMeta) {
-      const dot = statusDot(session.workerStatus)
+      const dot = statusDot(s.workerStatus)
       this.detailMeta.textContent = ''
       const d = document.createElement('span')
       d.className = `wdot ${dot.cls}`
       d.textContent = `${dot.glyph} ${dot.label}`
       this.detailMeta.appendChild(d)
       const rest = document.createElement('span')
-      rest.textContent = ` · ${modelLabel(session.model)} · ${session.permissionMode ?? 'default'}`
+      rest.textContent = ` · ${[modelLabel(model), effort ?? '', mode ?? '', contextLabel(s)].filter(Boolean).join(' · ')}`
       this.detailMeta.appendChild(rest)
     }
-
-    // Reflect the session's current model/mode in the selects.
-    if (this.modelSel && session.model) this.modelSel.value = session.model
-    if (this.modeSel && session.permissionMode) this.modeSel.value = session.permissionMode
-
+    if (this.detailSummary) {
+      const gist = s.needsAction || s.summary || ''
+      this.detailSummary.textContent = gist
+      this.detailSummary.hidden = !gist
+      this.detailSummary.classList.toggle('needs', !!s.needsAction)
+    }
+    // Reflect the live settings in the selects (an unknown one shows blank
+    // rather than a guess — an option that doesn't exist selects nothing).
+    if (this.modelSel && model) this.modelSel.value = model
+    if (this.modeSel) this.modeSel.value = mode ?? ''
+    if (this.effortSel) this.effortSel.value = effort ?? ''
     // Interrupt only makes sense while the worker is running.
-    if (this.interruptBtn) this.interruptBtn.disabled = session.workerStatus !== 'running'
+    if (this.interruptBtn) this.interruptBtn.disabled = s.workerStatus !== 'running'
+    this.renderInfo()
+  }
+
+  // ── Side question card ─────────────────────────────────────────────────────
+  /** The latest side question and its answer (or "asking…"), above the log. */
+  setAside(aside: AsideView | null): void {
+    const card = this.asideCard
+    if (!card) return
+    card.replaceChildren()
+    card.hidden = !aside
+    if (!aside) return
+    const head = document.createElement('div')
+    head.className = 'aside-head'
+    const label = document.createElement('span')
+    label.textContent = 'ASIDE · not in the transcript'
+    const close = document.createElement('button')
+    close.className = 'btn ghost notice-dismiss'
+    close.textContent = '×'
+    close.setAttribute('aria-label', 'Dismiss')
+    close.addEventListener('click', () => this.cb.onDismissAside())
+    head.append(label, close)
+    const q = document.createElement('div')
+    q.className = 'aside-q'
+    q.textContent = aside.question
+    const a = document.createElement('div')
+    a.className = `aside-a${aside.error ? ' err' : aside.answer == null ? ' pending' : ''}`
+    a.textContent = aside.error ?? aside.answer ?? 'Asking…'
+    card.append(head, q, a)
+  }
+
+  // ── Session card (tasks, plan usage, changes) ──────────────────────────────
+  /** The running background set (live from the event stream). */
+  setTasks(tasks: BackgroundTask[]): void {
+    this.tasks = tasks
+    this.renderInfo()
+  }
+
+  /** The on-demand part — plan usage + git changes — or null to clear it. */
+  setInfo(view: InfoView | null): void {
+    this.infoView = view
+    this.renderInfo()
+  }
+
+  private renderInfo(): void {
+    const body = this.infoBody
+    if (!body) return
+    body.replaceChildren()
+    const row = (text: string, cls = 'info-row'): HTMLDivElement => {
+      const el = document.createElement('div')
+      el.className = cls
+      el.textContent = text
+      body.appendChild(el)
+      return el
+    }
+    for (const t of this.tasks) {
+      const el = row(`Background: ${t.description || t.id}`, 'info-row task')
+      const stop = document.createElement('button')
+      stop.className = 'btn danger'
+      stop.textContent = 'Stop'
+      stop.addEventListener('click', () => this.cb.onStopTask(t.id))
+      el.appendChild(stop)
+    }
+    const v = this.infoView
+    if (v?.info?.usage?.limits.length) row(`Plan · ${planLabel(v.info)}`)
+    if (v?.info?.diff) {
+      const d = v.info.diff
+      row(d.files ? `Changes · ${d.files} file${d.files > 1 ? 's' : ''} +${d.added} −${d.removed}` : 'Changes · none uncommitted')
+    }
+    if (v?.loading) row('Asking the worker…', 'info-row muted')
+    else if (v?.error) row(v.error, 'info-row muted')
+    const s = this.session
+    const settings = this.worker ? settingsLine(this.worker) : ''
+    if (s?.ccVersion || settings) row([settings, s?.ccVersion ? `Claude Code ${s.ccVersion}` : ''].filter(Boolean).join(' · '), 'info-row muted')
   }
 
   // ── Event log ─────────────────────────────────────────────────────────────
@@ -791,7 +993,7 @@ ${settingsHtml}
     banner.appendChild(acts)
   }
 
-  // ── Question dialog (request_user_dialog / side_question) ──────────────────
+  // ── Question dialog (AskUserQuestion / request_user_dialog) ─────────────────
   /** Render a blocking QUESTION with its options as buttons (or hide when null).
    *  Shares the permission banner — only one blocking prompt is ever pending. A
    *  picked option shows selected; clicking one answers that question. */
@@ -937,8 +1139,10 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
     }
 
     case 'system': {
+      // Workers re-post init on every attach and every model / mode / effort
+      // change: it reads as "settings now" (an older bridge can't say more).
       let label = ''
-      if (e.subtype === 'init') label = `◆ session started (${e.model ?? 'unknown'})`
+      if (e.subtype === 'init') label = e.workerState ? `◆ ${settingsLine(e.workerState)}` : `◆ session started (${e.model ?? 'unknown'})`
       else if (e.subtype === 'compact_boundary') label = '◆ context compacted'
       if (!label) return null
       const row = document.createElement('div')
@@ -1132,6 +1336,9 @@ function injectStyles(): void {
     .unread { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--tc-1st); }
     .session-sub { font-size: 13px; font-weight: 400; color: var(--tc-2nd); font-variant-numeric: tabular-nums;
       margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .session-gist { font-size: 13px; font-weight: 300; color: var(--tc-2nd); margin-top: 3px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .session-gist.needs { color: var(--tc-1st); font-weight: 400; }
     .row-chev { flex: 0 0 auto; color: var(--tc-2nd); font-size: 17px; line-height: 1; margin-left: 2px; }
 
     /* ── Detail header ───────────────────────────────────────────────────── */
@@ -1141,6 +1348,9 @@ function injectStyles(): void {
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .detail-meta { font-size: 13px; font-weight: 400; color: var(--tc-2nd); margin-top: 2px; font-variant-numeric: tabular-nums; }
     .detail-meta .wdot { font-size: 12px; margin-right: 0; }
+    .detail-summary { font-size: 13px; font-weight: 400; color: var(--tc-2nd); margin-top: 6px; line-height: 1.4; }
+    .detail-summary[hidden] { display: none; }
+    .detail-summary.needs { color: var(--tc-1st); }
 
     /* ── Permission / question banner (BC-Accent = the doc's warning fill) ─── */
     .perm { display: flex; flex-direction: column; gap: 12px; padding: 16px;
@@ -1158,6 +1368,28 @@ function injectStyles(): void {
     .q-opts { display: flex; flex-direction: column; gap: 6px; }
     .q-opt { width: 100%; min-width: 0; text-align: left; white-space: normal; background: var(--bc-1st); }
     .q-opt.chosen { color: var(--tc-hi); background: var(--bc-hi); }
+
+    /* ── Side question card (a white card: an answer, not a warning) ────────── */
+    .aside-card { display: flex; flex-direction: column; gap: 6px; padding: 12px 16px;
+      background: var(--bc-1st); border-radius: var(--r); }
+    .aside-card[hidden] { display: none; }
+    .aside-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+      font-size: 11px; font-weight: 400; color: var(--tc-2nd); }
+    .aside-q { font-size: 13px; font-weight: 400; color: var(--tc-2nd); }
+    .aside-a { font-size: 15px; font-weight: 300; color: var(--tc-1st); white-space: pre-wrap; line-height: 1.45; }
+    .aside-a.pending { color: var(--tc-2nd); }
+    .aside-a.err { color: var(--tc-red); }
+
+    /* ── Session card (tasks, plan usage, changes) ───────────────────────── */
+    .info-card { display: flex; flex-direction: column; gap: 6px; }
+    .info-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .info-body { display: flex; flex-direction: column; gap: 6px; }
+    .info-body:empty { display: none; }
+    .info-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px;
+      font-size: 13px; font-weight: 400; color: var(--tc-1st); background: var(--bc-1st); border-radius: var(--r);
+      font-variant-numeric: tabular-nums; }
+    .info-row.muted { color: var(--tc-2nd); background: transparent; padding: 0 2px; }
+    .info-row .btn { flex: 0 0 auto; min-width: 0; padding: 8px 12px; font-size: 13px; }
 
     /* ── Event log ───────────────────────────────────────────────────────── */
     .log { flex: 1; min-height: 200px; max-height: 46vh; overflow-y: auto; display: flex;
@@ -1189,7 +1421,8 @@ function injectStyles(): void {
     .send-input::placeholder { color: var(--tc-2nd); }
     .interim { font-size: 13px; color: var(--tc-2nd); font-style: italic; padding: 0 2px; }
     .interim[hidden] { display: none; }
-    .composer-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+    .composer-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+    .composer-row .btn { min-width: 0; padding: 12px 6px; }
     /* Canned sends: even, intentional widths (3-up then 2-up at phone width),
        not a ragged auto-wrap. Each row's chips share the width equally. */
     .quick-row { display: flex; flex-wrap: wrap; gap: 6px; }

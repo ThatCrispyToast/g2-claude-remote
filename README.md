@@ -44,9 +44,16 @@ Can't connect? Open the bridge's port (default `8790`) in the host firewall.
 - **Answer blocking prompts** - permission requests and questions arrive as native
   screens (right away if you're watching, `! needs you` in the footer if not).
   Tap to answer, double-tap to set aside. Answer one elsewhere and it retires itself.
+- **Ask on the side** - check in on a busy session ("What are you doing right
+  now?") without interrupting it or adding to its transcript: pick a canned
+  question or dictate one, and follow up in context.
+- **Session info at a glance** - the server's one-line summary of where it
+  stands (or what it needs from you), context use, model / effort / mode,
+  running background tasks, plan usage, and uncommitted git changes.
 - **Steer hands-free** - interrupt, switch model / permission mode / reasoning
-  effort, fire slash commands (`/context`, `/usage`, `/compact`, …), send canned
-  replies, or dictate by voice.
+  effort (up to `max`), fire slash commands (`/context`, `/usage`, `/compact`,
+  …), send canned replies, or dictate by voice. The menus mark the session's
+  real current model, mode, and effort.
 - **Active sessions only** - archived and dead ones never reach the glasses, and
   every control action re-checks before it acts.
 
@@ -76,7 +83,7 @@ on the glasses through the firmware's native widgets. The bridge
 [`claude-rc-api`](https://github.com/ThatCrispyToast/claude-rc-api). It runs on
 any machine logged in to Claude Code, borrows that login (surviving token
 rotation), and adds the active-only filter, bearer-token auth, and the routes for
-answering blocking prompts.
+answering blocking prompts, asking side questions, and session info.
 
 ## Controls
 
@@ -86,25 +93,33 @@ answering blocking prompts.
 | **Session view** | native scroll - up into history, down to live | open Compose menu | back to list |
 | **Compose menu** | move selection | fire action / enter submenu | back to session |
 | **Commands submenu** | move selection | fire slash command | back to Compose |
+| **Ask aside submenu** | move selection | ask it (or dictate one) | back to Compose |
+| **Aside answer** | scroll the answer | ask a follow-up | back to session |
+| **Session info** | scroll | refresh | back to session |
 | **Model / Mode / Effort submenu** | move selection | apply | back to Compose |
 | **Voice dictation** | scroll transcript | done - review before sending | cancel |
 | **Confirm send** | scroll the message | send | cancel |
 | **Permission prompt** | move between Allow / Deny | pick | set aside |
 | **Question** | move between options | pick (`Dismiss` cancels) | set aside |
 
-The Compose menu leads with Dictate, then the quick-sends (`Proceed`, `Run tests`,
-`Explain` - configurable), `Interrupt`, `Commands`, `Model`, `Mode`, `Effort`, and
-`Archive`. Slash commands run locally at no token cost; heavy ones (`/compact`,
+The Compose menu leads with Dictate and Ask aside, then the quick-sends
+(`Proceed`, `Run tests`, `Explain` - configurable), `Interrupt`, `Session info`,
+`Commands`, `Model`, `Mode`, `Effort`, and `Archive`. A side question costs one
+model call and never reaches the session's transcript, so it skips the send
+confirmation. Slash commands run locally at no token cost; heavy ones (`/compact`,
 `/clear`) go through the confirm screen first. A set-aside prompt reopens from the
 Compose menu's `! Answer question` / `! Review permission` row, or by reopening the
 session. No blocking screen can trap you.
 
 ## The companion panel
 
-The same bundle's DOM is a full control surface in the phone's WebView: the
-un-clipped event log with tool inputs and usage/cost, free-text sends with `/`
-slash-command autocomplete, every steering control, and the Settings card. It
-still works as a plain-browser web app with no glasses connected.
+The same bundle's DOM is a full control surface in the phone's WebView: sessions
+listed with their effort, context use, and one-line status summary; the
+un-clipped event log with tool inputs and usage/cost; free-text sends with `/`
+slash-command autocomplete, plus **Ask aside** for a side question; a session
+card with background tasks (each with a Stop button), plan usage, and
+uncommitted changes; every steering control; and the Settings card. It still
+works as a plain-browser web app with no glasses connected.
 
 App updates can also carry a **release notice** - a slim dismissible card above
 the session list for anything important (say, "update your bridge"). Notices are

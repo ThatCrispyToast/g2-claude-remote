@@ -37,14 +37,15 @@ export interface Notice {
 /** Every notice this build knows, newest first. */
 export const NOTICES: Notice[] = [
   {
-    id: '2026-08-20-bridge-send-fix',
-    level: 'important',
-    title: 'Fix issued: messages ignored on new Claude Code versions',
+    id: '2026-10-16-ask-aside',
+    level: 'info',
+    title: 'New: ask on the side, and session info',
     body:
-      'Claude Code 2.1.220+ stopped acting on messages sent from the glasses ' +
-      'or panel — they reached the session but never got a reply. This is ' +
-      'fixed in the bridge stack (claude-rc-api 0.2.1). If the bridge host ' +
-      'has updated Claude Code, restart your bridge once with:',
+      'Ask aside (Compose menu, or the panel) asks a session a question without ' +
+      'interrupting it or adding to its transcript. Session info shows context ' +
+      'use, plan usage and uncommitted changes, and the menus now mark the ' +
+      "session's real mode and effort. These need the updated bridge, which also " +
+      'carries every earlier fix. Restart it once with:',
     command:
       'uvx --refresh --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge',
   },

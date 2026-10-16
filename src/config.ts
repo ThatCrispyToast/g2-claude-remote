@@ -173,13 +173,16 @@ export const MODELS: ModelChoice[] = [
 /** Permission modes offered in the Compose → Mode submenu. */
 export const MODES: PermissionMode[] = ['default', 'plan', 'acceptEdits', 'bypassPermissions']
 /** Effort levels offered in the Compose → Effort submenu. "auto" clears to the
- *  model default; "max" is session-scoped in the CLI and can't be set remotely. */
+ *  model default. Workers on Claude Code 2.1.30x apply a level for this session
+ *  only; older ones fall back to the `/effort` command, which also saves it as
+ *  that machine's default for the model. */
 export const EFFORTS: EffortChoice[] = [
   { id: null, label: 'auto' },
   { id: 'low', label: 'low' },
   { id: 'medium', label: 'medium' },
   { id: 'high', label: 'high' },
   { id: 'xhigh', label: 'xhigh' },
+  { id: 'max', label: 'max' },
 ]
 
 /**
@@ -207,6 +210,26 @@ function parseQuickSends(raw: unknown): QuickSend[] {
   ]
 }
 export const QUICK_SENDS: QuickSend[] = parseQuickSends(env.VITE_QUICK_SENDS)
+
+/**
+ * Canned side questions for the Compose → Ask aside submenu. A side question is
+ * answered from the session's conversation without interrupting it or entering
+ * the transcript (one model call — claude.ai's "btw"), so it's the keyboard-free
+ * way to check in on a busy session. Short: each is a native list row (~60
+ * bytes). Override with a JSON array of strings in VITE_ASIDE_QUESTIONS.
+ */
+function parseAsideQuestions(raw: unknown): string[] {
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const arr = JSON.parse(raw)
+      if (Array.isArray(arr)) return arr.filter((q) => typeof q === 'string' && q.trim()).map((q) => q.trim())
+    } catch {
+      /* fall through to defaults */
+    }
+  }
+  return ['What are you doing right now?', "What's left before you're done?", 'Anything blocking you?']
+}
+export const ASIDE_QUESTIONS: string[] = parseAsideQuestions(env.VITE_ASIDE_QUESTIONS)
 
 /**
  * Slash commands offered in the Compose → Commands submenu (glasses) and the

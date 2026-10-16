@@ -19,14 +19,52 @@ import { markNoticeSeen, unseenNotices, type Notice } from './notices'
 import { GlassesDisplay, HUD, clip, hudSafe, liveTail, screen, type Layout } from './glasses'
 import { HttpBridgeClient } from './rc/client'
 import { BridgeError } from './rc/types'
-import type { ActiveSession, Decision, DialogAnswer, DialogOption, DialogQuestion, EffortLevel, PermissionMode, RcEvent } from './rc/types'
+import type {
+  ActiveSession,
+  AsideTurn,
+  BackgroundTask,
+  Decision,
+  DialogAnswer,
+  DialogOption,
+  DialogQuestion,
+  EffortLevel,
+  PermissionMode,
+  RcEvent,
+  SessionInfo,
+  WorkerState,
+} from './rc/types'
 import { EventLog } from './events/log'
-import { isQuestionRequest } from './events/format'
-import { commandItems, composeActions, effortItems, modelItems, modeItems, type ComposeAction, type SubmenuItem } from './input/compose'
+import { cleanProse, isQuestionRequest, modelShort, modeShort } from './events/format'
+import {
+  ASIDE_DICTATE,
+  asideItems,
+  commandItems,
+  composeActions,
+  effortItems,
+  modelItems,
+  modeItems,
+  type ComposeAction,
+  type SubmenuItem,
+  type SubmenuKind,
+} from './input/compose'
 import { VoiceDictation } from './input/voice'
-import { Panel } from './ui'
+import { Panel, type AsideView } from './ui'
 
-type State = 'boot' | 'setup' | 'list' | 'session' | 'compose' | 'submenu' | 'voice' | 'confirm' | 'permission' | 'question' | 'notice' | 'error'
+type State =
+  | 'boot'
+  | 'setup'
+  | 'list'
+  | 'session'
+  | 'compose'
+  | 'submenu'
+  | 'voice'
+  | 'confirm'
+  | 'permission'
+  | 'question'
+  | 'aside'
+  | 'info'
+  | 'notice'
+  | 'error'
 
 const CLICK = OsEventTypeList.CLICK_EVENT // 0
 const SCROLL_UP = OsEventTypeList.SCROLL_TOP_EVENT // 1
@@ -37,6 +75,14 @@ const DOUBLE_CLICK = OsEventTypeList.DOUBLE_CLICK_EVENT // 3
 // out, before we give up and just leave the last events on screen.
 const STREAM_MAX_RETRIES = 5
 const STREAM_RETRY_DELAY_MS = 2500
+
+// The session header is ONE line of a proportional font; past ~56 chars it
+// overflows its strip. The title gets whatever the status tail leaves.
+const HEADER_CHARS = 56
+// Context use joins the header only once it is worth a glance.
+const CTX_WARN_PCT = 50
+// Side-question exchanges kept per session and sent with a follow-up.
+const ASIDE_HISTORY = 4
 
 /** Race a bridge RPC against a timeout so a slow or unimplemented native method
  *  can never stall boot or a settings save; resolves to `fallback` on timeout. */
@@ -90,12 +136,17 @@ class App {
   private histEnd = 0
   private lastScrollAt = 0 // performance.now() of the last handled scroll (debounce)
 
+  // The open session's live settings, merged from its system/init + status
+  // events (the session object has no permission mode at all), and its running
+  // background tasks, from the newest system/background_tasks_changed.
+  private worker: WorkerState | null = null
+  private tasks: BackgroundTask[] = []
+
   // compose / submenu
-  private submenuKind: 'model' | 'mode' | 'effort' | 'command' = 'model'
+  private submenuKind: SubmenuKind = 'model'
   private submenu: SubmenuItem[] = []
-  // Effort applied from this app, per session — the session object doesn't
-  // expose effort, so this is the only "current" the submenu can mark.
-  // Absent = never set here (a level set from the CLI is invisible to us).
+  // Effort applied from this app, per session: the last-resort "current" for
+  // a worker too old to report its effort (2.1.29x and earlier).
   private readonly effortBySid = new Map<string, EffortLevel | null>()
   // The Compose menu, snapshotted on entry. The list can vary (the leading
   // "Answer question" row appears only when a prompt is pending), and that
@@ -104,8 +155,23 @@ class App {
   // row highlight would map to the wrong action.
   private composeItems: ComposeAction[] = []
 
-  // voice
+  // voice — `voicePurpose` is what the transcript becomes when dictation ends
   private interim = ''
+  private voicePurpose: 'send' | 'aside' = 'send'
+
+  // Side questions ("Ask aside"): the exchange on screen (glasses aside screen +
+  // panel card) and, per session, the recent exchanges sent along with a
+  // follow-up. `asideSeq` drops a late answer to a question since replaced.
+  private aside: AsideView | null = null
+  private readonly asideHistory = new Map<string, AsideTurn[]>()
+  private asideSeq = 0
+
+  // Session info's on-demand part (plan usage, git changes) — fetched on entry,
+  // never polled: each fetch leaves control events in the session's log.
+  private info: SessionInfo | null = null
+  private infoError: string | null = null
+  private infoLoading = false
+  private infoSeq = 0
 
   // A canned or dictated message the wearer is about to send, held on the
   // confirmation screen so a single stray tap in the Compose menu or the voice
@@ -163,8 +229,12 @@ class App {
       onAnswerPermission: (d) => void this.answerPermission(d),
       onPickDialogOption: (qIndex, label) => this.recordPick(qIndex, label),
       onCancelDialog: () => void this.submitQuestion('cancelled'),
-      onStartVoice: () => void this.startVoice(),
+      onStartVoice: () => void this.startVoice('send'),
       onStopVoice: () => void this.commitVoice(),
+      onAskAside: (q) => void this.askAside(q, 'panel'),
+      onDismissAside: () => this.dismissAside(),
+      onLoadInfo: () => void this.loadInfo(),
+      onStopTask: (id) => void this.stopTask(id),
       onApplySettings: () => void this.applySettings(),
       onDismissNotice: (id) => this.dismissNotice(id),
       onExit: () => void this.exit(),
@@ -361,7 +431,10 @@ class App {
     // Keep the open session's metadata fresh, and detect if it went inactive.
     if (this.sid) {
       const still = list.find((s) => s.id === this.sid)
-      if (still) this.session = still
+      if (still) {
+        this.session = still
+        this.panel.refreshSession(still)
+      }
     }
     this.panel.setSessions(this.sessions, this.sid)
   }
@@ -405,15 +478,19 @@ class App {
     this.streamRetries = 0
     this.resetSessionView()
     this.resetPrompts()
+    this.resetSessionExtras()
     this.session = this.sessions.find((s) => s.id === sid) ?? null
     try {
       this.session = await this.rc.getSession(sid) // 409s if not active
       const history = await this.rc.getHistory(sid) // the NEWEST events, oldest→newest
       for (const ev of history) {
         this.log.append(ev)
+        this.noteEvent(ev)
         if (ev.sequenceNum != null) this.lastSeq = Math.max(this.lastSeq, ev.sequenceNum)
       }
       this.panel.setActiveSession(this.session)
+      this.panel.setWorkerState(this.worker)
+      this.panel.setTasks(this.tasks)
       this.panel.setEvents(history)
       // A session that is blocked on the user RIGHT NOW opens straight onto its
       // prompt: the tail-most control_request with no resolution after it
@@ -464,6 +541,7 @@ class App {
     // re-trigger UI — the log's sequenceNum dedupe is the gate for everything
     // below, most importantly the blocking-prompt routing.
     if (!this.log.append(ev)) return
+    this.noteEvent(ev)
     this.panel.appendEvent(ev)
     // Prompt-resolution signals: an answer echoed back through the log (ours or
     // another controller's) retires that prompt; a turn-ending result retires
@@ -478,6 +556,53 @@ class App {
     // newest tail; in 'history' the body is frozen, so render() only refreshes
     // the (separate) header/footer containers and the native scroll stays put.
     if (this.state === 'session') this.render()
+  }
+
+  /** Track the open session's live settings and background tasks. A status
+   *  event carries only the permission mode, so merge — never let its nulls
+   *  erase the model or effort an init reported. */
+  private noteEvent(ev: RcEvent): void {
+    if (ev.workerState) {
+      const prev = this.worker ?? { model: null, effort: null, permissionMode: null, ccVersion: null }
+      const next = { ...prev }
+      for (const [k, v] of Object.entries(ev.workerState) as [keyof WorkerState, string | null][]) {
+        if (v != null) next[k] = v
+      }
+      this.worker = next
+      this.panel.setWorkerState(next)
+    }
+    if (ev.tasks) {
+      this.tasks = ev.tasks
+      this.panel.setTasks(ev.tasks)
+    }
+  }
+
+  /** Forget the open session's settings, tasks, aside and info (open / leave).
+   *  Bumping the sequence numbers drops any answer still in flight. */
+  private resetSessionExtras(): void {
+    this.worker = null
+    this.tasks = []
+    this.aside = null
+    this.asideSeq++
+    this.info = null
+    this.infoError = null
+    this.infoLoading = false
+    this.infoSeq++
+    this.panel.setWorkerState(null)
+    this.panel.setTasks([])
+    this.panel.setAside(null)
+    this.panel.setInfo(null)
+  }
+
+  /** The session's current effort: what the worker reported, else the session
+   *  metadata, else the level this app last applied (`undefined` = unknown). */
+  private currentEffort(): string | null | undefined {
+    const sid = this.sid
+    return this.worker?.effort ?? this.session?.effort ?? (sid ? this.effortBySid.get(sid) : undefined)
+  }
+
+  private currentMode(): string | null {
+    return this.worker?.permissionMode ?? this.session?.permissionMode ?? null
   }
 
   private onStreamError(err: BridgeError): void {
@@ -511,6 +636,7 @@ class App {
     this.session = null
     this.log.clear()
     this.resetPrompts() // drop the prompt queue (clears permEvent + panel banners)
+    this.resetSessionExtras()
     this.panel.setActiveSession(null)
     this.listSelectIndex = 0
     this.go('list')
@@ -571,9 +697,11 @@ class App {
     if (!this.sid) return
     const level = effort === 'auto' ? null : (effort as EffortLevel)
     try {
-      await this.rc.setEffort(this.sid, level)
+      const via = await this.rc.setEffort(this.sid, level)
       this.effortBySid.set(this.sid, level)
-      this.panel.setToast(`Effort → ${effort}`)
+      // An older worker only takes the /effort command, which ALSO saves the
+      // level as that machine's default for the model — say so.
+      this.panel.setToast(via === 'command' ? `Effort → ${effort} (also saved as the host's default)` : `Effort → ${effort}`)
     } catch (e) {
       this.onActionError(e)
     }
@@ -586,6 +714,87 @@ class App {
       this.panel.setToast('Session archived.')
       await this.refreshSessions()
       this.backToList()
+    } catch (e) {
+      this.onActionError(e)
+    }
+  }
+
+  // ── side questions ("Ask aside") ────────────────────────────────────────
+  // Answered from the session's conversation without interrupting it or
+  // entering its transcript — one model call, no confirm step needed.
+
+  /** Ask `question` on the side. From the glasses it opens the aside screen;
+   *  from the panel only the panel's card shows it. Recent exchanges ride along
+   *  so a follow-up reads in context. */
+  private async askAside(question: string, from: 'glasses' | 'panel'): Promise<void> {
+    const sid = this.sid
+    const q = question.trim()
+    if (!sid || !q) return
+    const seq = ++this.asideSeq
+    this.aside = { question: q, answer: null, error: null }
+    this.panel.setAside(this.aside)
+    if (from === 'glasses') this.go('aside')
+    else if (this.state === 'aside') this.render() // the glasses were showing the last one
+    const history = this.asideHistory.get(sid) ?? []
+    try {
+      const answer = await this.rc.ask(sid, q, history)
+      if (seq !== this.asideSeq) return // replaced, or the session was left
+      this.aside = { question: q, answer: answer ?? 'No answer: the session has no conversation yet.', error: null }
+      if (answer) this.asideHistory.set(sid, [...history, { question: q, response: answer }].slice(-ASIDE_HISTORY))
+    } catch (e) {
+      if (seq !== this.asideSeq) return
+      if (e instanceof BridgeError && e.isInactive) return this.onActionError(e)
+      this.aside = { question: q, answer: null, error: workerError(e, 'side questions') }
+    }
+    this.panel.setAside(this.aside)
+    if (this.state === 'aside') this.render()
+  }
+
+  /** The panel card's ×: forget the shown exchange (its history stays). */
+  private dismissAside(): void {
+    this.aside = null
+    this.asideSeq++
+    this.panel.setAside(null)
+    if (this.state === 'aside') this.go('session')
+  }
+
+  // ── session info ─────────────────────────────────────────────────────────
+  private openInfo(): void {
+    this.go('info')
+    void this.loadInfo()
+  }
+
+  /** Ask the worker for plan usage + git changes (the rest of the info screen
+   *  is already known). One fetch at a time: each leaves control events in the
+   *  session's log, so a burst of taps mustn't multiply them. */
+  private async loadInfo(): Promise<void> {
+    const sid = this.sid
+    if (!sid || this.infoLoading) return
+    const seq = ++this.infoSeq
+    this.infoLoading = true
+    this.panel.setInfo({ info: this.info, error: null, loading: true })
+    if (this.state === 'info') this.render()
+    try {
+      const info = await this.rc.info(sid)
+      if (seq !== this.infoSeq) return
+      this.info = info
+      this.infoError = null
+    } catch (e) {
+      if (seq !== this.infoSeq) return
+      if (e instanceof BridgeError && e.isInactive) return this.onActionError(e)
+      this.infoError = workerError(e, 'plan usage + changes')
+    } finally {
+      if (seq === this.infoSeq) this.infoLoading = false
+    }
+    this.panel.setInfo({ info: this.info, error: this.infoError, loading: false })
+    if (this.state === 'info') this.render()
+  }
+
+  private async stopTask(taskId: string): Promise<void> {
+    if (!this.sid) return
+    try {
+      await this.rc.stopTask(this.sid, taskId)
+      this.panel.setToast('Task stopped.')
     } catch (e) {
       this.onActionError(e)
     }
@@ -850,11 +1059,12 @@ class App {
   }
 
   // ── voice dictation ────────────────────────────────────────────────────
-  private async startVoice(): Promise<void> {
+  private async startVoice(purpose: 'send' | 'aside'): Promise<void> {
     if (!this.voice?.available) {
       this.panel.setToast('Voice dictation needs a Deepgram key.')
       return
     }
+    this.voicePurpose = purpose
     this.interim = ''
     this.panel.setDictating(true)
     this.go('voice')
@@ -884,9 +1094,15 @@ class App {
   }
 
   /** Panel Stop button: finish dictating and send straight away — an explicit
-   *  press on a real button, not a stray glasses tap, so no confirm step. */
+   *  press on a real button, not a stray glasses tap, so no confirm step. (A
+   *  side question dictated on the glasses is still asked, not sent.) */
   private async commitVoice(): Promise<void> {
     const text = await this.finishDictation()
+    if (this.voicePurpose === 'aside') {
+      if (text) await this.askAside(text, 'glasses')
+      else if (this.state === 'voice') this.go('session')
+      return
+    }
     if (text) await this.send(text)
     if (this.state === 'voice') {
       if (text) this.goLiveSession() // sent → watch it run
@@ -900,8 +1116,9 @@ class App {
   private async reviewDictation(): Promise<void> {
     const text = await this.finishDictation()
     if (this.state !== 'voice') return // involuntarily left the voice screen meanwhile
-    if (text) this.confirmSend(text, 'session')
-    else this.go('session')
+    if (!text) this.go('session')
+    else if (this.voicePurpose === 'aside') void this.askAside(text, 'glasses') // read-only: no confirm
+    else this.confirmSend(text, 'session')
   }
 
   private async cancelVoice(): Promise<void> {
@@ -1034,6 +1251,13 @@ class App {
       case 'question':
         this.pickHighlighted() // tap the highlighted option (or the Dismiss row)
         break
+      case 'aside':
+        // Answered → ask a follow-up (the submenu; history rides along).
+        if (this.aside?.answer != null || this.aside?.error) this.openSubmenu('aside')
+        break
+      case 'info':
+        void this.loadInfo() // tap = refresh
+        break
       case 'notice':
         this.ackNotice() // got it — never shows again on this device
         break
@@ -1069,6 +1293,10 @@ class App {
         break
       case 'question':
         this.snoozePrompt() // dbl-tap sets the question aside to answer later
+        break
+      case 'aside':
+      case 'info':
+        this.go('session') // an aside still being answered lands on the panel card
         break
       case 'notice':
         this.snoozeNotices() // dbl-tap = later — unseen, returns next launch
@@ -1198,11 +1426,14 @@ class App {
         this.confirmSend(action.text, 'compose') // confirm before firing a canned send
         break
       case 'voice':
-        void this.startVoice()
+        void this.startVoice('send')
         break
       case 'interrupt':
         void this.interrupt()
         this.go('session')
+        break
+      case 'info':
+        this.openInfo()
         break
       case 'submenu':
         this.openSubmenu(action.menu)
@@ -1224,16 +1455,18 @@ class App {
     }
   }
 
-  private openSubmenu(kind: 'model' | 'mode' | 'effort' | 'command'): void {
+  private openSubmenu(kind: SubmenuKind): void {
     this.submenuKind = kind
     this.submenu =
       kind === 'model'
-        ? modelItems(this.session?.model ?? null)
+        ? modelItems(this.worker?.model ?? this.session?.model ?? null)
         : kind === 'mode'
-          ? modeItems(this.session?.permissionMode ?? null)
+          ? modeItems(this.currentMode())
           : kind === 'effort'
-            ? effortItems(this.sid ? this.effortBySid.get(this.sid) : undefined)
-            : commandItems()
+            ? effortItems(this.currentEffort())
+            : kind === 'aside'
+              ? asideItems(!!this.voice?.available)
+              : commandItems()
     this.listSelectIndex = 0 // native list starts highlighted at the top row
     this.go('submenu')
   }
@@ -1246,6 +1479,11 @@ class App {
     }
     if (this.submenuKind === 'command') {
       this.fireSlashCommand(item.value) // owns its own navigation (confirm vs fire+watch)
+      return
+    }
+    if (this.submenuKind === 'aside') {
+      if (item.value === ASIDE_DICTATE) void this.startVoice('aside')
+      else void this.askAside(item.value, 'glasses')
       return
     }
     if (this.submenuKind === 'model') void this.applyModel(item.value)
@@ -1349,10 +1587,14 @@ class App {
       case 'voice':
         return {
           kind: 'scroll',
-          header: `${HUD.RUN} Listening`,
+          header: this.voicePurpose === 'aside' ? `${HUD.RUN} Ask aside ${HUD.SEP} listening` : `${HUD.RUN} Listening`,
           body: this.interim ? liveTail(this.interim) : '(speak now)',
           footer: `tap = done ${HUD.SEP} dbl = cancel`,
         }
+      case 'aside':
+        return this.asideLayout()
+      case 'info':
+        return this.infoLayout()
       case 'confirm':
         return this.confirmLayout()
       case 'notice':
@@ -1382,13 +1624,31 @@ class App {
     return this.sessions.map((s) => `${dot(s.workerStatus)} ${clip(s.title, 32, HUD.ELL)} ${HUD.SEP} ${short(s.workerStatus)}`)
   }
 
+  /** The session header: dot, title, then the live settings — model, effort,
+   *  a non-default mode, and context use once it passes CTX_WARN_PCT. The title
+   *  gets whatever room the tail leaves on the one-line strip. */
+  private sessionHeader(): string {
+    const s = this.session
+    const mode = this.currentMode()
+    const ctx = s?.context && s.context.percent >= CTX_WARN_PCT ? `ctx ${s.context.percent}%` : ''
+    const tail = [modelShort(this.worker?.model ?? s?.model), this.currentEffort() ?? '', mode === 'default' ? '' : modeShort(mode), ctx]
+      .filter(Boolean)
+      .join(` ${HUD.SEP} `)
+    const room = Math.max(10, HEADER_CHARS - tail.length - 5)
+    return `${dot(s?.workerStatus)} ${clip(s?.title ?? 'session', room, HUD.ELL)} ${HUD.SEP} ${tail}`
+  }
+
+  /** The footer's lead-in while a deferred prompt waits: a gentle nag from the
+   *  footer instead of hijacking the screen the wearer is on. */
+  private attnPrefix(): string {
+    return this.promptDeferred ? `${HUD.ATTN} needs you ${HUD.SEP} ` : ''
+  }
+
   /** Session view: fixed header + firmware-scrolled body + fixed footer. */
   private sessionLayout(): Layout {
     const s = this.session
-    const header = `${dot(s?.workerStatus)} ${clip(s?.title ?? 'session', 22, HUD.ELL)} ${HUD.SEP} ${modelShort(s?.model ?? null)} ${HUD.SEP} ${s?.permissionMode ?? 'default'}`
-    // A deferred prompt (e.g. the wearer is reading back history) nags gently
-    // from the footer instead of hijacking the screen.
-    const attn = this.promptDeferred ? `${HUD.ATTN} needs you ${HUD.SEP} ` : ''
+    const header = this.sessionHeader()
+    const attn = this.attnPrefix()
     if (this.histMode === 'history') {
       return {
         kind: 'scroll',
@@ -1443,6 +1703,52 @@ class App {
     }
   }
 
+  /** A side question and its answer, on a natively-scrolled body. Tap (once
+   *  answered) asks a follow-up; double-tap returns to the session. */
+  private asideLayout(): Layout {
+    const a = this.aside
+    const reply = !a ? '' : a.error ? `${HUD.ATTN} ${a.error}` : a.answer != null ? cleanProse(a.answer) : 'asking...'
+    const done = !!a && (a.answer != null || !!a.error)
+    return {
+      kind: 'scroll',
+      header: `? Aside ${HUD.SEP} not in the transcript`,
+      body: hudSafe(a ? `${HUD.USER} ${a.question}\n\n${reply}` : '(nothing asked)'),
+      footer: `${this.attnPrefix()}${done ? `tap = ask more ${HUD.SEP} ` : ''}dbl = back`,
+    }
+  }
+
+  /** Where the session stands, on one natively-scrolled screen: status and
+   *  settings, context use, the server's summary (or what it needs from you),
+   *  running background tasks, then the on-demand plan usage + git changes. */
+  private infoLayout(): Layout {
+    const s = this.session
+    const lines: string[] = []
+    const mode = this.currentMode()
+    const effort = this.currentEffort()
+    lines.push(
+      [short(s?.workerStatus), modelShort(this.worker?.model ?? s?.model), effort ? `${effort} effort` : '', modeShort(mode)]
+        .filter(Boolean)
+        .join(` ${HUD.SEP} `),
+    )
+    if (s?.context) {
+      lines.push(`context ${s.context.percent}% ${HUD.SEP} ${tokens(s.context.usedTokens)} of ${tokens(s.context.maxTokens)}`)
+    }
+    if (s?.needsAction) lines.push('', `${HUD.ATTN} ${s.needsAction}`)
+    else if (s?.summary) lines.push('', s.summary)
+    if (this.tasks.length) {
+      lines.push('', `${this.tasks.length} background task${this.tasks.length > 1 ? 's' : ''}:`)
+      for (const t of this.tasks) lines.push(`${HUD.TOOL} ${clip(t.description || t.id, 60, HUD.ELL)}`)
+    }
+    lines.push('', ...infoLines(this.info, this.infoLoading, this.infoError))
+    if (s?.ccVersion) lines.push(`Claude Code ${s.ccVersion}`)
+    return {
+      kind: 'scroll',
+      header: `${HUD.SYS} ${clip(s?.title ?? 'session', 34, HUD.ELL)}`,
+      body: hudSafe(lines.join('\n')),
+      footer: `${this.attnPrefix()}tap = refresh ${HUD.SEP} dbl = back`,
+    }
+  }
+
   /** Confirm a canned or dictated message before it sends. The full message rides
    *  in the natively-scrolled body (so a long dictation can be read back and
    *  scrolled), and the tap = send / double-tap = cancel idiom matches the voice
@@ -1492,11 +1798,12 @@ class App {
 // ── small pure helpers ─────────────────────────────────────────────────────
 /** Header title per submenu kind (exhaustive, so a new kind can't silently
  *  inherit the wrong label the way a fall-through ternary did). */
-const SUBMENU_TITLE: Record<'model' | 'mode' | 'effort' | 'command', string> = {
+const SUBMENU_TITLE: Record<SubmenuKind, string> = {
   model: 'Model',
   mode: 'Permission mode',
   effort: 'Effort',
   command: 'Commands',
+  aside: 'Ask aside',
 }
 
 function short(w: string | null | undefined): string {
@@ -1508,9 +1815,51 @@ function dot(w: string | null | undefined): string {
   if (w === 'requires_action') return HUD.ATTN
   return HUD.IDLE
 }
-function modelShort(m: string | null): string {
-  if (!m) return '?'
-  return m.replace(/^claude-/, '').replace(/-\d{8}$/, '')
+/** `440439` → `440k`, `1000000` → `1M`. */
+function tokens(n: number): string {
+  if (n >= 1_000_000) return `${+(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1000) return `${Math.round(n / 1000)}k`
+  return String(n)
+}
+/** The info screen's on-demand lines: plan usage windows + git changes. */
+function infoLines(info: SessionInfo | null, loading: boolean, error: string | null): string[] {
+  if (!info) return [loading ? 'plan + changes: loading...' : error ? `${HUD.ATTN} ${error}` : '']
+  const lines: string[] = []
+  const limits = info.usage?.limits ?? []
+  if (limits.length) {
+    lines.push(`plan ${limits.map((l) => `${limitLabel(l.kind, l.model)} ${l.percent ?? '?'}%`).join(` ${HUD.SEP} `)}`)
+    const five = limits.find((l) => l.kind === 'session')
+    const reset = five?.resetsAt ? untilLabel(five.resetsAt) : ''
+    if (reset) lines.push(`5h window resets in ${reset}`)
+  }
+  if (info.diff) {
+    const d = info.diff
+    lines.push(d.files ? `changes ${d.files} file${d.files > 1 ? 's' : ''} +${d.added} -${d.removed}` : 'no uncommitted changes')
+  }
+  if (loading) lines.push('(refreshing...)')
+  return lines
+}
+function limitLabel(kind: string, model: string | null): string {
+  if (kind === 'session') return '5h'
+  if (kind === 'weekly_all') return 'week'
+  if (kind === 'weekly_scoped') return model ?? 'scoped'
+  return kind
+}
+/** `1h 12m` until an ISO time ('' if past or unparseable). */
+function untilLabel(iso: string): string {
+  const ms = Date.parse(iso) - Date.now()
+  if (!Number.isFinite(ms) || ms <= 0) return ''
+  const min = Math.round(ms / 60_000)
+  return min >= 60 ? `${Math.floor(min / 60)}h ${min % 60}m` : `${min}m`
+}
+/** A worker query's failure, worded for the wearer: an older bridge 404s the
+ *  new routes, a busy worker times out (504), a refusal comes back as 502. */
+function workerError(e: unknown, what: string): string {
+  if (e instanceof BridgeError) {
+    if (e.status === 404) return `${what} need a newer bridge (uvx --refresh).`
+    if (e.status === 504) return 'No answer in time.'
+  }
+  return (e as Error).message || 'Failed.'
 }
 /** A question option row: the label, plus a short description when there's room. */
 function optionLabel(o: DialogOption): string {

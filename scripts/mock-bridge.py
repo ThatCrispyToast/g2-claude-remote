@@ -4,8 +4,9 @@
 For driving the app (dev server, simulator, browser) with no Claude login and
 nothing real to steer, and for staging the store screenshots in assets/store/
 (the repo is public, so never shoot real sessions). It implements the read side
-of the bridge API with the shapes in src/rc/types.ts; every POST is accepted and
-ignored, and any token is accepted.
+of the bridge API with the shapes in src/rc/types.ts, answers side questions
+and session info with canned replies, accepts (and ignores) every other POST,
+and takes any token.
 
     python3 scripts/mock-bridge.py [--port 8791] [--question]
     VITE_BRIDGE_URL=http://localhost:8791 VITE_BRIDGE_TOKEN=x npm run dev
@@ -29,7 +30,10 @@ def _ago(minutes: int) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - minutes * 60))
 
 
-def _session(sid: str, title: str, worker: str, model: str, minutes_ago: int) -> dict[str, Any]:
+def _session(
+    sid: str, title: str, worker: str, model: str, minutes_ago: int, *, effort: str, context: int, summary: str,
+    needs_action: str | None = None,
+) -> dict[str, Any]:
     return {
         "id": sid,
         "title": title,
@@ -43,6 +47,11 @@ def _session(sid: str, title: str, worker: str, model: str, minutes_ago: int) ->
         "unread": False,
         "userMessageCount": 2,
         "pendingAction": None,
+        "effort": effort,
+        "context": {"usedTokens": context * 10_000, "maxTokens": 1_000_000, "percent": context},
+        "summary": summary,
+        "needsAction": needs_action,
+        "ccVersion": "2.1.301",
     }
 
 
@@ -68,7 +77,14 @@ def _event(seq: int, kind: str, **f: Any) -> dict[str, Any]:
         "toolUseId": f"toolu_{seq}" if control else None,
         "permissionRequest": control,
         "usage": f.get("usage"),
+        "source": "client" if kind == "user" else "worker",
+        "workerState": f.get("state"),
+        "tasks": f.get("tasks"),
     }
+
+
+def _state(model: str, effort: str, mode: str) -> dict[str, Any]:
+    return {"model": model, "effort": effort, "permissionMode": mode, "ccVersion": "2.1.301"}
 
 
 def _permission(tool: str, inp: dict[str, Any], questions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -103,9 +119,13 @@ RATE_LIMIT_QUESTION = {
 
 def build_world(question: bool) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     sessions = [
-        _session("session_mock_api", "api-refactor", "running", "claude-opus-5-5", 0),
-        _session("session_mock_docs", "docs-site", "idle", "claude-sonnet-5-5", 42),
-        _session("session_mock_pay", "payment-service", "requires_action", "claude-opus-5-5", 3),
+        _session("session_mock_api", "api-refactor", "running", "claude-opus-5-5", 0, effort="xhigh", context=62,
+                 summary="Checkout API on the new session store; fixing the coupon totals test"),
+        _session("session_mock_docs", "docs-site", "idle", "claude-sonnet-5-5", 42, effort="medium", context=9,
+                 summary="Getting-started guide proofread: four typos, one broken link"),
+        _session("session_mock_pay", "payment-service", "requires_action", "claude-opus-5-5", 3, effort="high",
+                 context=31, summary="Rate limiter passes tests; staging deploy waiting on approval",
+                 needs_action="approve the staging deploy (./scripts/deploy.sh staging)"),
     ]
     if question:
         blocker = _permission("AskUserQuestion", {"questions": [RATE_LIMIT_QUESTION]}, [RATE_LIMIT_QUESTION])
@@ -113,7 +133,8 @@ def build_world(question: bool) -> tuple[list[dict[str, Any]], dict[str, list[di
         blocker = _permission("Bash", {"command": "./scripts/deploy.sh staging", "description": "Deploy to staging"})
     events = {
         "session_mock_api": [
-            _event(1, "system", subtype="init", model="claude-opus-5-5"),
+            _event(1, "system", subtype="init", model="claude-opus-5-5",
+                   state=_state("claude-opus-5-5", "xhigh", "acceptEdits")),
             _event(2, "user", text="Refactor the checkout API to use the new session store"),
             _event(
                 3,
@@ -122,9 +143,11 @@ def build_world(question: bool) -> tuple[list[dict[str, Any]], dict[str, list[di
                 tools=[("Edit", {"file_path": "src/api/checkout.ts"}), ("Bash", {"command": "npx tsc --noEmit"})],
             ),
             _event(4, "result", subtype="success", usage=_usage(4, 92.0, 0.31)),
-            _event(5, "user", text="Fix the failing checkout tests"),
+            _event(5, "system", subtype="background_tasks_changed",
+                   tasks=[{"id": "b7xk2m9qa", "type": "local_bash", "description": "Dev server on :3000"}]),
+            _event(6, "user", text="Fix the failing checkout tests"),
             _event(
-                6,
+                7,
                 "assistant",
                 text="Found it - the coupon total is added before tax, so the assertion is off by the tax "
                 "amount. Patching the totals helper.",
@@ -132,7 +155,8 @@ def build_world(question: bool) -> tuple[list[dict[str, Any]], dict[str, list[di
             ),
         ],
         "session_mock_docs": [
-            _event(1, "system", subtype="init", model="claude-sonnet-5-5"),
+            _event(1, "system", subtype="init", model="claude-sonnet-5-5",
+                   state=_state("claude-sonnet-5-5", "medium", "default")),
             _event(2, "user", text="Proofread the getting-started guide"),
             _event(
                 3,
@@ -146,7 +170,8 @@ def build_world(question: bool) -> tuple[list[dict[str, Any]], dict[str, list[di
             _event(4, "result", subtype="success", usage=_usage(3, 41.5, 0.12)),
         ],
         "session_mock_pay": [
-            _event(1, "system", subtype="init", model="claude-opus-5-5"),
+            _event(1, "system", subtype="init", model="claude-opus-5-5",
+                   state=_state("claude-opus-5-5", "high", "default")),
             _event(2, "user", text="Ship the rate limiter to staging"),
             _event(3, "assistant", text="Tests pass. Deploying to staging next."),
             _event(4, "control_request", control=blocker),
@@ -155,7 +180,23 @@ def build_world(question: bool) -> tuple[list[dict[str, Any]], dict[str, list[di
     return sessions, events
 
 
-_R_SESSION = re.compile(r"^/api/sessions/(?P<sid>[^/]+)(?P<rest>/events|/stream)?$")
+_R_SESSION = re.compile(r"^/api/sessions/(?P<sid>[^/]+)(?P<rest>/events|/stream|/info)?$")
+
+ASIDE_ANSWER = (
+    "Fixing the coupon totals test: the discount was applied before tax. "
+    "One more test run, then I'll summarize the diff."
+)
+INFO = {
+    "usage": {
+        "limits": [
+            {"kind": "session", "percent": 38, "resetsAt": None, "model": None},
+            {"kind": "weekly_all", "percent": 12, "resetsAt": None, "model": None},
+            {"kind": "weekly_scoped", "percent": 3, "resetsAt": None, "model": "Fable"},
+        ],
+        "costUsd": 1.42,
+    },
+    "diff": {"files": 3, "added": 118, "removed": 41},
+}
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -186,6 +227,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        path = urlparse(self.path).path
+        if path.endswith("/aside"):
+            time.sleep(1.5)  # a side question is one model call
+            return self._json({"answer": ASIDE_ANSWER})
+        if path.endswith("/effort"):
+            return self._json({"ok": True, "via": "control"})
         self._json({"ok": True})
 
     def do_GET(self) -> None:
@@ -204,6 +251,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"events": self.events.get(session["id"], [])})
         if m["rest"] == "/stream":
             return self._stream()
+        if m["rest"] == "/info":
+            return self._json(INFO)
         return self._json({"session": session})
 
     def _stream(self) -> None:

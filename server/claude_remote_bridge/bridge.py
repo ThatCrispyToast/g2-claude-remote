@@ -3,7 +3,7 @@
 It is a purpose-built sibling of ``claude-rc``'s ``webui.py``: a dependency-free
 ``http.server`` that wraps :class:`claude_rc.client.RemoteControlClient` and
 exposes exactly what the glasses UI needs. It differs from the stock webui in
-five deliberate ways, each required by this app:
+six deliberate ways, each required by this app:
 
 1. **Active-only.** ``GET /api/sessions`` returns *only* sessions that are
    ``status == "active"`` **and** ``connection_status == "connected"`` — i.e.
@@ -18,27 +18,30 @@ five deliberate ways, each required by this app:
    the loopback-only webui it needs its own shared-secret guard.
 3. **CORS.** The WebView bundle is a different origin, so responses carry
    permissive CORS headers (safe: the bearer token, not a cookie, is the guard).
-4. **Richer, camelCase events.** ``RcEvent`` is a superset of the webui's
-   flattened event that additionally carries ``requestId`` / ``toolUseId`` /
-   ``permissionRequest`` (needed to answer a permission prompt) and ``usage``.
-   ``permissionRequest`` covers both blocking flavors: tool-permissions
-   (``can_use_tool``) and QUESTIONS (with parsed ``questions``/options). NOTE the
-   sharp edge, confirmed against a live prompt: the **AskUserQuestion** tool is
-   delivered as a ``can_use_tool`` permission whose ``input`` holds the
-   ``questions`` — *not* as a ``request_user_dialog`` — so it is answered on the
-   PERMISSION path (allow + ``updatedInput.answers``), not with a dialog result.
-   The ``request_user_dialog`` / ``side_question`` subtypes exist for rarer,
-   still-unconfirmed dialog kinds. Two routes close the loop: ``POST …/permission``
-   (allow/deny) and ``POST …/dialog`` (answer a question — routes a ``can_use_tool``
-   question back through the permission builder) — neither the webui nor
-   ``RemoteControlClient`` can do these on their own.
-5. **Effort control with a working fallback.** ``POST …/effort`` calls
-   claude-rc-api's ``set_effort`` with wait+fallback: the protocol-correct
-   ``apply_flag_settings`` control is refused by current remote-control
-   workers, so on refusal the ``/effort <level>`` slash command is injected
-   instead — workers execute it as a zero-cost local command. NOTE that the
-   command path persists the worker machine's default effort (CLI semantics,
-   not session-scoped); the response's ``via`` says which path ran.
+4. **Richer, camelCase events and sessions.** ``RcEvent`` is a superset of the
+   webui's flattened event that additionally carries ``requestId`` /
+   ``toolUseId`` / ``permissionRequest`` (needed to answer a prompt), ``usage``,
+   ``workerState`` (model / effort / permission mode from ``system/init`` and
+   ``system/status`` — the session object has no permission mode) and the
+   running background ``tasks``. ``permissionRequest`` covers both blocking
+   flavors: tool-permissions (``can_use_tool``) and QUESTIONS (with parsed
+   ``questions``/options). NOTE the sharp edge, confirmed against a live
+   prompt: the **AskUserQuestion** tool is delivered as a ``can_use_tool``
+   permission whose ``input`` holds the ``questions`` — *not* as a
+   ``request_user_dialog`` — so it is answered on the PERMISSION path (allow +
+   ``updatedInput.answers``). ``ActiveSession`` adds what the session's
+   ``external_metadata`` says for free: current effort, context use, the
+   one-line post-turn summary, the worker's Claude Code version.
+5. **Prompt answers.** ``POST …/permission`` (allow/deny) and ``POST …/dialog``
+   (answer a question; a ``can_use_tool`` question goes back through the
+   permission path) wrap claude-rc-api's answer builders.
+6. **Worker queries.** ``POST …/aside`` asks a side question (claude.ai's
+   "btw" — no interruption, nothing added to the transcript), ``GET …/info``
+   fetches plan usage + uncommitted git changes, ``POST …/stop_task`` stops a
+   background task, and ``POST …/effort`` applies effort session-scoped via the
+   ``apply_flag_settings`` control — falling back, on workers older than
+   2.1.30x that refuse it, to the ``/effort`` slash command (which persists the
+   worker machine's default; the response's ``via`` says which path ran).
 
 Run it — the goal is "one command and the glasses can connect":
 
@@ -102,8 +105,17 @@ except ModuleNotFoundError:
             "  # one dependency:  pip install httpx\n"
         )
         raise SystemExit(2)
+try:
+    from claude_rc.client import ControlRejected, ControlTimeout
+    from claude_rc.events import Event, _to_int, cli_dialog_response
+except ImportError:  # pragma: no cover - operator error
+    sys.stderr.write(
+        "claude-rc-api is too old for this bridge (it needs 0.3.0+).\n"
+        "Re-run with --refresh to update it:\n"
+        '  uvx --refresh --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge\n'
+    )
+    raise SystemExit(2)
 from claude_rc.credentials import CredentialsError, load_credentials, load_org_uuid
-from claude_rc.events import Event, _to_int
 
 
 # --- config ----------------------------------------------------------------
@@ -142,17 +154,22 @@ TOKEN = ""
 VERBOSE = False
 
 VALID_MODES = {"default", "plan", "acceptEdits", "bypassPermissions"}
-# Effort levels the worker's flag-settings schema accepts remotely. "max" is
-# session-scoped in the CLI and rejected on this path; "auto" maps to None
-# (an explicit null effortLevel clears back to the model default).
-VALID_EFFORTS = {"low", "medium", "high", "xhigh"}
+# Effort levels a worker accepts remotely ("auto" maps to None: an explicit null
+# effortLevel clears back to the model default).
+VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+# A side question is one model call over the session's context; Opus on a long
+# session can take a while. The worker's own deadline is 11 minutes.
+ASIDE_TIMEOUT_S = 150.0
 
 # --- route patterns (first hit wins) ---------------------------------------
 _SID = r"(?P<sid>[^/]+)"
 _R_SESSION = re.compile(rf"^/api/sessions/{_SID}$")
 _R_EVENTS = re.compile(rf"^/api/sessions/{_SID}/events$")
 _R_STREAM = re.compile(rf"^/api/sessions/{_SID}/stream$")
+_R_INFO = re.compile(rf"^/api/sessions/{_SID}/info$")
 _R_SEND = re.compile(rf"^/api/sessions/{_SID}/send$")
+_R_ASIDE = re.compile(rf"^/api/sessions/{_SID}/aside$")
+_R_STOP_TASK = re.compile(rf"^/api/sessions/{_SID}/stop_task$")
 _R_PERMISSION = re.compile(rf"^/api/sessions/{_SID}/permission$")
 _R_DIALOG = re.compile(rf"^/api/sessions/{_SID}/dialog$")
 _R_INTERRUPT = re.compile(rf"^/api/sessions/{_SID}/interrupt$")
@@ -164,18 +181,6 @@ _R_ARCHIVE = re.compile(rf"^/api/sessions/{_SID}/archive$")
 
 class SessionInactive(Exception):
     """Raised when a session is archived or dead — never controllable."""
-
-
-def unwrap_session(s: Any) -> dict:
-    """Normalise a session object.
-
-    ``list_sessions`` returns bare session dicts, but ``get_session`` wraps the
-    same object under a ``response_shape`` key. Unwrap so downstream code sees one
-    consistent shape.
-    """
-    if isinstance(s, dict) and isinstance(s.get("response_shape"), dict):
-        return s["response_shape"]
-    return s if isinstance(s, dict) else {}
 
 
 # --- active predicate (SINGLE SOURCE OF TRUTH) -----------------------------
@@ -190,10 +195,19 @@ def is_active(s: dict) -> bool:
 
 
 # --- shaping upstream objects into the app's contract ----------------------
+def _context(ext: dict) -> Optional[dict]:
+    usage = ext.get("context_usage") or {}
+    used, most = usage.get("used_tokens"), usage.get("max_tokens")
+    if not isinstance(used, int) or not isinstance(most, int) or most <= 0:
+        return None
+    return {"usedTokens": used, "maxTokens": most, "percent": round(100 * used / most)}
+
+
 def session_to_json(s: dict) -> dict:
     """Trim a raw upstream session into the ``ActiveSession`` shape (camelCase)."""
     cfg = s.get("config") or {}
     ext = s.get("external_metadata") or {}
+    summary = ext.get("post_turn_summary") or {}
     return {
         "id": s.get("id"),
         "title": s.get("title") or "(untitled)",
@@ -207,6 +221,11 @@ def session_to_json(s: dict) -> dict:
         "unread": bool(s.get("unread")),
         "userMessageCount": _to_int(s.get("user_message_count")) or 0,
         "pendingAction": ext.get("pending_action") or None,
+        "effort": ext.get("effort_level") or None,
+        "context": _context(ext),
+        "summary": summary.get("status_detail") or None,
+        "needsAction": summary.get("needs_action") or None,
+        "ccVersion": ext.get("container_cc_version") or None,
     }
 
 
@@ -319,25 +338,39 @@ def _usage(ev: Event) -> Optional[dict]:
     }
 
 
+def _worker_state(ev: Event) -> Optional[dict]:
+    state = ev.worker_state
+    if not state:
+        return None
+    return {
+        "model": state.get("model"),
+        "effort": state.get("effort"),
+        "permissionMode": state.get("permission_mode"),
+        "ccVersion": state.get("claude_code_version"),
+    }
+
+
+def _tasks(ev: Event) -> Optional[list]:
+    """The running background set a ``system/background_tasks_changed`` carries."""
+    if ev.type != "system" or ev.subtype != "background_tasks_changed":
+        return None
+    return [
+        {"id": t.get("task_id"), "type": t.get("task_type"), "description": t.get("description") or ""}
+        for t in ev.payload.get("tasks") or []
+        if isinstance(t, dict) and t.get("task_id")
+    ]
+
+
 def event_to_json(ev: Event) -> dict:
     """Flatten an :class:`Event` into ``RcEvent`` (camelCase, superset of webui)."""
-    blocking_subtype = None
-    request_id = None
-    if ev.type == "control_request":
-        req = ev.payload.get("request") or {}
-        blocking_subtype = req.get("subtype")
-        request_id = ev.payload.get("request_id")
-    elif ev.type == "control_response":
-        # A control_response's request_id correlates it to the control_request it
-        # answers — the app uses it to auto-dismiss a prompt answered elsewhere
-        # (another controller / the CLI itself).
-        resp = ev.payload.get("response") or {}
-        request_id = resp.get("request_id") or ev.payload.get("request_id")
+    # A control_response's requestId correlates it to the request it answers —
+    # the app uses it to auto-dismiss a prompt answered elsewhere.
     perm = _permission_request(ev)
     return {
         "type": ev.type,
         "subtype": ev.subtype,
         "role": ev.role,
+        "source": ev.source,
         "text": ev.text(),
         "toolUses": [
             {"name": t.get("name"), "input": t.get("input"), "id": t.get("id")}
@@ -350,48 +383,21 @@ def event_to_json(ev: Event) -> dict:
         "isTurnEnd": ev.is_turn_end,
         "isTerminal": ev.is_terminal,
         "isBlockingControl": ev.is_blocking_control,
-        "blockingSubtype": blocking_subtype,
-        "requestId": request_id,
+        "blockingSubtype": ev.control_subtype if ev.is_blocking_control else None,
+        "requestId": ev.request_id,
         "toolUseId": perm.get("toolUseId") if perm else None,
         "permissionRequest": perm,
         "usage": _usage(ev),
+        "workerState": _worker_state(ev),
+        "tasks": _tasks(ev),
     }
-
-
-def build_permission_answer(
-    request_id: str,
-    tool_use_id: Optional[str],
-    decision: str,
-    updated_input: Any = None,
-    message: Optional[str] = None,
-) -> dict:
-    """Construct the ``control_response`` that answers a ``can_use_tool`` prompt.
-
-    Claude Code's stream-json control protocol answers a ``control_request`` with
-    a ``control_response`` whose outer ``subtype`` is ``success`` (the request was
-    handled) and whose inner ``response`` carries the actual decision
-    (``behavior: allow|deny``). ``request_id`` correlates it to the prompt. This
-    shape was validated against a live prompt; ``send_raw`` delivers it.
-    """
-    behavior = "allow" if decision == "allow" else "deny"
-    inner: dict[str, Any] = {"behavior": behavior}
-    if behavior == "allow":
-        # An allow must echo the (possibly edited) tool input back.
-        inner["updatedInput"] = updated_input if updated_input is not None else {}
-    else:
-        inner["message"] = message or "Denied by controller"
-    resp: dict[str, Any] = {"subtype": "success", "request_id": request_id, "response": inner}
-    if tool_use_id:
-        resp["tool_use_id"] = tool_use_id
-    return {"type": "control_response", "response": resp}
 
 
 def _answers_map(answers: Any) -> dict[str, Any]:
     """Fold the app's ``[{header, question, options: [chosen labels]}]`` into the
     AskUserQuestion answer map: ``{<question text>: <label | [labels]>}``.
 
-    The tool keys answers by the *question* string (``answers[question]`` in the
-    tool's ``mapToolResultToToolResultBlockParam``), so that's the key. A single
+    The tool keys answers by the *question* string, so that's the key. A single
     pick is a bare label; a multi-select is the list. Unanswered questions are
     simply omitted (→ the tool reports them as "(no option selected)").
     """
@@ -407,72 +413,19 @@ def _answers_map(answers: Any) -> dict[str, Any]:
     return out
 
 
-def build_question_answer(
-    request_id: str,
-    tool_use_id: Optional[str],
-    status: str,
-    answers: Any,
-    original_input: Any,
-) -> dict:
-    """Answer an **AskUserQuestion** — which the remote-control API delivers as a
-    ``can_use_tool`` permission request, *not* a ``request_user_dialog`` — by
-    ALLOWING the tool with the wearer's picks merged into ``updatedInput``.
-
-    Confirmed against a live AskUserQuestion (``pathogen-test``): the chosen
-    option(s) ride in ``updatedInput.answers``, a map keyed by *question text* →
-    label. The tool then returns ``"<question>"="<label>"`` and the model reads
-    ``[User answered AskUserQuestion]: …``. An empty ``answers`` yields
-    "The user did not answer the questions." — which is exactly the graceful
-    *dismiss*, so a ``cancelled`` status simply allows with an empty map.
-
-    ``updatedInput`` MUST echo ``questions`` — the tool destructures it and
-    crashes ("Cannot destructure property 'questions'") if it is missing — so we
-    carry the original input through and reconstruct a minimal ``questions`` list
-    if it somehow didn't reach us.
-    """
-    answer_map = _answers_map(answers) if status == "completed" else {}
+def _question_input(original_input: Any, answers: Any) -> dict:
+    """The AskUserQuestion input to echo back. It MUST keep ``questions`` (the
+    tool crashes without them), so rebuild a minimal list if the app's copy of
+    the input somehow lost it."""
     base = dict(original_input) if isinstance(original_input, dict) else {}
     if not isinstance(base.get("questions"), list):
         base["questions"] = [
-            {
-                "question": (a.get("question") or a.get("header") or ""),
-                "header": a.get("header") or "",
-                "options": [],
-                "multiSelect": False,
-            }
+            {"question": a.get("question") or a.get("header") or "", "header": a.get("header") or "",
+             "options": [], "multiSelect": False}
             for a in (answers or [])
             if isinstance(a, dict)
         ]
-    base["answers"] = answer_map
-    return build_permission_answer(request_id, tool_use_id, "allow", updated_input=base)
-
-
-def build_dialog_answer(
-    request_id: str,
-    status: str,
-    answers: Any = None,
-) -> dict:
-    """Construct the ``control_response`` for a *true* dialog control request
-    (``request_user_dialog`` / ``side_question`` — e.g. elicitation, MCP-approval,
-    plan dialogs). **AskUserQuestion does NOT use this path** — it arrives as
-    ``can_use_tool`` and is answered by :func:`build_question_answer`.
-
-    Same outer envelope as a permission answer (``control_response`` with
-    ``subtype: success`` + ``request_id``), but the inner ``response`` is a dialog
-    result: ``{status, result}`` where ``status`` is ``completed`` | ``cancelled``
-    and ``result`` is the dialog-specific payload (opaque per ``dialog_kind``).
-
-    This shape is still reverse-engineered and UNCONFIRMED (no live sample of a
-    non-tool dialog kind yet) — it's the best-effort fallback for those rarer
-    kinds; confirm ``result`` against a live one before trusting it.
-    """
-    inner: dict[str, Any] = {"status": status}
-    if status == "completed":
-        inner["result"] = {"answers": answers} if answers else {}
-    else:
-        inner["result"] = {}
-    resp = {"subtype": "success", "request_id": request_id, "response": inner}
-    return {"type": "control_response", "response": resp}
+    return base
 
 
 class _Bridge(ThreadingHTTPServer):
@@ -554,13 +507,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": exc.body[:1000], "status": status}, status=status)
         elif isinstance(exc, CredentialsError):
             self._json({"error": str(exc), "status": 401}, status=401)
+        elif isinstance(exc, ControlRejected):
+            self._json({"error": str(exc), "status": 502}, status=502)  # the worker refused it
+        elif isinstance(exc, ControlTimeout):
+            self._json({"error": str(exc), "status": 504}, status=504)  # the worker never answered
         else:
             self._json({"error": repr(exc), "status": 500}, status=500)
 
     # -- the active gate ---------------------------------------------------
     def _require_active(self, sid: str) -> dict:
         """Fetch the session and refuse (409) if it is not active+connected."""
-        s = unwrap_session(self.rc.get_session(sid))
+        s = self.rc.get_session(sid)
         if not is_active(s):
             raise SessionInactive(sid)
         return s
@@ -597,12 +554,13 @@ class _Handler(BaseHTTPRequestHandler):
                 evs = self.rc.list_events(m["sid"], limit=limit, sort_order="desc")
                 evs.reverse()
                 return self._json({"events": [event_to_json(e) for e in evs]})
+            m = _R_INFO.match(path)
+            if m:
+                self._require_active(m["sid"])
+                return self._json(self._info(m["sid"]))
             m = _R_SESSION.match(path)
             if m:
-                s = unwrap_session(self.rc.get_session(m["sid"]))
-                if not is_active(s):
-                    raise SessionInactive(m["sid"])
-                return self._json({"session": session_to_json(s)})
+                return self._json({"session": session_to_json(self._require_active(m["sid"]))})
             self._json({"error": "not found", "status": 404}, status=404)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -624,6 +582,27 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._json({"error": "empty message", "status": 400}, status=400)
                 self.rc.send_message(m["sid"], text)
                 return self._json({"ok": True})
+            m = _R_ASIDE.match(path)
+            if m:
+                self._require_active(m["sid"])
+                question = (body.get("question") or "").strip()
+                if not question:
+                    return self._json({"error": "empty question", "status": 400}, status=400)
+                history = [
+                    {"question": str(h.get("question") or ""), "response": str(h.get("response") or "")}
+                    for h in body.get("history") or []
+                    if isinstance(h, dict) and h.get("question") and h.get("response")
+                ]
+                answer = self.rc.side_question(m["sid"], question, history=history, timeout=ASIDE_TIMEOUT_S)
+                return self._json({"answer": answer})
+            m = _R_STOP_TASK.match(path)
+            if m:
+                self._require_active(m["sid"])
+                task_id = (body.get("task_id") or "").strip()
+                if not task_id:
+                    return self._json({"error": "missing task_id", "status": 400}, status=400)
+                self.rc.stop_task(m["sid"], task_id)
+                return self._json({"ok": True})
             m = _R_PERMISSION.match(path)
             if m:
                 self._require_active(m["sid"])
@@ -633,14 +612,14 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._json({"error": "missing request_id", "status": 400}, status=400)
                 if decision not in ("allow", "deny"):
                     return self._json({"error": "decision must be allow|deny", "status": 400}, status=400)
-                payload = build_permission_answer(
+                self.rc.respond_permission(
+                    m["sid"],
                     request_id,
-                    body.get("tool_use_id"),
-                    decision,
-                    body.get("updated_input"),
-                    body.get("message"),
+                    allow=decision == "allow",
+                    tool_input=body.get("updated_input"),
+                    tool_use_id=body.get("tool_use_id"),
+                    message=body.get("message"),
                 )
-                self.rc.send_raw(m["sid"], payload)
                 return self._json({"ok": True})
             m = _R_DIALOG.match(path)
             if m:
@@ -652,19 +631,22 @@ class _Handler(BaseHTTPRequestHandler):
                 if status not in ("completed", "cancelled"):
                     return self._json({"error": "status must be completed|cancelled", "status": 400}, status=400)
                 # AskUserQuestion is delivered as a `can_use_tool` permission, so it
-                # is answered on the PERMISSION path (allow + updatedInput.answers) —
-                # only the rarer true dialog kinds use the {status, result} shape.
+                # is answered on the PERMISSION path (allow + updatedInput.answers;
+                # an empty map is the graceful dismiss) — only the rarer true dialog
+                # kinds use the {status, result} shape.
+                answers = body.get("answers")
                 if body.get("subtype") == "can_use_tool":
-                    payload = build_question_answer(
+                    self.rc.answer_question(
+                        m["sid"],
                         request_id,
-                        body.get("tool_use_id"),
-                        status,
-                        body.get("answers"),
-                        body.get("input"),
+                        _answers_map(answers) if status == "completed" else {},
+                        tool_input=_question_input(body.get("input"), answers),
+                        tool_use_id=body.get("tool_use_id"),
                     )
                 else:
-                    payload = build_dialog_answer(request_id, status, body.get("answers"))
-                self.rc.send_raw(m["sid"], payload)
+                    completed = status == "completed"
+                    result = {"answers": answers} if completed and answers else None
+                    self.rc.send_raw(m["sid"], cli_dialog_response(request_id, completed=completed, result=result))
                 return self._json({"ok": True})
             m = _R_INTERRUPT.match(path)
             if m:
@@ -701,16 +683,11 @@ class _Handler(BaseHTTPRequestHandler):
                         {"error": f"effort must be auto or one of {sorted(VALID_EFFORTS)}", "status": 400},
                         status=400,
                     )
-                # Current remote-control workers refuse the apply_flag_settings
-                # control, so set_effort waits for the worker's verdict and falls
-                # back to injecting the /effort slash command (which they DO
-                # execute). claude-rc-api < 0.2.0 predates set_effort — the
-                # command path alone still works there.
-                if hasattr(self.rc, "set_effort"):
-                    out = self.rc.set_effort(m["sid"], effort, wait=6.0, command_fallback=True)
-                    return self._json({"ok": True, "via": out.get("via", "control")})
-                self.rc.send_message(m["sid"], f"/effort {effort or 'auto'}")
-                return self._json({"ok": True, "via": "command"})
+                # 2.1.30x workers apply the apply_flag_settings control
+                # session-scoped; older ones refuse it, so set_effort waits for
+                # the verdict and falls back to the /effort slash command there.
+                out = self.rc.set_effort(m["sid"], effort, wait=6.0, command_fallback=True)
+                return self._json({"ok": True, "via": out.get("via", "control")})
             m = _R_ARCHIVE.match(path)
             if m:
                 # Archiving is the one control that *ends* an active session, so it
@@ -740,10 +717,48 @@ class _Handler(BaseHTTPRequestHandler):
             "token_len": len(creds.access_token),
         }
 
+    def _info(self, sid: str) -> dict:
+        """Plan usage + uncommitted git changes, asked of the worker (each a
+        control round trip that leaves a request/response pair in the event
+        log). Best-effort per part: a refusal or timeout nulls that part."""
+        out: dict[str, Any] = {"usage": None, "diff": None}
+        try:
+            usage = self.rc.get_usage(sid, timeout=10.0)
+            limits = (usage.get("rate_limits") or {}).get("limits") or []
+            session = usage.get("session") or {}
+            out["usage"] = {
+                "limits": [
+                    {
+                        "kind": lim.get("kind"),
+                        "percent": lim.get("percent"),
+                        "resetsAt": lim.get("resets_at"),
+                        # weekly_scoped is one model's own cap: name it
+                        "model": ((lim.get("scope") or {}).get("model") or {}).get("display_name"),
+                    }
+                    for lim in limits
+                    if isinstance(lim, dict)
+                ],
+                "costUsd": session.get("total_cost_usd"),
+            }
+        except (ControlRejected, ControlTimeout):
+            pass
+        try:
+            diff = self.rc.get_workspace_diff(sid, timeout=12.0)
+            if diff is not None:
+                stats = diff.get("stats") or {}
+                out["diff"] = {
+                    "files": stats.get("filesCount", 0),
+                    "added": stats.get("linesAdded", 0),
+                    "removed": stats.get("linesRemoved", 0),
+                }
+        except (ControlRejected, ControlTimeout):
+            pass
+        return out
+
     def _stream(self, sid: str) -> None:
         # Gate at open: refuse a stream on a non-active session with an error frame.
         try:
-            s = unwrap_session(self.rc.get_session(sid))
+            s = self.rc.get_session(sid)
         except Exception as exc:  # noqa: BLE001
             return self._error(exc)
         if not is_active(s):
