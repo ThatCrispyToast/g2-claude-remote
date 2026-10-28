@@ -37,6 +37,18 @@ export interface Notice {
 /** Every notice this build knows, newest first. */
 export const NOTICES: Notice[] = [
   {
+    id: '2026-10-28-bridge-login',
+    level: 'important',
+    title: 'Update your bridge',
+    body:
+      "The updated bridge keeps the rest of Claude Code's saved login intact " +
+      'when it refreshes the token. The old one could drop parts of it. The new ' +
+      'bridge also signs in on macOS, where the login lives in the Keychain, and ' +
+      'on organizations that require Trusted Devices. Restart it once with:',
+    command:
+      'uvx --refresh --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge',
+  },
+  {
     id: '2026-10-16-ask-aside',
     level: 'info',
     title: 'New: ask on the side, and session info',

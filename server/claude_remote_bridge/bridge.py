@@ -105,12 +105,19 @@ except ModuleNotFoundError:
             "  # one dependency:  pip install httpx\n"
         )
         raise SystemExit(2)
+# 0.4.0 is the floor: older token refreshes rewrote Claude Code's whole login
+# block, dropping the CLI's other fields, and never read the macOS Keychain.
 try:
+    from claude_rc import __version__ as _rc_api_version
     from claude_rc.client import ControlRejected, ControlTimeout
     from claude_rc.events import Event, _to_int, cli_dialog_response
+
+    _rc_api_too_old = tuple(map(int, re.findall(r"\d+", _rc_api_version)[:2])) < (0, 4)
 except ImportError:  # pragma: no cover - operator error
+    _rc_api_too_old = True
+if _rc_api_too_old:  # pragma: no cover - operator error
     sys.stderr.write(
-        "claude-rc-api is too old for this bridge (it needs 0.3.0+).\n"
+        "claude-rc-api is too old for this bridge (it needs 0.4.0+).\n"
         "Re-run with --refresh to update it:\n"
         '  uvx --refresh --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge\n'
     )

@@ -78,7 +78,7 @@ Even phone app - runs this app (glasses UI + companion panel)
         │ HTTP + SSE · bearer token · LAN / Tailscale
         ▼
 claude-remote-bridge (server/) - wraps claude-rc-api
-        │ your Claude Code OAuth login (~/.claude)
+        │ your Claude Code OAuth login (~/.claude, or the macOS Keychain)
         ▼
 Anthropic Remote Control API
 ```

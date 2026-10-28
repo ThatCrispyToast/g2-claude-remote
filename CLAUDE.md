@@ -15,7 +15,7 @@ at build time.
 
 1. **The bridge adds no Anthropic code.** It reuses `claude-rc-api`'s
    `RemoteControlClient` (checked out at `../claude-rc-api`; the bridge needs
-   ≥ 0.3.0 and exits with a `--refresh` hint on an older one) and layers on
+   ≥ 0.4.0 and exits with a `--refresh` hint on an older one) and layers on
    only the active+connected filter, a bearer/CORS guard, and the JSON shaping
    for the app. Session control, prompt answers (`respond_permission` /
    `answer_question`), side questions, streaming, and OAuth (including

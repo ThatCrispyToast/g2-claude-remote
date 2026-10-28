@@ -36,9 +36,11 @@ Claude never responds"** on Claude Code ≥ 2.1.220 is fixed in `claude-rc-api`
 0.2.1 — newer workers only start a turn for messages whose ingest identifies as
 a human client, and older library versions identified as something the worker
 demotes to a peer-agent message. Refresh as above to get it. The same goes for
-the app's **Ask aside** and **Session info** (bridge 0.4.0, which needs
-`claude-rc-api` 0.3.0 — an older library makes the bridge exit with this
-hint).
+the app's **Ask aside** and **Session info** (bridge 0.4.0). Since bridge 0.4.1
+the bridge needs `claude-rc-api` 0.4.0, whose token refreshes save only the
+new tokens over Claude Code's login instead of rewriting its whole block, and
+which reads the login from the macOS Keychain. An older library makes the
+bridge exit with this hint.
 
 Also works with `pip install "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server"`
 then `claude-remote-bridge`, or from a repo checkout via `python3 server/rc_bridge.py`.
@@ -63,7 +65,7 @@ a *generated* passphrase has (default 5 ≈ 52 bits; floored at 3).
 ## What it does
 
 Wraps [`claude-rc-api`](https://github.com/ThatCrispyToast/claude-rc-api)'s
-`RemoteControlClient` (0.3.0 or newer) and exposes exactly what the glasses UI
+`RemoteControlClient` (0.4.0 or newer) and exposes exactly what the glasses UI
 needs: an active-sessions-only list with each session's effort, context use and
 one-line status summary; per-session SSE event streams carrying the worker's
 live model / effort / permission mode and background tasks;
