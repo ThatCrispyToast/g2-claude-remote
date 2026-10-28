@@ -5,7 +5,7 @@
 // `.status === 409` means "session not active" (archived or dead) — the caller
 // drops the session and returns to the list.
 
-import { BRIDGE_TOKEN, BRIDGE_URL, HISTORY_LIMIT } from '../config'
+import { HISTORY_LIMIT } from '../config'
 import { openEventStream, type StreamHandlers } from './stream'
 import {
   BridgeError,
@@ -23,8 +23,8 @@ import {
 
 export class HttpBridgeClient implements BridgeClient {
   constructor(
-    private readonly base: string = BRIDGE_URL,
-    private readonly token: string = BRIDGE_TOKEN,
+    private readonly base: string,
+    private readonly token: string,
   ) {}
 
   private headers(json = false): Record<string, string> {

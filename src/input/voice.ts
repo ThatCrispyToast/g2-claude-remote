@@ -17,6 +17,16 @@ import { LiveCaptioner, type CaptionerStatus } from '../stt/deepgram'
 
 export type VoiceStatus = 'idle' | 'connecting' | 'listening' | 'reconnecting' | 'error'
 
+/** A mic call is a BLE round trip, and a close whose reply never comes must not
+ *  wedge stop()/cancel() — nor the finish waiting on them. Past this they carry
+ *  on as if it landed; the `current` token makes a late reply harmless. */
+const MIC_CLOSE_TIMEOUT_MS = 4000
+
+/** Wait for `p` (and swallow its rejection), but never longer than `ms`. */
+function settleWithin(p: Promise<unknown>, ms: number): Promise<unknown> {
+  return Promise.race([p, new Promise((r) => setTimeout(r, ms))])
+}
+
 export interface VoiceHandlers {
   /** The best transcript so far (finals + latest interim), on every change. */
   onInterim: (text: string) => void
@@ -43,6 +53,11 @@ export class VoiceDictation {
   private handlers: VoiceHandlers | null = null
   /** Set synchronously across start()'s awaits to reject re-entrant starts. */
   private starting = false
+  /** The dictation allowed to run, as an identity token: start() sets a fresh
+   *  one, stop() and cancel() clear it. Each re-checks it after its mic round
+   *  trip, so whichever call lost a race backs off: a start() called off while
+   *  the mic opened, or a stop()/cancel() overtaken by a newer start(). */
+  private current: object | null = null
   /** Committed segments joined with spaces — the durable part of the transcript. */
   private finals = ''
   /** The current volatile hypothesis (cleared each time a window commits). */
@@ -74,6 +89,8 @@ export class VoiceDictation {
     // session is already live, so we never orphan a captioner or leak a watchdog.
     if (this.starting || this.captioner) return
     this.starting = true
+    const run = {}
+    this.current = run
     // Fresh session — discard any transcript from a previous run.
     this.finals = ''
     this.interim = ''
@@ -82,9 +99,22 @@ export class VoiceDictation {
     try {
       await this.bridge.audioControl(true)
     } catch (err) {
+      if (this.current !== run) return // called off meanwhile — nothing to report
       console.error('[voice] failed to open mic:', err)
       this.starting = false
+      this.current = null
       handlers.onStatus('error', 'Could not open the glasses mic.')
+      return
+    }
+    // Called off while the mic was opening: the stop() or cancel() wins, so
+    // close the mic just opened rather than stream behind an idle UI — unless
+    // a newer start() owns it by now.
+    if (this.current !== run) {
+      if (this.current === null) {
+        void this.bridge.audioControl(false).catch((err) => {
+          console.error('[voice] failed to close mic:', err)
+        })
+      }
       return
     }
 
@@ -135,13 +165,19 @@ export class VoiceDictation {
    * the finished transcript (trimmed). Safe to call when not started.
    */
   async stop(): Promise<string> {
+    this.current = null
     this.starting = false
     this.clearWatchdog()
-    try {
-      await this.bridge.audioControl(false)
-    } catch (err) {
-      console.error('[voice] failed to close mic:', err)
-    }
+    await settleWithin(
+      this.bridge.audioControl(false).catch((err) => {
+        console.error('[voice] failed to close mic:', err)
+      }),
+      MIC_CLOSE_TIMEOUT_MS,
+    )
+    // Overtaken by a newer start(): the stream is its own. A live captioner
+    // holds new starts off, so this needs one already gone — nothing was
+    // running, or another stop()/cancel() took it (and returns its text).
+    if (this.current !== null) return ''
     const captioner = this.captioner
     this.captioner = null
     if (captioner) await captioner.stop()
@@ -154,13 +190,16 @@ export class VoiceDictation {
 
   /** Stop dictating and throw the transcript away (cancel path). */
   async cancel(): Promise<void> {
+    this.current = null
     this.starting = false
     this.clearWatchdog()
-    try {
-      await this.bridge.audioControl(false)
-    } catch (err) {
-      console.error('[voice] failed to close mic:', err)
-    }
+    await settleWithin(
+      this.bridge.audioControl(false).catch((err) => {
+        console.error('[voice] failed to close mic:', err)
+      }),
+      MIC_CLOSE_TIMEOUT_MS,
+    )
+    if (this.current !== null) return // overtaken by a newer start() (see stop())
     const captioner = this.captioner
     this.captioner = null
     captioner?.close()

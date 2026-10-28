@@ -127,19 +127,36 @@ export class GlassesDisplay {
     return this.curItems
   }
 
-  /** Create the initial page (a text screen). Call once before anything else. */
+  /** Create the initial page (a text screen). Call once before anything else —
+   *  the host takes no other page call until it exists. Raced against the same
+   *  timeout as every other call, so a startup page stuck on BLE can't stall
+   *  boot, yet one that lands late still counts: renders queue meanwhile (the
+   *  latest wins) and paint the moment it does. Resolves whether it's up yet. */
   async init(initial = ''): Promise<boolean> {
     if (this.started) return true
     const content = clampBytes(initial, BODY_BYTE_CAP, 'head')
-    const r = await this.bridge.createStartUpPageContainer(
-      new CreateStartUpPageContainer({ containerTotalNum: 1, textObject: [textBox(BODY_ID, 'display', content, full())] }),
-    )
-    this.started = r === StartUpPageCreateResult.success
-    if (this.started) {
-      this.kind = 'text'
-      this.curText = content
-    }
-    return this.started
+    const created = this.bridge
+      .createStartUpPageContainer(
+        new CreateStartUpPageContainer({ containerTotalNum: 1, textObject: [textBox(BODY_ID, 'display', content, full())] }),
+      )
+      .then((r) => {
+        if (r !== StartUpPageCreateResult.success) {
+          console.warn(`[glasses] createStartUpPageContainer failed (result ${r}) — nothing will render`)
+          return false
+        }
+        this.started = true
+        this.kind = 'text'
+        this.curText = content
+        void this.pump() // whatever was rendered while the page was pending
+        return true
+      })
+      .catch((err) => {
+        console.error('[glasses] createStartUpPageContainer failed:', err)
+        return false
+      })
+    const ok = await this.timed(created)
+    if (ok === null) console.warn('[glasses] createStartUpPageContainer timed out — renders queue until it lands')
+    return ok === true
   }
 
   /** Queue a screen. Coalesced (only the latest wins) and serialized (no BLE overlap). */

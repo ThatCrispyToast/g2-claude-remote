@@ -14,7 +14,7 @@
 import { OsEventTypeList, waitForEvenAppBridge } from '@evenrealities/even_hub_sdk'
 import type { EvenAppBridge, EvenHubEvent } from '@evenrealities/even_hub_sdk'
 
-import { APP_TITLE, APP_TITLE_SHORT, BRIDGE_URL, HISTORY_WINDOW_BYTES, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES, LIVE_BODY_ROWS, POLL_MS, SETTINGS_KEY, SLASH_COMMANDS, currentBridge, isBridgeConfigured } from './config'
+import { APP_TITLE, APP_TITLE_SHORT, HISTORY_WINDOW_BYTES, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES, LIVE_BODY_ROWS, POLL_MS, SETTINGS_KEY, SLASH_COMMANDS, currentBridge, isBridgeConfigured } from './config'
 import { markNoticeSeen, unseenNotices, type Notice } from './notices'
 import { GlassesDisplay, HUD, clip, hudSafe, liveTail, screen, type Layout } from './glasses'
 import { HttpBridgeClient } from './rc/client'
@@ -47,7 +47,7 @@ import {
   type SubmenuItem,
   type SubmenuKind,
 } from './input/compose'
-import { VoiceDictation } from './input/voice'
+import { VoiceDictation, type VoiceStatus } from './input/voice'
 import { Panel, type AsideView } from './ui'
 
 type State =
@@ -95,8 +95,8 @@ class App {
   // so a Settings change reconnects WITHOUT a page reload (a reload would drop
   // the Even glasses bridge and freeze the HUD). `origin` tracks the URL it points
   // at, for the panel's connection chip + error copy.
-  private rc = new HttpBridgeClient()
-  private origin = BRIDGE_URL
+  private rc!: HttpBridgeClient // set by useCurrentBridge(), first thing in boot()
+  private origin = ''
   // The last known bridge connection status, so every render() reflects reality
   // (a plain render must not claim 'ok' while we're on the setup/error screen).
   private connBridge: 'ok' | 'down' | 'connecting' = 'connecting'
@@ -157,10 +157,20 @@ class App {
 
   // voice — `voicePurpose` is what the transcript becomes when dictation ends;
   // `voiceFrom` is the surface that started it, where a failed one hands back
-  // its words (failVoice)
+  // its words (failVoice); `voiceStatus` is the Deepgram stream's state, for the
+  // voice screen's header
   private interim = ''
   private voicePurpose: 'send' | 'aside' = 'send'
   private voiceFrom: 'panel' | 'glasses' = 'glasses'
+  private voiceStatus: VoiceStatus = 'connecting'
+  // A glasses dictation that died (failVoice): the voice screen stays up,
+  // marked stopped, holding the reason and any words left to review.
+  private voiceStop: { reason: string; text: string } | null = null
+  // Dictation runs, counted by startVoice(), and the run a finish (stop +
+  // flush) is under way for: a second "done" on that run backs off, and a
+  // finish that a newer run overtook leaves the newer one's UI alone.
+  private voiceRun = 0
+  private finishingRun: number | null = null
 
   // Side questions ("Ask aside"): the exchange on screen (glasses aside screen +
   // panel card) and, per session, the recent exchanges sent along with a
@@ -220,6 +230,7 @@ class App {
 
   // ── boot ───────────────────────────────────────────────────────────────
   async boot(root: HTMLElement): Promise<void> {
+    this.useCurrentBridge()
     this.panel = new Panel({
       onSelectSession: (sid) => void this.openSession(sid),
       onBackToList: () => this.backToList(),
@@ -255,9 +266,8 @@ class App {
 
     // Restore panel-saved settings from the durable App-side store FIRST: before
     // the first connect, so a reopened app reconnects on its own, and before
-    // glasses.init(), whose BLE call has no timeout — the Settings card stays
-    // shut until this lands (Panel.settingsLoaded), so it may wait on nothing
-    // but this one bounded read.
+    // glasses.init() — the Settings card stays shut until this lands
+    // (Panel.settingsLoaded), so it may wait on nothing but this one bounded read.
     try {
       await this.hydrateSettings()
     } finally {
@@ -275,6 +285,8 @@ class App {
         this.listSelectIndex = 0
       }
       this.voice = new VoiceDictation(this.bridge)
+      // Bounded: a startup page stuck on BLE no longer holds up the connect
+      // below, and the HUD paints the latest screen whenever it does land.
       await this.glasses.init(`${APP_TITLE}\n\nconnecting`)
       this.bridge.onEvenHubEvent((e) => this.onHubEvent(e))
       this.bridge.onLaunchSource?.(() => {})
@@ -319,9 +331,7 @@ class App {
   private async applySettings(): Promise<void> {
     this.backToList() // tears down any open stream / session / prompt state
     await this.persistSettings() // mirror the just-saved settings to durable storage
-    const { url, token } = currentBridge()
-    this.origin = url
-    this.rc = new HttpBridgeClient(url, token)
+    this.useCurrentBridge()
     this.state = 'boot'
     this.connBridge = 'connecting'
     this.panel.setConnection({ bridge: 'connecting', origin: this.origin, state: this.state })
@@ -359,12 +369,18 @@ class App {
       return
     }
     window.localStorage?.setItem(SETTINGS_KEY, stored)
+    this.useCurrentBridge()
+    // The Settings card can open as soon as this returns, well before the first
+    // connect: show the restored origin, not the load-time default.
+    this.panel.setConnection({ bridge: this.connBridge, origin: this.origin, state: this.state })
+  }
+
+  /** Point the client — and the origin the panel shows — at the bridge in the
+   *  saved settings, re-read live: at boot, after hydration, and on every Save. */
+  private useCurrentBridge(): void {
     const { url, token } = currentBridge()
     this.origin = url
     this.rc = new HttpBridgeClient(url, token)
-    // The Settings card can open as soon as this returns, well before the first
-    // connect: show the restored origin, not the load-time default.
-    this.panel.setConnection({ bridge: this.connBridge, origin: url, state: this.state })
   }
 
   /** A release notice was acknowledged (panel × or glasses tap): record it
@@ -1080,6 +1096,12 @@ class App {
     }
     this.voicePurpose = purpose
     this.voiceFrom = from
+    this.voiceStatus = 'connecting'
+    // Words a stopped dictation still held (only the panel can start one over
+    // the stopped screen): keep them, in the send box.
+    if (this.voiceStop?.text) this.panel.appendDraft(this.voiceStop.text)
+    this.voiceStop = null
+    this.voiceRun += 1
     this.interim = ''
     this.panel.setDictating(true)
     this.go('voice')
@@ -1091,18 +1113,36 @@ class App {
       },
       onStatus: (s, detail) => {
         if (s === 'error') void this.failVoice(detail)
+        // 'idle' only passes through on the way out (a stop, or just before an
+        // error), so it never reaches the header.
+        else if (s !== 'idle' && s !== this.voiceStatus) {
+          this.voiceStatus = s
+          if (this.state === 'voice') this.render()
+        }
       },
     })
   }
 
-  /** Stop the mic, clear the dictation UI, and return the trimmed transcript. */
-  private async finishDictation(): Promise<string> {
+  /** Stop the mic, clear the dictation UI, and return the trimmed transcript —
+   *  or null when the caller must back off: another finish of this run is
+   *  under way (a double "done" — two quick taps, a double-clicked Stop — then
+   *  neither splits the transcript nor sends it twice), or a newer dictation
+   *  began while this one finished, so the UI is no longer this one's. */
+  private async finishDictation(): Promise<string | null> {
     if (!this.voice) return ''
-    const text = await this.voice.stop()
-    this.interim = ''
-    this.panel.setInterim('')
-    this.panel.setDictating(false)
-    return text
+    const run = this.voiceRun
+    if (this.finishingRun === run) return null
+    this.finishingRun = run
+    try {
+      const text = await this.voice.stop()
+      if (run !== this.voiceRun) return null
+      this.interim = ''
+      this.panel.setInterim('')
+      this.panel.setDictating(false)
+      return text
+    } finally {
+      if (this.finishingRun === run) this.finishingRun = null
+    }
   }
 
   /** Panel Stop button: finish dictating and send straight away — an explicit
@@ -1110,6 +1150,7 @@ class App {
    *  side question dictated on the glasses is still asked, not sent.) */
   private async commitVoice(): Promise<void> {
     const text = await this.finishDictation()
+    if (text === null) return // a finish already under way owns the result
     if (this.voicePurpose === 'aside') {
       if (text) await this.askAside(text, 'glasses')
       else if (this.state === 'voice') this.go('session')
@@ -1127,38 +1168,66 @@ class App {
    *  transcript just drops back to the session. */
   private async reviewDictation(): Promise<void> {
     const text = await this.finishDictation()
+    if (text === null) return // a finish already under way owns the result
     if (this.state !== 'voice') return // involuntarily left the voice screen meanwhile
     if (!text) this.go('session')
     else if (this.voicePurpose === 'aside') void this.askAside(text, 'glasses') // read-only: no confirm
     else this.confirmSend(text, 'session')
   }
 
-  /** The dictation died (the captioner gave up, or the mic wouldn't open). Say
-   *  why, and leave the voice screen rather than show "Listening" over a dead
-   *  stream — without acting on the words by itself: a panel dictation's go back
-   *  into the send box, a glasses send's to the confirm screen, and a
+  /** The dictation died (the captioner gave up, or the mic wouldn't open):
+   *  say why, and stop showing "Listening" over a dead stream — without acting
+   *  on the words, and without moving the glasses by itself. The wearer's next
+   *  tap may be a "done" meant for the live voice screen, and on any other
+   *  screen it would act: send from the confirm screen, answer a prompt that
+   *  go() presents. So a glasses dictation stays on the voice screen, marked
+   *  stopped, until a tap: a send's words wait there for review, and a
    *  half-dictated aside is dropped (asking it would spend a model call on a
-   *  question the wearer never finished). */
+   *  question the wearer never finished). A panel dictation's words go back
+   *  into the send box, and the glasses leave quietly. */
   private async failVoice(detail?: string): Promise<void> {
     this.panel.setToast(detail ? `Voice error: ${detail}` : 'Voice error.', 6000)
     const text = await this.finishDictation()
-    if (this.state !== 'voice') return // a tap, Stop or cancel got there first
-    if (!text || this.voicePurpose === 'aside') {
-      this.go('session')
-    } else if (this.voiceFrom === 'panel') {
-      this.panel.appendDraft(text)
-      this.go('session')
-    } else {
-      this.confirmSend(text, 'session')
+    if (text === null || this.state !== 'voice') return // a tap, Stop or cancel got there first
+    if (this.voiceFrom === 'panel') {
+      if (text) this.panel.appendDraft(text)
+      this.leaveVoiceQuietly()
+      return
     }
+    this.voiceStop = { reason: detail || 'Voice error.', text: this.voicePurpose === 'send' ? text : '' }
+    this.render()
   }
 
-  private async cancelVoice(): Promise<void> {
+  /** A tap on the stopped voice screen: review the words it held on the
+   *  confirm screen, or go back to the session when there are none. */
+  private reviewStoppedDictation(): void {
+    const text = this.voiceStop?.text ?? ''
+    this.voiceStop = null
+    if (text) this.confirmSend(text, 'session')
+    else this.go('session')
+  }
+
+  /** Double-tap: drop the dictation. `backgrounded` = the app lost the
+   *  foreground mid-dictation, an involuntary exit (see leaveVoiceQuietly). */
+  private async cancelVoice(backgrounded = false): Promise<void> {
+    this.voiceStop = null
     await this.voice?.cancel()
     this.interim = ''
     this.panel.setInterim('')
     this.panel.setDictating(false)
-    if (this.state === 'voice') this.go('session')
+    if (this.state !== 'voice') return
+    if (backgrounded) this.leaveVoiceQuietly()
+    else this.go('session')
+  }
+
+  /** Leave the voice screen for the session WITHOUT go(), after an exit the
+   *  wearer didn't make (being backgrounded, a failed panel dictation): they
+   *  may still tap meaning "done" on the voice screen, and go() would present
+   *  a deferred prompt right under that tap — answering it. It keeps waiting
+   *  behind the footer's "! needs you" instead. */
+  private leaveVoiceQuietly(): void {
+    this.state = 'session'
+    this.render()
   }
 
   // ── send confirmation (misclick guard) ─────────────────────────────────────
@@ -1236,7 +1305,16 @@ class App {
         this.cleanup()
         return
       case OsEventTypeList.FOREGROUND_EXIT_EVENT:
-        void this.voice?.cancel() // backgrounded — never leave the mic hot
+        // Backgrounded — never leave the mic hot, nor the voice screen up
+        // claiming to listen over a closed one.
+        // A stopped dictation has nothing live: it stays up, words and all.
+        if (this.state === 'voice' && !this.voiceStop) void this.cancelVoice(true)
+        else void this.voice?.cancel()
+        return
+      case OsEventTypeList.FOREGROUND_ENTER_EVENT:
+        // Back in front: a write made while hidden may have been dropped, which
+        // leaves the mirror invalidated — render() repaints only if so.
+        this.render()
         return
       case CLICK:
         this.onTap()
@@ -1272,7 +1350,8 @@ class App {
         this.fireSubmenu()
         break
       case 'voice':
-        void this.reviewDictation() // finish dictating → review before sending
+        if (this.voiceStop) this.reviewStoppedDictation()
+        else void this.reviewDictation() // finish dictating → review before sending
         break
       case 'confirm':
         this.commitPendingSend() // tap = send the held message
@@ -1616,13 +1695,33 @@ class App {
         return this.permissionLayout()
       case 'question':
         return this.questionLayout()
-      case 'voice':
+      case 'voice': {
+        if (this.voiceStop) {
+          const { reason, text } = this.voiceStop
+          return {
+            kind: 'scroll',
+            header: this.voicePurpose === 'aside' ? `${HUD.ATTN} Ask aside ${HUD.SEP} stopped` : `${HUD.ATTN} Dictation stopped`,
+            body: text ? `${hudSafe(reason)}\n\n${HUD.USER} ${text}` : hudSafe(reason),
+            footer: text ? `tap = review ${HUD.SEP} dbl = discard` : 'tap = back',
+          }
+        }
+        // The stream's real state, not a fixed "Listening": a bad key, language
+        // or network spends ~40 s reconnecting before the captioner gives up.
+        // The mic stays open meanwhile and the last 10 s of audio wait for the
+        // socket, so speech through a short drop isn't lost — but nothing said
+        // is transcribed if it never comes back, or if the wearer taps done first.
+        const up = this.voiceStatus === 'listening'
+        const word = up ? 'listening' : `${this.voiceStatus}${HUD.ELL}`
         return {
           kind: 'scroll',
-          header: this.voicePurpose === 'aside' ? `${HUD.RUN} Ask aside ${HUD.SEP} listening` : `${HUD.RUN} Listening`,
+          header:
+            this.voicePurpose === 'aside'
+              ? `${up ? HUD.RUN : HUD.IDLE} Ask aside ${HUD.SEP} ${word}`
+              : `${up ? HUD.RUN : HUD.IDLE} ${word[0].toUpperCase()}${word.slice(1)}`,
           body: this.interim ? liveTail(this.interim) : '(speak now)',
           footer: `tap = done ${HUD.SEP} dbl = cancel`,
         }
+      }
       case 'aside':
         return this.asideLayout()
       case 'info':

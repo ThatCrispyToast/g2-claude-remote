@@ -94,8 +94,27 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   over HTTP: `GET /api/screenshot/glasses` (the exact 576×288 framebuffer),
   `POST /api/input {"action":"up|down|click|double_click"}`, `GET /api/console`.
   Relaunch after every edit — Vite HMR does NOT reload the entry module. The sim
-  caps text containers at 999 bytes. Real hardware is still needed for the mic
-  and true native scroll.
+  caps text containers at 999 bytes. Real hardware is still needed for the
+  glasses' own mic and true native scroll.
+- **Dictation runs end to end in the simulator.** It records the host's
+  default audio input (or `--aid <device>`), so speech played into a virtual
+  device reaches Deepgram (dictation was checked this way in `de` and `en`,
+  2026-10-28). Three traps:
+  - It opened a PulseAudio-backed ALSA device as **u8**, the first format that
+    device lists, and garbled the samples into noise. Give it an S16-only
+    device.
+  - On Linux, `wss://` needs glib-networking's GIO TLS module on
+    `GIO_EXTRA_MODULES`. Without it every Deepgram connect fails exactly like a
+    bad key.
+  - A mic the sim can't open is only logged on its stderr (`AudioControl
+    error`): `audioControl(true)` resolves `false`, which the app doesn't
+    check, so it shows `● Listening` over silence. (What a real Even App
+    returns there is unverified, so the app doesn't act on it yet.)
+
+  The sim keeps the SDK's `set/getLocalStorage` in memory only, while WebKit
+  localStorage persists in its profile. That is the reverse of the Even App,
+  so the eviction + hydration path can't be reproduced in it. Test that one
+  with a stubbed host in a browser.
 - **Point the simulator at the mock bridge, never a real one.** Run the dev
   server with `VITE_BRIDGE_URL=http://localhost:8791 VITE_BRIDGE_TOKEN=x` (process
   env beats `.env.local`). A tap on a real session list can fire into a live
@@ -183,7 +202,10 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   returns `true`, races every call against a timeout (a BLE call that never
   settles would wedge the serialized pump and freeze the HUD for good), and on
   any failure forgets the page so the next render repaints from scratch. Don't
-  "optimize" the mirror updates back to unconditional.
+  "optimize" the mirror updates back to unconditional. The startup page is
+  raced too: `init()` stops waiting after the timeout so boot carries on (the
+  panel needs no HUD), renders queue behind it, and a page that lands late
+  paints the newest one.
 - **A list rebuild resets the firmware highlight to row 0 — resync or misfire.**
   The app's `listSelectIndex` mirrors the firmware's highlight, but taps on row
   0 arrive with `currentSelectItemIndex` protobuf-dropped, so a stale index
@@ -244,8 +266,13 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   `requires_action`. **An assistant event after a `control_request` does NOT
   mean it was answered.** A prompt presents immediately only while passively
   watching the live tail; otherwise it defers (footer `! needs you`) and shows
-  on return to the session view. A blocked session opens straight onto its
-  prompt (`findPendingControl` + `workerStatus === 'requires_action'`).
+  on return to the session view — except a return the wearer didn't make.
+  Being backgrounded mid-dictation lands via `leaveVoiceQuietly()` (render,
+  not `go`), and a voice error doesn't leave the voice screen at all (see
+  Dictation language): a tap meant as "done" there would otherwise answer the
+  prompt (reproduced: it allowed a Bash `rm -rf`). A blocked session opens
+  straight onto its prompt (`findPendingControl` + `workerStatus ===
+  'requires_action'`).
 - **Set-aside = a STICKY defer (`promptSnoozed`).** Double-tap calls
   `snoozePrompt()`: marks the prompt `promptDeferred + promptSnoozed` and drops
   to the live tail without answering. The snooze flag is the one difference
@@ -303,7 +330,10 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   buttons (not misclick-prone), so they still send directly via `commitVoice` /
   `onSend`; don't add a panel confirm. The voice screen's tap now **reviews**
   (`reviewDictation`, footer `tap = done`), it no longer sends — `commitVoice`
-  survives only for the panel's Stop button.
+  survives only for the panel's Stop button. A second "done" while the first
+  is still finishing (mic close + Deepgram flush) is ignored, per dictation
+  run (`finishingRun`; a finish a newer run overtook backs off too): a
+  double-clicked Stop used to send the transcript split across two messages.
 - **Cancel returns to `pendingSend.back`:** the Compose menu for a canned send
   (so re-pick is one tap; `listSelectIndex` is reset to match the rebuilt list),
   the live session for a dictation (its mic is already closed). `backToList`
@@ -400,16 +430,22 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   localStorage) → `VITE_*` from `.env.local` (DEV SERVER ONLY — builds resolve
   no env, so on a packed build this layer is empty) → defaults. When debugging
   "why THAT bridge/token", check localStorage before the env. Never make a
-  `VITE_` value required at build time — packs must work with none set.
+  `VITE_` value required at build time — packs must work with none set. The
+  `BRIDGE_URL` / `BRIDGE_TOKEN` / `DEEPGRAM_API_KEY` / `STT_LANGUAGE` consts are
+  the bottom two layers only — never the saved value — because they are the
+  Settings card's placeholders, and its hint promises a blank field falls back
+  to the default shown in it. Anything that connects reads the live
+  `current*()` accessors. (Until 1.8.2 the first three folded in the
+  load-time saved settings, so a plain browser showed saved values there.)
 - **Panel settings persist via the SDK, not browser storage.** The Settings card
   saves to the WebView's `window.localStorage`, but the Even app EVICTS that
   between launches — so `main.ts` mirrors the same `claude-remote.settings` JSON
   into the SDK's App-side store (`bridge.set/getLocalStorage`, which persists
   natively). `hydrateSettings()` seeds the browser cache from it at boot, right
   after the Even bridge appears — before the first connect, so a reopened app
-  reconnects itself, and before `glasses.init()`, whose
-  `createStartUpPageContainer` has NO timeout (a hung BLE call there still
-  stalls the rest of boot). `persistSettings()` writes it back on every save.
+  reconnects itself, and before `glasses.init()` and its BLE call (bounded
+  since 1.8.2 — see the display-mirror gotcha). `persistSettings()` writes it
+  back on every save.
   Both storage calls are `withTimeout`-guarded; in a plain browser they just
   come back empty (see panel-only mode), where localStorage persists on its own
   anyway. Without this the wearer re-enters the bridge URL + token on every
@@ -434,17 +470,24 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   auto-disables when blank.
 - **Dictation language** is the Settings card's `sttLanguage` (any Deepgram
   code; `multi` = mixed-language speech), else `STT_LANGUAGE` — the build
-  default `en`, which is also the field's placeholder, so it must never fold in
-  the saved value. `currentSttLanguage()` is read on every (re)connect. Save
+  default `en`, which is also the field's placeholder (see Layering).
+  `currentSttLanguage()` is read on every (re)connect. Save
   checks only the code's SHAPE (`isSttLanguage`, so `german` is caught); a
   well-formed code Deepgram lacks is refused at the WebSocket upgrade (HTTP
   400; a bad key fails the same way), which a browser reports as a bare close
   1006, indistinguishable from a network drop — so it spends the reconnect
-  budget (~40 s) before the captioner gives up. Its message then reaches the
-  panel toast, and `failVoice` leaves the voice screen WITHOUT acting on the
-  words: a panel dictation's go back into the send box, a glasses send's to the
-  confirm screen, and a half-dictated aside is dropped (never auto-asked). It
-  used to be a bare `Voice error.` over a "Listening" screen. The code is
+  budget (~40 s) before the captioner gives up — the voice screen's header
+  follows the stream meanwhile (`○ Connecting...` → `○ Reconnecting...`;
+  `● Listening` only while it's up). Its message then reaches the
+  panel toast, and `failVoice` acts on no words and moves the glasses
+  nowhere by itself. A glasses dictation stays on the voice screen, marked
+  `! Dictation stopped` with the reason, until a tap: a send's words wait there
+  for review (tap → confirm), and a half-dictated aside is dropped (never
+  auto-asked). A panel dictation's words go back into the send box. Staying
+  put is the point: the wearer's next tap may be a "done" meant for the live
+  screen, and on the confirm screen it would SEND (reproduced in a stubbed
+  host, as was the prompt case below). It used to be a bare `Voice error.`
+  over a "Listening" screen. The code is
   stored as typed, trimmed but not case-folded: Deepgram's own list is
   mixed-case (`zh-Hant`, `es-419`). It matched `pt-BR`/`pt-br`/`PT-BR`, `en-gb`
   and `zh-tw` alike (2026-10-27); that's all that was checked.

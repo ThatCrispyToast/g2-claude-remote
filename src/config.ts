@@ -42,8 +42,8 @@ export function loadRuntimeSettings(): RuntimeSettings {
 
 /** Persist panel-entered settings (empty strings clear a field). The caller then
  *  reconnects in place (see `currentBridge`) — no page reload, which would drop
- *  the glasses bridge. The `BRIDGE_*` consts stay at their load-time snapshot;
- *  the `current*()` accessors re-read these live values. */
+ *  the glasses bridge. The `BRIDGE_*` consts are the build's defaults and never
+ *  see these; the `current*()` accessors re-read the live values. */
 export function saveRuntimeSettings(s: RuntimeSettings): void {
   try {
     const clean: RuntimeSettings = {}
@@ -64,8 +64,6 @@ export function saveRuntimeSettings(s: RuntimeSettings): void {
     /* storage unavailable — settings just won't persist */
   }
 }
-
-const runtime = loadRuntimeSettings()
 
 /** Read a `VITE_`-prefixed string env var, or fall back to `def`. */
 function strEnv(value: unknown, def: string): string {
@@ -91,7 +89,7 @@ const env = import.meta.env
 // ─── The bridge (Claude Remote bridge → claude-rc-api → Anthropic) ───────────
 /** Resolve the effective bridge URL / token from a settings snapshot (runtime
  *  setting wins over the dev-only `VITE_` value; then a sensible default). Shared
- *  by the load-time consts and the live `currentBridge()` re-read below. */
+ *  by the build-default consts (an empty snapshot) and the live `currentBridge()`. */
 function resolveBridgeUrl(s: RuntimeSettings): string {
   return strEnv(s.bridgeUrl ?? env.VITE_BRIDGE_URL, 'http://localhost:8790').replace(/\/+$/, '')
 }
@@ -99,18 +97,22 @@ function resolveBridgeToken(s: RuntimeSettings): string {
   return strEnv(s.bridgeToken ?? env.VITE_BRIDGE_TOKEN, '')
 }
 /**
- * Base URL of the bridge (`claude-remote-bridge`, server/). No trailing slash.
- * Use a name the phone can reach from anywhere you wear the glasses — e.g. the
- * host's Tailscale MagicDNS name (`http://my-box.tailXXXX.ts.net:8790`) or a LAN IP.
+ * The build's bridge URL, used when none is saved in the Settings card (the
+ * dev-only `VITE_` value, else localhost). No trailing slash. A wearer saves a
+ * name the phone can reach from anywhere — e.g. the host's Tailscale MagicDNS
+ * name (`http://my-box.tailXXXX.ts.net:8790`) or a LAN IP. Like the token and
+ * key below, this is the Settings field's placeholder, so it must NOT fold in
+ * the saved value — a blank field falls back to exactly this.
  */
-export const BRIDGE_URL = resolveBridgeUrl(runtime)
-/** Shared secret matching the bridge's RC_BRIDGE_TOKEN. Sent as a Bearer header
- *  (and as `?token=` on the SSE stream, which can't set headers). */
-export const BRIDGE_TOKEN = resolveBridgeToken(runtime)
+export const BRIDGE_URL = resolveBridgeUrl({})
+/** The build's shared secret for the bridge's RC_BRIDGE_TOKEN (none in a pack).
+ *  Sent as a Bearer header (and as `?token=` on the SSE stream, which can't set
+ *  headers). */
+export const BRIDGE_TOKEN = resolveBridgeToken({})
 
 /** The bridge URL + token RIGHT NOW, re-reading saved settings so a Settings-card
  *  change applies WITHOUT a full page reload (a reload drops the Even glasses
- *  bridge). The consts above are the load-time snapshot; this is the live view. */
+ *  bridge). The consts above are the build defaults; this is the live view. */
 export function currentBridge(): { url: string; token: string } {
   const s = loadRuntimeSettings()
   return { url: resolveBridgeUrl(s), token: resolveBridgeToken(s) }
@@ -286,7 +288,8 @@ export const SLASH_COMMANDS: SlashCommand[] = parseSlashCommands(env.VITE_SLASH_
 function resolveDeepgramKey(s: RuntimeSettings): string {
   return strEnv(s.deepgramApiKey ?? env.VITE_DEEPGRAM_API_KEY, '')
 }
-export const DEEPGRAM_API_KEY = resolveDeepgramKey(runtime)
+/** The build's Deepgram key (none in a pack) — a placeholder, like `BRIDGE_URL`. */
+export const DEEPGRAM_API_KEY = resolveDeepgramKey({})
 /** The Deepgram key RIGHT NOW (re-reads saved settings — see `currentBridge`). */
 export function currentDeepgramKey(): string {
   return resolveDeepgramKey(loadRuntimeSettings())
