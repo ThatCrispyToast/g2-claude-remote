@@ -155,9 +155,12 @@ class App {
   // row highlight would map to the wrong action.
   private composeItems: ComposeAction[] = []
 
-  // voice — `voicePurpose` is what the transcript becomes when dictation ends
+  // voice — `voicePurpose` is what the transcript becomes when dictation ends;
+  // `voiceFrom` is the surface that started it, where a failed one hands back
+  // its words (failVoice)
   private interim = ''
   private voicePurpose: 'send' | 'aside' = 'send'
+  private voiceFrom: 'panel' | 'glasses' = 'glasses'
 
   // Side questions ("Ask aside"): the exchange on screen (glasses aside screen +
   // panel card) and, per session, the recent exchanges sent along with a
@@ -229,7 +232,7 @@ class App {
       onAnswerPermission: (d) => void this.answerPermission(d),
       onPickDialogOption: (qIndex, label) => this.recordPick(qIndex, label),
       onCancelDialog: () => void this.submitQuestion('cancelled'),
-      onStartVoice: () => void this.startVoice('send'),
+      onStartVoice: () => void this.startVoice('send', 'panel'),
       onStopVoice: () => void this.commitVoice(),
       onAskAside: (q) => void this.askAside(q, 'panel'),
       onDismissAside: () => this.dismissAside(),
@@ -250,6 +253,17 @@ class App {
       new Promise<null>((r) => setTimeout(() => r(null), 1500)),
     ])
 
+    // Restore panel-saved settings from the durable App-side store FIRST: before
+    // the first connect, so a reopened app reconnects on its own, and before
+    // glasses.init(), whose BLE call has no timeout — the Settings card stays
+    // shut until this lands (Panel.settingsLoaded), so it may wait on nothing
+    // but this one bounded read.
+    try {
+      await this.hydrateSettings()
+    } finally {
+      this.panel.settingsLoaded()
+    }
+
     if (this.bridge) {
       this.glasses = new GlassesDisplay(this.bridge)
       // Every full list (re)build resets the firmware's selection highlight to
@@ -267,9 +281,6 @@ class App {
       window.addEventListener('beforeunload', () => this.cleanup())
     }
 
-    // Restore panel-saved bridge/token from the durable App-side store BEFORE the
-    // first connect, so a reopened app reconnects on its own (see hydrateSettings).
-    await this.hydrateSettings()
     // Baked release notices — AFTER hydration, whose restored blob carries the
     // seen-ids: rendering earlier would flash already-dismissed notices.
     this.panel.setNotices(unseenNotices())
@@ -351,6 +362,9 @@ class App {
     const { url, token } = currentBridge()
     this.origin = url
     this.rc = new HttpBridgeClient(url, token)
+    // The Settings card can open as soon as this returns, well before the first
+    // connect: show the restored origin, not the load-time default.
+    this.panel.setConnection({ bridge: this.connBridge, origin: url, state: this.state })
   }
 
   /** A release notice was acknowledged (panel × or glasses tap): record it
@@ -1059,12 +1073,13 @@ class App {
   }
 
   // ── voice dictation ────────────────────────────────────────────────────
-  private async startVoice(purpose: 'send' | 'aside'): Promise<void> {
+  private async startVoice(purpose: 'send' | 'aside', from: 'panel' | 'glasses'): Promise<void> {
     if (!this.voice?.available) {
       this.panel.setToast('Voice dictation needs a Deepgram key.')
       return
     }
     this.voicePurpose = purpose
+    this.voiceFrom = from
     this.interim = ''
     this.panel.setDictating(true)
     this.go('voice')
@@ -1074,11 +1089,8 @@ class App {
         this.panel.setInterim(t)
         if (this.state === 'voice') this.render()
       },
-      onStatus: (s) => {
-        if (s === 'error') {
-          this.panel.setToast('Voice error.')
-          this.panel.setDictating(false)
-        }
+      onStatus: (s, detail) => {
+        if (s === 'error') void this.failVoice(detail)
       },
     })
   }
@@ -1119,6 +1131,26 @@ class App {
     if (!text) this.go('session')
     else if (this.voicePurpose === 'aside') void this.askAside(text, 'glasses') // read-only: no confirm
     else this.confirmSend(text, 'session')
+  }
+
+  /** The dictation died (the captioner gave up, or the mic wouldn't open). Say
+   *  why, and leave the voice screen rather than show "Listening" over a dead
+   *  stream — without acting on the words by itself: a panel dictation's go back
+   *  into the send box, a glasses send's to the confirm screen, and a
+   *  half-dictated aside is dropped (asking it would spend a model call on a
+   *  question the wearer never finished). */
+  private async failVoice(detail?: string): Promise<void> {
+    this.panel.setToast(detail ? `Voice error: ${detail}` : 'Voice error.', 6000)
+    const text = await this.finishDictation()
+    if (this.state !== 'voice') return // a tap, Stop or cancel got there first
+    if (!text || this.voicePurpose === 'aside') {
+      this.go('session')
+    } else if (this.voiceFrom === 'panel') {
+      this.panel.appendDraft(text)
+      this.go('session')
+    } else {
+      this.confirmSend(text, 'session')
+    }
   }
 
   private async cancelVoice(): Promise<void> {
@@ -1426,7 +1458,7 @@ class App {
         this.confirmSend(action.text, 'compose') // confirm before firing a canned send
         break
       case 'voice':
-        void this.startVoice('send')
+        void this.startVoice('send', 'glasses')
         break
       case 'interrupt':
         void this.interrupt()
@@ -1482,7 +1514,7 @@ class App {
       return
     }
     if (this.submenuKind === 'aside') {
-      if (item.value === ASIDE_DICTATE) void this.startVoice('aside')
+      if (item.value === ASIDE_DICTATE) void this.startVoice('aside', 'glasses')
       else void this.askAside(item.value, 'glasses')
       return
     }

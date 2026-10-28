@@ -227,10 +227,13 @@ export class LiveCaptioner {
   }
 
   private scheduleReconnect(closeCode: number): void {
-    // 1008 = policy violation — Deepgram rejecting the request (bad key/params).
-    // Retrying can't help.
+    // 1008 = policy violation: Deepgram closing an accepted stream because it
+    // can't decode what it was sent as audio (its DATA-0000). Retrying can't
+    // help. A bad key or a language Deepgram lacks is refused earlier, at the
+    // upgrade, which surfaces as a bare 1006 — the same as a network drop — so
+    // those land in the retry path below.
     if (closeCode === 1008) {
-      this.fail('Deepgram rejected the connection — check your API key.')
+      this.fail('Deepgram could not decode the mic audio.')
       return
     }
     this.attempts += 1
@@ -238,7 +241,7 @@ export class LiveCaptioner {
       this.fail(
         this.everConnected
           ? 'Live transcription connection lost and could not be restored.'
-          : 'Could not reach Deepgram — check your API key and network.',
+          : 'Could not reach Deepgram — check your API key, dictation language and network.',
       )
       return
     }

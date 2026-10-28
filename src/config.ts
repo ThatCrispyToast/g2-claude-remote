@@ -50,7 +50,7 @@ export function saveRuntimeSettings(s: RuntimeSettings): void {
     if (s.bridgeUrl?.trim()) clean.bridgeUrl = s.bridgeUrl.trim()
     if (s.bridgeToken?.trim()) clean.bridgeToken = s.bridgeToken.trim()
     if (s.deepgramApiKey?.trim()) clean.deepgramApiKey = s.deepgramApiKey.trim()
-    if (s.sttLanguage?.trim()) clean.sttLanguage = s.sttLanguage.trim().toLowerCase()
+    if (s.sttLanguage?.trim()) clean.sttLanguage = s.sttLanguage.trim()
     // Seen-notice ids are NOT connection settings: the Settings card's Save and
     // Reset pass only their own fields, and neither may resurrect notices the
     // wearer already dismissed — so when the caller doesn't provide the list
@@ -292,18 +292,24 @@ export function currentDeepgramKey(): string {
   return resolveDeepgramKey(loadRuntimeSettings())
 }
 export const DEEPGRAM_MODEL = strEnv(env.VITE_DEEPGRAM_MODEL, 'nova-3')
-/** Deepgram language code sent as `?language=` (`en`, `de`, `multi` for mixed
- *  speech, …). Runtime setting wins over the dev-only `VITE_` value; the build
- *  default is English. Nova-3 accepts any of Deepgram's language codes here. */
-function resolveSttLanguage(s: RuntimeSettings): string {
-  return strEnv(s.sttLanguage ?? env.VITE_STT_LANGUAGE, 'en')
-}
-export const STT_LANGUAGE = resolveSttLanguage(runtime)
+/** The build's dictation language: the Deepgram `?language=` code used when none
+ *  is saved in the Settings card (`en`, unless the dev-only `VITE_` var says
+ *  otherwise). It is that field's placeholder, so it must NOT fold in the saved
+ *  value — a blank field falls back to exactly this. */
+export const STT_LANGUAGE = strEnv(env.VITE_STT_LANGUAGE, 'en')
 /** The dictation language RIGHT NOW (re-reads saved settings — see `currentBridge`),
  *  so a language saved in the Settings card applies to the next dictation without
  *  a reload. */
 export function currentSttLanguage(): string {
-  return resolveSttLanguage(loadRuntimeSettings())
+  return strEnv(loadRuntimeSettings().sttLanguage, STT_LANGUAGE)
+}
+/** Is `code` shaped like a Deepgram language code: `multi` (mixed-language
+ *  speech) or a BCP-47-style tag such as `en`, `pt-BR`, `zh-Hant`, `es-419`?
+ *  A shape check only, to catch typos like `german` at save time. Deepgram is
+ *  the judge of what it supports: a well-formed code it lacks still fails at
+ *  connect, after the captioner's reconnect budget, like a bad key. */
+export function isSttLanguage(code: string): boolean {
+  return /^(multi|[a-z]{2,3}(-[a-z0-9]{2,8})*)$/i.test(code)
 }
 /** Master switch for voice dictation (also needs the Deepgram key). */
 const VOICE_MASTER = boolEnv(env.VITE_VOICE_ENABLED, true)

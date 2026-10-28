@@ -28,7 +28,13 @@ to dictate. A companion phone panel mirrors it all with a fuller control surface
 
 3. **Connect** - enter one of those URLs and the token in the panel's Settings
    card. Add a [Deepgram](https://console.deepgram.com) key there for voice
-   dictation; leave it blank and voice disables itself.
+   dictation; leave it blank and voice disables itself. Dictation is English
+   unless you also set a language there: any
+   [Deepgram language code](https://developers.deepgram.com/docs/models-languages-overview)
+   (`de`, `pt-BR`, …), or `multi` for speech that mixes languages. The glasses'
+   font covers Latin-1, so most Western European text reads back fine (save
+   French `œ` and the `€` sign); other scripts may show gaps on the HUD, though
+   the message still sends intact.
 
 Can't connect? Open the bridge's port (default `8790`) in the host firewall.
 
@@ -137,8 +143,8 @@ it to the next launch - and acknowledging on either surface retires it on both.
 Two layers on the app side; the higher wins.
 
 1. **Runtime settings** - the panel's Settings card (bridge URL, token, Deepgram
-   key, dictation language), stored on the device across app restarts. This is how a packed `.ehpk` is
-   configured.
+   key, dictation language), stored on the device across app restarts. This is
+   how a packed `.ehpk` is configured.
 2. **Dev-server defaults** - `VITE_*` vars in `.env.local`, read by `npm run dev`
    only ([`.env.example`](.env.example) lists them all). Packs never include them:
    `npm run pack` builds with env resolution disabled, so no key or host can leak

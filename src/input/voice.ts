@@ -20,8 +20,8 @@ export type VoiceStatus = 'idle' | 'connecting' | 'listening' | 'reconnecting' |
 export interface VoiceHandlers {
   /** The best transcript so far (finals + latest interim), on every change. */
   onInterim: (text: string) => void
-  /** Dictation lifecycle, for the HUD. */
-  onStatus: (s: VoiceStatus) => void
+  /** Dictation lifecycle, for the HUD. An `'error'` may say what went wrong. */
+  onStatus: (s: VoiceStatus, detail?: string) => void
 }
 
 /** Map the captioner's connection state onto the dictation-facing status. */
@@ -84,7 +84,7 @@ export class VoiceDictation {
     } catch (err) {
       console.error('[voice] failed to open mic:', err)
       this.starting = false
-      handlers.onStatus('error')
+      handlers.onStatus('error', 'Could not open the glasses mic.')
       return
     }
 
@@ -104,7 +104,7 @@ export class VoiceDictation {
       },
       onFatal: (message) => {
         console.error('[voice] deepgram fatal:', message)
-        this.handlers?.onStatus('error')
+        this.handlers?.onStatus('error', message)
       },
     })
 

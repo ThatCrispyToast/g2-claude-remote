@@ -29,7 +29,7 @@ import type {
   WorkerState,
 } from './rc/types'
 import type { Notice } from './notices'
-import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, STT_LANGUAGE, loadRuntimeSettings, saveRuntimeSettings } from './config'
+import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, STT_LANGUAGE, isSttLanguage, loadRuntimeSettings, saveRuntimeSettings, type RuntimeSettings } from './config'
 import { cleanUserEcho, isQuestionRequest, settingsLine } from './events/format'
 
 /** A side question on show: asking (answer + error null), answered, or failed. */
@@ -184,6 +184,13 @@ export class Panel {
 
   private mounted = false
   private dictating = false
+  /** Set once main.ts has restored the saved settings (settingsLoaded). A tap on
+   *  Settings before that is held, not served: filled from the still-empty
+   *  storage, the card would show (and Save would write) blanks. */
+  private settingsReady = false
+  private settingsHeld = false
+  /** Open/close the Settings card, filling it from storage on open (wireSettings). */
+  private toggleSettings = (): void => {}
   /** The currently-open session id (for onArchive), or null in the list view. */
   private currentSid: string | null = null
   // The open session as last pushed, its live worker settings, background
@@ -222,9 +229,8 @@ export class Panel {
     const modeOpts = MODES.map((m) => `<option value="${m}">${m}</option>`).join('')
     const effortOpts = EFFORTS.map((e) => `<option value="${e.id ?? 'auto'}">${e.label}</option>`).join('')
 
-    // Settings prefill: the inputs hold the on-device overrides; the
-    // placeholders show what the build falls back to without them.
-    const rt = loadRuntimeSettings()
+    // Settings: the placeholders show what the build falls back to; the inputs
+    // hold the on-device overrides, filled on every open (see wireSettings).
     const settingsHtml = `
         <section id="settingsCard" class="settings" hidden>
           <div class="view-title">Connection settings</div>
@@ -235,22 +241,22 @@ export class Panel {
           <label class="field">
             <span class="field-label">Bridge URL</span>
             <input id="setBridgeUrl" class="set-input" type="url" autocapitalize="off" autocorrect="off"
-              spellcheck="false" placeholder="${escapeHtml(BRIDGE_URL)}" value="${escapeHtml(rt.bridgeUrl ?? '')}" />
+              spellcheck="false" placeholder="${escapeHtml(BRIDGE_URL)}" />
           </label>
           <label class="field">
             <span class="field-label">Bridge token</span>
             <input id="setBridgeToken" class="set-input" type="password" autocapitalize="off"
-              placeholder="${BRIDGE_TOKEN ? '(using built-in token)' : '(none set)'}" value="${escapeHtml(rt.bridgeToken ?? '')}" />
+              placeholder="${BRIDGE_TOKEN ? '(using built-in token)' : '(none set)'}" />
           </label>
           <label class="field">
             <span class="field-label">Deepgram API key (optional, for voice)</span>
             <input id="setDeepgramKey" class="set-input" type="password" autocapitalize="off"
-              placeholder="${DEEPGRAM_API_KEY ? '(using built-in key)' : '(voice disabled)'}" value="${escapeHtml(rt.deepgramApiKey ?? '')}" />
+              placeholder="${DEEPGRAM_API_KEY ? '(using built-in key)' : '(voice disabled)'}" />
           </label>
           <label class="field">
             <span class="field-label">Dictation language (Deepgram code: en, de, fr, multi…)</span>
             <input id="setSttLanguage" class="set-input" type="text" autocapitalize="off" autocorrect="off"
-              spellcheck="false" placeholder="${escapeHtml(STT_LANGUAGE)}" value="${escapeHtml(rt.sttLanguage ?? '')}" />
+              spellcheck="false" placeholder="${escapeHtml(STT_LANGUAGE)}" />
           </label>
           <div class="settings-hint">Stored only on this device. A blank field falls back to the default shown in it.</div>
           <div class="perm-acts">
@@ -447,25 +453,46 @@ ${settingsHtml}
     const token = root.querySelector<HTMLInputElement>('#setBridgeToken')
     const dg = root.querySelector<HTMLInputElement>('#setDeepgramKey')
     const lang = root.querySelector<HTMLInputElement>('#setSttLanguage')
+    // Fill from storage on every open, never at mount: mount() runs BEFORE main.ts
+    // restores the saved settings from the App-side store (hydrateSettings), and
+    // the Even App evicts the WebView's storage between launches — mount-time
+    // values would be blank on a reopened app, and saving them would wipe the
+    // restored connection. For the same reason a tap before that restore is
+    // held until settingsLoaded().
+    const fill = (s: RuntimeSettings): void => {
+      if (url) url.value = s.bridgeUrl ?? ''
+      if (token) token.value = s.bridgeToken ?? ''
+      if (dg) dg.value = s.deepgramApiKey ?? ''
+      if (lang) lang.value = s.sttLanguage ?? ''
+    }
+    this.toggleSettings = () => {
+      if (!card) return
+      if (card.hidden) fill(loadRuntimeSettings())
+      card.hidden = !card.hidden
+    }
     root.querySelector<HTMLButtonElement>('#settingsBtn')?.addEventListener('click', () => {
-      if (card) card.hidden = !card.hidden
+      if (this.settingsReady) this.toggleSettings()
+      else this.settingsHeld = true
     })
     root.querySelector<HTMLButtonElement>('#settingsSave')?.addEventListener('click', () => {
+      const language = lang?.value.trim() ?? ''
+      if (language && !isSttLanguage(language)) {
+        this.setToast('Language must be a code like de, pt-BR or multi.')
+        lang?.focus()
+        return
+      }
       saveRuntimeSettings({
         bridgeUrl: url?.value ?? '',
         bridgeToken: token?.value ?? '',
         deepgramApiKey: dg?.value ?? '',
-        sttLanguage: lang?.value ?? '',
+        sttLanguage: language,
       })
       if (card) card.hidden = true
       this.cb.onApplySettings()
     })
     root.querySelector<HTMLButtonElement>('#settingsReset')?.addEventListener('click', () => {
       saveRuntimeSettings({})
-      if (url) url.value = ''
-      if (token) token.value = ''
-      if (dg) dg.value = ''
-      if (lang) lang.value = ''
+      fill({})
       this.cb.onApplySettings()
     })
   }
@@ -631,6 +658,17 @@ ${settingsHtml}
       this.connChip.title = `${info.origin} · ${info.state}`
     }
     if (this.originEl) this.originEl.textContent = info.origin
+  }
+
+  /** main.ts has restored the saved settings from the App-side store (or found
+   *  none): the Settings card may open now, and does at once if it was tapped
+   *  meanwhile. */
+  settingsLoaded(): void {
+    this.settingsReady = true
+    if (this.settingsHeld) {
+      this.settingsHeld = false
+      this.toggleSettings()
+    }
   }
 
   // ── Release notices ──────────────────────────────────────────────────────
@@ -961,6 +999,15 @@ ${settingsHtml}
     }
   }
 
+  /** Put `text` in the send box, after any draft already there, to edit or send
+   *  — where a failed panel dictation hands back what it heard. */
+  appendDraft(text: string): void {
+    const box = this.sendInput
+    if (!box) return
+    const draft = box.value.trimEnd()
+    box.value = draft ? `${draft} ${text}` : text
+  }
+
   // ── Permission banner ────────────────────────────────────────────────────
   setPermission(p: PermissionRequest | null): void {
     const banner = this.permBanner
@@ -1056,7 +1103,8 @@ ${settingsHtml}
   }
 
   // ── Transient toast ──────────────────────────────────────────────────────
-  setToast(msg: string): void {
+  /** Show `msg` for `ms` ('' hides it). A long message needs a longer `ms`. */
+  setToast(msg: string, ms = 2600): void {
     const el = this.toastEl
     if (!el) return
     if (this.toastTimer !== null) {
@@ -1074,7 +1122,7 @@ ${settingsHtml}
       el.hidden = true
       el.textContent = ''
       this.toastTimer = null
-    }, 2600)
+    }, ms)
   }
 }
 

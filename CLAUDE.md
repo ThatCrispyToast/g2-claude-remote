@@ -103,8 +103,11 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   public. The store shots are staged this way: `--question` blocks
   payment-service on an AskUserQuestion instead of a Bash permission, and a long
   `VITE_QUICK_SENDS` text stages the confirm screen.
-- **No Even bridge (plain browser) = panel-only mode** — glasses/gesture/mic
-  paths skip; the session list, stream, and steering still work via the panel.
+- **No Even App (plain browser) = panel-only mode** — the SDK's bridge object
+  still initializes, but with no Flutter handler its native calls come back
+  empty (`postMessage: Flutter handler not available`), so the glasses/gesture/
+  mic paths do nothing; the session list, stream, and steering still work via
+  the panel.
 
 ## HUD gotchas
 
@@ -114,6 +117,15 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   (`docs/display.md`). **`ui.ts` is exempt** — the panel is a real browser
   WebView; rich glyphs there are intended, and it formats events itself
   (independently of the HUD-only `events/format.ts`). Don't "fix" it.
+- **Text beyond Latin-1 is untested.** Per the same notes (simulator-tested;
+  "real hardware may differ") the font has printable ASCII + Latin-1 nearly
+  complete, so German/Spanish/Italian/Portuguese/Dutch/Nordic dictation reads
+  back intact on the confirm screen, and French nearly so: `œ`/`Œ` sit outside
+  Latin-1, as does `€` in any language. Past that they document only symbol
+  blocks and some CJK;
+  other scripts (Polish `ł`, Cyrillic, Greek, …) are unverified, and any glyph
+  the firmware lacks is skipped silently. The message still sends intact and
+  the panel shows it fine — a HUD readback limit, not a dictation bug.
 - **Native text scroll is boundary-only.** A text container with
   `isEventCapture:1` is scrolled smoothly by the firmware; the app only sees
   `SCROLL_TOP`/`SCROLL_BOTTOM` at the ends. The session view exploits this: an
@@ -360,7 +372,7 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   `persistSettings`. Two invariants regression-tested via browser-test: a
   seeded `seenNotices` hides the card at boot, and a Settings-card Save/Reset
   carries `seenNotices` forward (`saveRuntimeSettings` reads the stored list
-  when the caller passes none — the card only knows its three fields; losing
+  when the caller passes none — the card only knows its four fields; losing
   that merge would resurrect every dismissed notice on the next settings save).
   Prune-on-dismiss keeps the blob bounded: ids not in the current baked list
   are dropped, so retiring old notices from the source is always safe.
@@ -393,12 +405,25 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   saves to the WebView's `window.localStorage`, but the Even app EVICTS that
   between launches — so `main.ts` mirrors the same `claude-remote.settings` JSON
   into the SDK's App-side store (`bridge.set/getLocalStorage`, which persists
-  natively). `hydrateSettings()` seeds the browser cache from it at boot, BEFORE
-  the first connect, so a reopened app reconnects itself; `persistSettings()`
-  writes it back on every save. Both are `withTimeout`-guarded (a slow/absent
-  native method can't stall boot) and no-op with no Even bridge (a plain browser
-  persists localStorage on its own). Without this the wearer re-enters the bridge
-  URL + token on every reopen.
+  natively). `hydrateSettings()` seeds the browser cache from it at boot, right
+  after the Even bridge appears — before the first connect, so a reopened app
+  reconnects itself, and before `glasses.init()`, whose
+  `createStartUpPageContainer` has NO timeout (a hung BLE call there still
+  stalls the rest of boot). `persistSettings()` writes it back on every save.
+  Both storage calls are `withTimeout`-guarded; in a plain browser they just
+  come back empty (see panel-only mode), where localStorage persists on its own
+  anyway. Without this the wearer re-enters the bridge URL + token on every
+  reopen.
+- **The Settings card fills its inputs on every OPEN, never at mount — and
+  can't open before hydration.** `Panel.mount()` runs before
+  `hydrateSettings()`, so on a reopened app the storage it sees is the evicted,
+  empty one: a card prefilled at mount showed a connected app as blank, and a
+  Save (say, to change only the dictation language) wrote those blanks over the
+  restored bridge URL, token and key — and dropped `seenNotices`, resurrecting
+  dismissed notices. `wireSettings`' `fill()` re-reads `loadRuntimeSettings()`
+  each time the card opens, and a tap before `Panel.settingsLoaded()` (called
+  in a `finally` after hydration, so the gate can't stick) is held and served
+  then. Keep both.
 - **The bridge reads `.env.local` too** (`RC_BRIDGE_*` keys; `VITE_BRIDGE_TOKEN`
   doubles as the token; CLI flags and process env win). With no token configured
   it GENERATES a word passphrase (`RC_BRIDGE_TOKEN_WORDS` words from
@@ -407,6 +432,22 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   mode. A user-set token is used verbatim.
 - **Deepgram key** lives in `.env.local` or the Settings card; voice
   auto-disables when blank.
+- **Dictation language** is the Settings card's `sttLanguage` (any Deepgram
+  code; `multi` = mixed-language speech), else `STT_LANGUAGE` — the build
+  default `en`, which is also the field's placeholder, so it must never fold in
+  the saved value. `currentSttLanguage()` is read on every (re)connect. Save
+  checks only the code's SHAPE (`isSttLanguage`, so `german` is caught); a
+  well-formed code Deepgram lacks is refused at the WebSocket upgrade (HTTP
+  400; a bad key fails the same way), which a browser reports as a bare close
+  1006, indistinguishable from a network drop — so it spends the reconnect
+  budget (~40 s) before the captioner gives up. Its message then reaches the
+  panel toast, and `failVoice` leaves the voice screen WITHOUT acting on the
+  words: a panel dictation's go back into the send box, a glasses send's to the
+  confirm screen, and a half-dictated aside is dropped (never auto-asked). It
+  used to be a bare `Voice error.` over a "Listening" screen. The code is
+  stored as typed, trimmed but not case-folded: Deepgram's own list is
+  mixed-case (`zh-Hant`, `es-419`). It matched `pt-BR`/`pt-br`/`PT-BR`, `en-gb`
+  and `zh-tw` alike (2026-10-27); that's all that was checked.
 - `server/pyproject.toml` depends on `claude-rc-api` by DIRECT GIT URL — needed
   for the `uvx --from git+…` install path; PyPI would reject it (see
   `server/README.md`).
