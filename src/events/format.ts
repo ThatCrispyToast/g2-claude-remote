@@ -283,6 +283,10 @@ export function renderEventParts(e: RcEvent): EventParts {
       return NOTHING
     }
 
+    // EventLog has already dropped what came before; this is the line left behind.
+    case 'conversation_reset':
+      return { text: `${HUD.SYS} conversation cleared`, tools: [] }
+
     case 'control_request': {
       // A blocking control — main.ts routes it to the permission or question
       // screen, but it should still read in the log so scrollback shows why the

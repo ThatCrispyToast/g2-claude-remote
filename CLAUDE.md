@@ -362,8 +362,8 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   - **Aliases** — `/cost` redirects to `/usage` (the echo shows
     `<command-name>/usage`), so ship the canonical name.
   - **Verified good** (local, `$0`, glanceable output): `/context`, `/usage`,
-    `/mcp`, `/compact`. `/clear` runs (no error, no model turn) but emits NO
-    `<local-command-stdout>`, so it gives no HUD feedback that it worked.
+    `/mcp`, `/compact`. `/clear` runs (no error, no model turn) with no
+    `<local-command-stdout>`; its feedback is the transcript emptying (see below).
   - Interactive ones (`/login`, `/config`, `/vim`, `/ide`, `/terminal-setup`)
     have no remote meaning. Mind machine-global semantics too: like `/effort`,
     some commands persist a machine default rather than being session-scoped.
@@ -386,6 +386,29 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   bubbles. Note a local command still yields two user events that both read as the
   command (the send + the `<command-name>` echo); the HUD's row-budgeted tail
   usually hides the older one, the panel shows both — acceptable, not deduped.
+
+## Clearing a conversation
+
+- **`conversation_reset` is the ONLY signal — key on the type, never on `/clear`
+  text.** A worker emits it for `/clear` (and its `/reset` / `/new` aliases),
+  leaving plan mode with clear-context, and fresh-session and onboarding flows,
+  from any controller or the terminal. The session id and its event log carry
+  on, so the old events stay in `GET …/events` forever: hiding them is the
+  client's job. The CLI's own schema says to reset on every such frame whatever
+  its `trigger` says. Verified live on 2.1.314 (2026-10-30). The frame needs no
+  bridge support, since `event_to_json` passes `type` through.
+- **Both surfaces reset where they ingest** (`EventLog.append`, `Panel.appendNode`)
+  so a history fetch spanning a clear and a live one behave alike: everything
+  older goes and a lone `conversation cleared` row stays. Their `seen` sets
+  survive it, so an SSE replay can't resurrect anything. `findPendingControl`
+  treats a reset like a `result`. main.ts's `onConversationReset` drops the rest:
+  queued prompts, a frozen history window, the aside card, and (`noteEvent`) the
+  aside follow-up history.
+- **The session's `summary` outlives a clear.** The worker wipes
+  `post_turn_summary` only when the next turn starts, so the list gist and session
+  card keep describing the cleared conversation until then. Left alone on purpose:
+  there is nothing to tell a stale summary from a fresh one, and a session cleared
+  while the app sits on the list sends the app no event at all.
 
 ## Release notices
 

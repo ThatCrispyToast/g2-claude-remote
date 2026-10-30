@@ -183,7 +183,7 @@ export interface Usage {
  * bridge's additions, needed to answer permission prompts.
  */
 export interface RcEvent {
-  type: 'user' | 'assistant' | 'system' | 'result' | 'control_request' | 'control_response' | 'stream_event' | string | null
+  type: 'user' | 'assistant' | 'system' | 'result' | 'control_request' | 'control_response' | 'conversation_reset' | 'stream_event' | string | null
   subtype: string | null
   role: 'user' | 'assistant' | null
   /** 'client' = a controller wrote it (this app, claude.ai…); 'worker' = Claude Code. */

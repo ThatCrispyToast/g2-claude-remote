@@ -578,6 +578,7 @@ class App {
     // them all (the CLI is no longer waiting on anything).
     if (ev.type === 'control_response' && ev.requestId) this.resolvePromptRemotely(ev.requestId)
     if (ev.type === 'result') this.dropAllPrompts('Turn ended.')
+    if (ev.type === 'conversation_reset') this.onConversationReset()
     // A fresh blocking control — a QUESTION (pick an option) or a
     // tool-permission (allow/deny) — joins the prompt queue; queuePrompt decides
     // whether it can show now or must wait for the wearer.
@@ -586,6 +587,16 @@ class App {
     // newest tail; in 'history' the body is frozen, so render() only refreshes
     // the (separate) header/footer containers and the native scroll stays put.
     if (this.state === 'session') this.render()
+  }
+
+  /** The session's conversation was discarded (/clear and friends, from any
+   *  controller). The log and the panel have dropped their transcripts; this
+   *  drops the rest of what belonged to it: its prompts, a history window frozen
+   *  on old lines, and the aside on show or still in flight. */
+  private onConversationReset(): void {
+    this.dropAllPrompts('Conversation cleared.')
+    this.resetSessionView()
+    this.dismissAside()
   }
 
   /** Track the open session's live settings and background tasks. A status
@@ -605,6 +616,9 @@ class App {
       this.tasks = ev.tasks
       this.panel.setTasks(ev.tasks)
     }
+    // Follow-up asides mustn't carry the discarded conversation along. Here, not
+    // in onConversationReset, so a clear that happened while away counts too.
+    if (ev.type === 'conversation_reset' && this.sid) this.asideHistory.delete(this.sid)
   }
 
   /** Forget the open session's settings, tasks, aside and info (open / leave).
@@ -2015,7 +2029,7 @@ function findPendingControl(events: RcEvent[]): RcEvent | null {
   for (const ev of events) {
     if (ev.isBlockingControl && ev.permissionRequest && ev.requestId) pending = ev
     else if (ev.type === 'control_response' && ev.requestId && pending?.requestId === ev.requestId) pending = null
-    else if (ev.type === 'result') pending = null
+    else if (ev.type === 'result' || ev.type === 'conversation_reset') pending = null
   }
   return pending
 }

@@ -50,12 +50,17 @@ export class EventLog {
    * Returns whether the event was FRESH (false = a sequenceNum we already
    * ingested, e.g. an SSE reconnect replaying its catch-up window). Callers use
    * this to make sure a replayed event never re-triggers UI (prompt screens…).
+   *
+   * A `conversation_reset` (/clear and friends) empties the log first, so a
+   * history fetch spanning one and a live one both end up showing only what
+   * came after it. `seen` survives, so a replay can't bring the old events back.
    */
   append(e: RcEvent): boolean {
     if (e.sequenceNum != null) {
       if (this.seen.has(e.sequenceNum)) return false
       this.seen.add(e.sequenceNum)
     }
+    if (e.type === 'conversation_reset') this.dropLines()
     const { text, tools } = renderEventParts(e)
     if (!text && tools.length === 0) return true // drops without breaking the chain
     if (text) {
@@ -199,8 +204,13 @@ export class EventLog {
   }
 
   clear(): void {
-    this.lines = []
     this.seen = new Set<number>()
+    this.dropLines()
+  }
+
+  /** Forget the rendered transcript, but not which events were already seen. */
+  private dropLines(): void {
+    this.lines = []
     this.chainStart = -1
     this.chainEntries = []
     this.foldLine = ''

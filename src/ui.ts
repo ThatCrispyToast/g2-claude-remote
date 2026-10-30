@@ -956,6 +956,12 @@ ${settingsHtml}
    *  simple rows into a single `… ×N` row (see `lastFold`). */
   private appendNode(e: RcEvent): void {
     if (!this.logEl) return
+    // The panel twin of EventLog's reset: only what follows a /clear stays. `seen`
+    // survives, so a replay can't bring the old events back.
+    if (e.type === 'conversation_reset') {
+      this.logEl.textContent = ''
+      this.lastFold = null
+    }
     const node = renderEventNode(e)
     if (!node) return
     const foldable = node.childElementCount === 0
@@ -1204,6 +1210,13 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
       const row = document.createElement('div')
       row.className = 'ev ev-system'
       row.textContent = label
+      return row
+    }
+
+    case 'conversation_reset': {
+      const row = document.createElement('div')
+      row.className = 'ev ev-system'
+      row.textContent = '◆ conversation cleared'
       return row
     }
 

@@ -5,8 +5,8 @@ For driving the app (dev server, simulator, browser) with no Claude login and
 nothing real to steer, and for staging the store screenshots in assets/store/
 (the repo is public, so never shoot real sessions). It implements the read side
 of the bridge API with the shapes in src/rc/types.ts, answers side questions
-and session info with canned replies, accepts (and ignores) every other POST,
-and takes any token.
+and session info with canned replies, carries out a `/clear` send the way a real
+worker does, accepts (and ignores) every other POST, and takes any token.
 
     python3 scripts/mock-bridge.py [--port 8791] [--question]
     VITE_BRIDGE_URL=http://localhost:8791 VITE_BRIDGE_TOKEN=x npm run dev
@@ -226,8 +226,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
-        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         path = urlparse(self.path).path
+        if path.endswith("/send") and json.loads(body).get("text") == "/clear":
+            self._clear(path.split("/")[3])
         if path.endswith("/aside"):
             time.sleep(1.5)  # a side question is one model call
             return self._json({"answer": ASIDE_ANSWER})
@@ -250,13 +252,20 @@ class _Handler(BaseHTTPRequestHandler):
         if m["rest"] == "/events":
             return self._json({"events": self.events.get(session["id"], [])})
         if m["rest"] == "/stream":
-            return self._stream()
+            return self._stream(session["id"])
         if m["rest"] == "/info":
             return self._json(INFO)
         return self._json({"session": session})
 
-    def _stream(self) -> None:
-        """An SSE stream with nothing new to say: held open with keep-alives."""
+    def _clear(self, sid: str) -> None:
+        """What a worker persists for `/clear`: the reset, then a zero-turn result."""
+        events = self.events[sid]
+        seq = events[-1]["sequenceNum"]
+        events.append(_event(seq + 1, "conversation_reset"))
+        events.append(_event(seq + 2, "result", subtype="success", usage=_usage(0, 0, 0)))
+
+    def _stream(self, sid: str) -> None:
+        """An SSE stream of whatever is new since it opened, held open with keep-alives."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -264,9 +273,13 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             self.wfile.write(b"retry: 3000\n\n")
+            sent = len(self.events[sid])
             while True:
                 self.wfile.flush()
-                time.sleep(15)
+                time.sleep(0.5)
+                for ev in self.events[sid][sent:]:
+                    self.wfile.write(f"id: {ev['sequenceNum']}\ndata: {json.dumps(ev)}\n\n".encode())
+                sent = len(self.events[sid])
                 self.wfile.write(b": keep-alive\n\n")
         except (BrokenPipeError, ConnectionResetError):
             pass
