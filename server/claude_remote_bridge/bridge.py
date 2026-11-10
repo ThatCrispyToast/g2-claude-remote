@@ -3,12 +3,15 @@
 It is a purpose-built sibling of ``claude-rc``'s ``webui.py``: a dependency-free
 ``http.server`` that wraps :class:`claude_rc.client.RemoteControlClient` and
 exposes exactly what the glasses UI needs. It differs from the stock webui in
-six deliberate ways, each required by this app:
+seven deliberate ways, each required by this app:
 
 1. **Active-only.** ``GET /api/sessions`` returns *only* sessions that are
    ``status == "active"`` **and** ``connection_status == "connected"`` — i.e.
    neither archived nor dead (a dead session is one whose ``claude
    remote-control`` worker has disconnected; sends to it would queue forever).
+   It asks the API for active sessions outright: an unfiltered page is the
+   account's 20 newest sessions, archived ones included, so a long-running
+   session used to drop off the list once enough newer ones had come and gone.
    Every mutating / streaming route re-checks this and refuses with **409** if
    the session is no longer active. This is the app's non-negotiable rule and it
    is enforced here, server-side, as the single source of truth.
@@ -22,8 +25,10 @@ six deliberate ways, each required by this app:
    webui's flattened event that additionally carries ``requestId`` /
    ``toolUseId`` / ``permissionRequest`` (needed to answer a prompt), ``usage``,
    ``workerState`` (model / effort / permission mode from ``system/init`` and
-   ``system/status`` — the session object has no permission mode) and the
-   running background ``tasks``. ``permissionRequest`` covers both blocking
+   ``system/status`` — the session object has no permission mode), the
+   running background ``tasks`` and ``settlesPrompt`` (this event ends the
+   prompt its ``requestId`` names: a controller answered it, or the worker
+   withdrew it). ``permissionRequest`` covers both blocking
    flavors: tool-permissions (``can_use_tool``) and QUESTIONS (with parsed
    ``questions``/options). NOTE the sharp edge, confirmed against a live
    prompt: the **AskUserQuestion** tool is delivered as a ``can_use_tool``
@@ -31,7 +36,8 @@ six deliberate ways, each required by this app:
    ``request_user_dialog`` — so it is answered on the PERMISSION path (allow +
    ``updatedInput.answers``). ``ActiveSession`` adds what the session's
    ``external_metadata`` says for free: current effort, context use, the
-   one-line post-turn summary, the worker's Claude Code version.
+   one-line post-turn summary, the worker's Claude Code version — and
+   ``pinned``, claude.ai/code's pin (``POST …/pin`` sets it).
 5. **Prompt answers.** ``POST …/permission`` (allow/deny) and ``POST …/dialog``
    (answer a question; a ``can_use_tool`` question goes back through the
    permission path) wrap claude-rc-api's answer builders.
@@ -42,6 +48,11 @@ six deliberate ways, each required by this app:
    ``apply_flag_settings`` control — falling back, on workers older than
    2.1.30x that refuse it, to the ``/effort`` slash command (which persists the
    worker machine's default; the response's ``via`` says which path ran).
+7. **Stream liveness.** The API's keepalives (about every 15 s) pass through
+   ``GET …/stream`` as ``ping`` frames. The app redials a stream that stops
+   pinging, and a ping the bridge can't deliver is how it learns the app has
+   gone — a quiet session's stream otherwise held its thread and its upstream
+   connection until the session's next event.
 
 Run it — the goal is "one command and the glasses can connect":
 
@@ -105,19 +116,20 @@ except ModuleNotFoundError:
             "  # one dependency:  pip install httpx\n"
         )
         raise SystemExit(2)
-# 0.4.0 is the floor: older token refreshes rewrote Claude Code's whole login
-# block, dropping the CLI's other fields, and never read the macOS Keychain.
+# 0.5.1 is the floor: the session list's status filter, pins, how a prompt ends
+# (`settles_prompt`) and the stream keepalives are all that new.
 try:
+    from claude_rc import PINNED_TAG
     from claude_rc import __version__ as _rc_api_version
     from claude_rc.client import ControlRejected, ControlTimeout
-    from claude_rc.events import Event, _to_int, cli_dialog_response
+    from claude_rc.events import RC, Event, _to_int, cli_dialog_response
 
-    _rc_api_too_old = tuple(map(int, re.findall(r"\d+", _rc_api_version)[:2])) < (0, 4)
+    _rc_api_too_old = tuple(map(int, re.findall(r"\d+", _rc_api_version)[:3])) < (0, 5, 1)
 except ImportError:  # pragma: no cover - operator error
     _rc_api_too_old = True
 if _rc_api_too_old:  # pragma: no cover - operator error
     sys.stderr.write(
-        "claude-rc-api is too old for this bridge (it needs 0.4.0+).\n"
+        "claude-rc-api is too old for this bridge (it needs 0.5.1+).\n"
         "Re-run with --refresh to update it:\n"
         '  uvx --refresh --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge\n'
     )
@@ -167,6 +179,10 @@ VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 # A side question is one model call over the session's context; Opus on a long
 # session can take a while. The worker's own deadline is 11 minutes.
 ASIDE_TIMEOUT_S = 150.0
+# The session list is read in pages of this many (the API's most), and no
+# further than this many pages: a thousand active sessions is not a real list.
+LIST_PAGE = 200
+LIST_MAX_PAGES = 5
 
 # --- route patterns (first hit wins) ---------------------------------------
 _SID = r"(?P<sid>[^/]+)"
@@ -184,6 +200,7 @@ _R_MODEL = re.compile(rf"^/api/sessions/{_SID}/model$")
 _R_PERMMODE = re.compile(rf"^/api/sessions/{_SID}/permission_mode$")
 _R_EFFORT = re.compile(rf"^/api/sessions/{_SID}/effort$")
 _R_ARCHIVE = re.compile(rf"^/api/sessions/{_SID}/archive$")
+_R_PIN = re.compile(rf"^/api/sessions/{_SID}/pin$")
 
 
 class SessionInactive(Exception):
@@ -203,9 +220,11 @@ def is_active(s: dict) -> bool:
 
 # --- shaping upstream objects into the app's contract ----------------------
 def _context(ext: dict) -> Optional[dict]:
+    """Context use, once the worker has measured it: a session still in its
+    first turn reports 0 used tokens, which is "not yet", not "empty"."""
     usage = ext.get("context_usage") or {}
     used, most = usage.get("used_tokens"), usage.get("max_tokens")
-    if not isinstance(used, int) or not isinstance(most, int) or most <= 0:
+    if not isinstance(used, int) or not isinstance(most, int) or used <= 0 or most <= 0:
         return None
     return {"usedTokens": used, "maxTokens": most, "percent": round(100 * used / most)}
 
@@ -226,6 +245,7 @@ def session_to_json(s: dict) -> dict:
         "permissionMode": cfg.get("permission_mode") or cfg.get("permissionMode"),
         "lastEventAt": s.get("last_event_at"),
         "unread": bool(s.get("unread")),
+        "pinned": PINNED_TAG in (s.get("tags") or []),
         "userMessageCount": _to_int(s.get("user_message_count")) or 0,
         "pendingAction": ext.get("pending_action") or None,
         "effort": ext.get("effort_level") or None,
@@ -370,8 +390,9 @@ def _tasks(ev: Event) -> Optional[list]:
 
 def event_to_json(ev: Event) -> dict:
     """Flatten an :class:`Event` into ``RcEvent`` (camelCase, superset of webui)."""
-    # A control_response's requestId correlates it to the request it answers —
-    # the app uses it to auto-dismiss a prompt answered elsewhere.
+    # requestId ties a control_response (or a control_cancel_request) to the
+    # request it answers (or withdraws); settlesPrompt says that request was a
+    # worker's prompt and is now over — the app retires it on that.
     perm = _permission_request(ev)
     return {
         "type": ev.type,
@@ -392,6 +413,7 @@ def event_to_json(ev: Event) -> dict:
         "isBlockingControl": ev.is_blocking_control,
         "blockingSubtype": ev.control_subtype if ev.is_blocking_control else None,
         "requestId": ev.request_id,
+        "settlesPrompt": ev.settles_prompt,
         "toolUseId": perm.get("toolUseId") if perm else None,
         "permissionRequest": perm,
         "usage": _usage(ev),
@@ -545,8 +567,7 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/whoami":
                 return self._json(self._whoami())
             if path in ("/api/sessions", "/api/sessions/"):
-                sessions = [session_to_json(s) for s in self.rc.sessions() if is_active(s)]
-                return self._json({"sessions": sessions})
+                return self._json({"sessions": [session_to_json(s) for s in self._active_sessions()]})
             m = _R_STREAM.match(path)
             if m:
                 return self._stream(m["sid"])
@@ -702,6 +723,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self._require_active(m["sid"])
                 self.rc.archive_session(m["sid"])
                 return self._json({"ok": True})
+            m = _R_PIN.match(path)
+            if m:
+                self._require_active(m["sid"])
+                pin = self.rc.unpin_session if body.get("pinned") is False else self.rc.pin_session
+                return self._json({"ok": True, "pinned": session_to_json(pin(m["sid"]))["pinned"]})
             self._json({"error": "not found", "status": 404}, status=404)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -709,6 +735,20 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(exc)
 
     # -- handlers ----------------------------------------------------------
+    def _active_sessions(self) -> list[dict]:
+        """Every active, connected session, newest first. The status filter is
+        what makes it every one: an unfiltered page is the account's 20 newest
+        sessions, archived ones included."""
+        out: list[dict] = []
+        cursor = None
+        for _ in range(LIST_MAX_PAGES):
+            page = self.rc.list_sessions(statuses="active", limit=LIST_PAGE, cursor=cursor)
+            out += [s for s in page.get("data") or [] if is_active(s)]
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+        return out
+
     def _whoami(self) -> dict:
         try:
             creds = load_credentials()
@@ -727,8 +767,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _info(self, sid: str) -> dict:
         """Plan usage + uncommitted git changes, asked of the worker (each a
         control round trip that leaves a request/response pair in the event
-        log). Best-effort per part: a refusal or timeout nulls that part."""
-        out: dict[str, Any] = {"usage": None, "diff": None}
+        log). Best-effort per part: a refusal or timeout nulls that part
+        (``diffPending``: the worker was still computing the diff — ask again)."""
+        out: dict[str, Any] = {"usage": None, "diff": None, "diffPending": False}
         try:
             usage = self.rc.get_usage(sid, timeout=10.0)
             limits = (usage.get("rate_limits") or {}).get("limits") or []
@@ -758,7 +799,9 @@ class _Handler(BaseHTTPRequestHandler):
                     "added": stats.get("linesAdded", 0),
                     "removed": stats.get("linesRemoved", 0),
                 }
-        except (ControlRejected, ControlTimeout):
+        except ControlRejected as exc:
+            out["diffPending"] = exc.error_code == "workspace_diff_pending"
+        except ControlTimeout:
             pass
         return out
 
@@ -798,13 +841,19 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"retry: 3000\n: connected\n\n")
         self.wfile.flush()
 
+        events = self.rc.stream_events(sid, from_sequence_num=from_seq, keepalives=True)
         try:
-            for ev in self.rc.stream_events(sid, from_sequence_num=from_seq):
-                data = json.dumps(event_to_json(ev))
-                out = ""
-                if ev.sequence_num is not None:
-                    out += f"id: {ev.sequence_num}\n"
-                out += f"data: {data}\n\n"
+            for ev in events:
+                if ev.type == RC.KEEPALIVE:
+                    # The API's heartbeat, passed on as a frame the app can hear
+                    # (EventSource hides comments, and drops a frame with no
+                    # data). Failing to write it is how a quiet session's
+                    # stream learns the app has gone.
+                    out = "event: ping\ndata: 1\n\n"
+                else:
+                    out = f"data: {json.dumps(event_to_json(ev))}\n\n"
+                    if ev.sequence_num is not None:
+                        out = f"id: {ev.sequence_num}\n{out}"
                 self.wfile.write(out.encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -813,6 +862,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._sse_error(exc.body[:500], exc.status)
         except Exception as exc:  # noqa: BLE001
             self._sse_error(repr(exc), 500)
+        finally:
+            events.close()  # hang up on the API now, not when the generator is collected
 
     def _sse_error(self, message: str, status: int) -> None:
         try:

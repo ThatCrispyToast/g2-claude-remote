@@ -37,27 +37,17 @@ export interface Notice {
 /** Every notice this build knows, newest first. */
 export const NOTICES: Notice[] = [
   {
-    id: '2026-10-28-bridge-login',
+    id: '2026-11-10-bridge-0-5',
     level: 'important',
     title: 'Update your bridge',
     body:
-      "The updated bridge keeps the rest of Claude Code's saved login intact " +
-      'when it refreshes the token. The old one could drop parts of it. The new ' +
-      'bridge also signs in on macOS, where the login lives in the Keychain, and ' +
-      'on organizations that require Trusted Devices. Restart it once with:',
-    command:
-      'uvx --refresh --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge',
-  },
-  {
-    id: '2026-10-16-ask-aside',
-    level: 'info',
-    title: 'New: ask on the side, and session info',
-    body:
-      'Ask aside (Compose menu, or the panel) asks a session a question without ' +
-      'interrupting it or adding to its transcript. Session info shows context ' +
-      'use, plan usage and uncommitted changes, and the menus now mark the ' +
-      "session's real mode and effort. These need the updated bridge, which also " +
-      'carries every earlier fix. Restart it once with:',
+      'An older bridge can leave sessions off this list. It saw only your 20 ' +
+      'newest, archived ones included, so a long-running session dropped out as ' +
+      'newer ones came and went. The updated bridge lists every active session, ' +
+      'puts your claude.ai pins first (Pin session is in the menu), clears a ' +
+      'prompt as soon as it is answered at the terminal, and lets the app notice ' +
+      'a stream that has gone quiet. It carries every earlier fix too. Restart ' +
+      'it once with:',
     command:
       'uvx --refresh --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge',
   },

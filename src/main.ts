@@ -16,7 +16,7 @@ import type { EvenAppBridge, EvenHubEvent } from '@evenrealities/even_hub_sdk'
 
 import { APP_TITLE, APP_TITLE_SHORT, HISTORY_WINDOW_BYTES, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES, LIVE_BODY_ROWS, POLL_MS, SETTINGS_KEY, SLASH_COMMANDS, currentBridge, isBridgeConfigured } from './config'
 import { markNoticeSeen, unseenNotices, type Notice } from './notices'
-import { GlassesDisplay, HUD, clip, hudSafe, liveTail, screen, type Layout } from './glasses'
+import { GlassesDisplay, HUD, clip, hudSafe, liveTail, type Layout } from './glasses'
 import { HttpBridgeClient } from './rc/client'
 import { BridgeError } from './rc/types'
 import type {
@@ -34,7 +34,7 @@ import type {
   WorkerState,
 } from './rc/types'
 import { EventLog } from './events/log'
-import { cleanProse, isQuestionRequest, modelShort, modeShort } from './events/format'
+import { cleanProse, isQuestionRequest, modelShort, modeShort, settlesPrompt } from './events/format'
 import {
   ASIDE_DICTATE,
   asideItems,
@@ -119,8 +119,17 @@ class App {
   private session: ActiveSession | null = null
   private readonly log = new EventLog()
   private lastSeq = 0
+  // Counts every open and every leave, so an open still waiting on the bridge
+  // can tell it was overtaken (a second tap, another row, Back) and stand down.
+  private openSeq = 0
   private streamClose: (() => void) | null = null
   private streamRetries = 0
+  private streamRetryTimer: ReturnType<typeof setTimeout> | null = null
+  // The open session's stream is down (the footer says so), and whether its
+  // retries ran out — then each poll the bridge answers tries it once more.
+  // Both outlive a reopen attempt; dropStream() forgets them with the session.
+  private streamDown = false
+  private streamLost = false
 
   // Session view: the body is scrolled natively by the firmware, not paged in
   // software. Two sub-modes:
@@ -227,6 +236,7 @@ class App {
   private noticesPresented = false
 
   private pollTimer: ReturnType<typeof setInterval> | null = null
+  private polling = false
 
   // ── boot ───────────────────────────────────────────────────────────────
   async boot(root: HTMLElement): Promise<void> {
@@ -240,6 +250,7 @@ class App {
       onSetMode: (m) => void this.applyMode(m),
       onSetEffort: (e) => void this.applyEffort(e),
       onArchive: () => void this.archive(),
+      onSetPinned: (pinned) => void this.setPinned(pinned),
       onAnswerPermission: (d) => void this.answerPermission(d),
       onPickDialogOption: (qIndex, label) => this.recordPick(qIndex, label),
       onCancelDialog: () => void this.submitQuestion('cancelled'),
@@ -454,8 +465,11 @@ class App {
     // glasses every reorder is a list rebuild that yanks the highlight to the
     // top mid-scroll, and a tap can land on a different session than the one
     // the wearer picked. Sort by title (id tiebreak) so rows hold still; the
-    // status dot already says which sessions are busy.
-    list.sort((a, b) => a.title.localeCompare(b.title) || a.id.localeCompare(b.id))
+    // status dot already says which sessions are busy. Pins lead, as they do
+    // in claude.ai's sidebar: a pin moves only when the wearer moves it.
+    list.sort(
+      (a, b) => Number(!!b.pinned) - Number(!!a.pinned) || a.title.localeCompare(b.title) || a.id.localeCompare(b.id),
+    )
     this.sessions = list
     // The firmware owns the list highlight now, so no cursor to clamp here.
     // Keep the open session's metadata fresh, and detect if it went inactive.
@@ -469,11 +483,30 @@ class App {
     this.panel.setSessions(this.sessions, this.sid)
   }
 
+  /** One poll at a time: a fetch to a bridge that has dropped off the network
+   *  can hang far longer than POLL_MS, and the ticks would pile up behind it. */
   private async poll(): Promise<void> {
-    // Only the list and an open session need the periodic active-list refresh.
-    if (this.state === 'error') return
+    if (this.polling) return
+    this.polling = true
+    try {
+      await this.pollOnce()
+    } finally {
+      this.polling = false
+    }
+  }
+
+  private async pollOnce(): Promise<void> {
+    // The connection screens: a bridge that couldn't be reached may be back (it
+    // was started after the app, the phone found its network again), so try
+    // again without waiting for a tap. Any other error stays up until one.
+    if (this.state === 'error' || this.state === 'setup') {
+      if (this.connBridge === 'down') await this.checkAuthAndLoad()
+      return
+    }
+    if (this.state === 'boot') return // the first connect is still under way
     try {
       await this.refreshSessions()
+      this.setConn('ok')
       // If the session we're viewing/steering dropped out of the active set,
       // it was archived or died — leave it (we never control inactive sessions).
       if (this.sid && !this.sessions.some((s) => s.id === this.sid) && this.state !== 'list') {
@@ -493,26 +526,44 @@ class App {
       ) {
         this.dropAllPrompts('Prompt resolved elsewhere.')
       }
+      // A stream given up on comes back with the bridge: it just answered,
+      // and still lists the session. (Not while an attempt is still dialling.)
+      if (this.streamLost && !this.streamClose && this.sid) this.openStream()
       if (this.state === 'list') this.render()
     } catch {
-      /* transient; next tick retries */
+      // Transient; the next tick retries. What's on screen is stale meanwhile,
+      // and says so.
+      this.setConn('down')
     }
+  }
+
+  /** Note whether the bridge answered the last poll. Shown as it changes: the
+   *  panel's chip, the session list's header, the session view's footer. */
+  private setConn(bridge: 'ok' | 'down'): void {
+    if (this.connBridge === bridge) return
+    this.connBridge = bridge
+    this.render()
   }
 
   // ── open / close a session ─────────────────────────────────────────────
   private async openSession(sid: string): Promise<void> {
-    this.closeStream()
+    const run = ++this.openSeq
+    this.dropStream()
     this.sid = sid
     this.log.clear()
     this.lastSeq = 0
-    this.streamRetries = 0
     this.resetSessionView()
     this.resetPrompts()
     this.resetSessionExtras()
     this.session = this.sessions.find((s) => s.id === sid) ?? null
     try {
-      this.session = await this.rc.getSession(sid) // 409s if not active
+      const session = await this.rc.getSession(sid) // 409s if not active
       const history = await this.rc.getHistory(sid) // the NEWEST events, oldest→newest
+      // Overtaken while the bridge answered — a second tap, another row, Back.
+      // The newer open (or the list) owns the log, the stream and the screen;
+      // carrying on would pour this session's events into them.
+      if (run !== this.openSeq) return
+      this.session = session
       for (const ev of history) {
         this.log.append(ev)
         this.noteEvent(ev)
@@ -531,14 +582,16 @@ class App {
       this.openStream()
       this.go('session')
     } catch (e) {
+      if (run !== this.openSeq) return
       if (e instanceof BridgeError && e.isInactive) {
         this.panel.setToast('That session is no longer active.')
-        await this.refreshSessions()
-        this.backToList()
+        await this.leaveInactive()
       } else {
         // Non-inactive failure (network/500): drop the half-open session identity
-        // so the list doesn't keep showing this session as "open".
-        this.closeStream()
+        // so the list doesn't keep showing this session as "open". A bridge that
+        // couldn't be reached is retried by the poll (see pollOnce).
+        if (e instanceof BridgeError && e.status === 0) this.setConn('down')
+        this.dropStream()
         this.sid = null
         this.session = null
         this.log.clear()
@@ -548,7 +601,10 @@ class App {
     }
   }
 
+  /** (Re)open the open session's stream from the last event seen. Any stream
+   *  still up is closed first, so two can never feed one log. */
   private openStream(): void {
+    this.closeStream()
     if (!this.sid) return
     const sid = this.sid
     this.streamClose = this.rc.streamEvents(sid, this.lastSeq, {
@@ -556,13 +612,43 @@ class App {
       onError: (err) => this.onStreamError(err),
       onOpen: () => {
         this.streamRetries = 0
+        this.streamLost = false
+        this.setStreamDown(false)
       },
     })
   }
 
+  /** Close the stream and call off any pending reopen. */
   private closeStream(): void {
     this.streamClose?.()
     this.streamClose = null
+    if (this.streamRetryTimer) clearTimeout(this.streamRetryTimer)
+    this.streamRetryTimer = null
+  }
+
+  /** Close the stream for good (the session is being opened afresh, or left). */
+  private dropStream(): void {
+    this.closeStream()
+    this.streamRetries = 0
+    this.streamDown = false
+    this.streamLost = false
+  }
+
+  /** The open session answered 409: it was archived or its worker is gone.
+   *  Back to the list — refreshed, if the bridge will, so it's no longer there. */
+  private async leaveInactive(): Promise<void> {
+    try {
+      await this.refreshSessions()
+    } catch {
+      /* the poll refreshes it soon enough */
+    }
+    this.backToList()
+  }
+
+  private setStreamDown(down: boolean): void {
+    if (this.streamDown === down) return
+    this.streamDown = down
+    if (this.state === 'session') this.render() // the footer's live / offline tag
   }
 
   private onSessionEvent(ev: RcEvent): void {
@@ -574,9 +660,10 @@ class App {
     this.noteEvent(ev)
     this.panel.appendEvent(ev)
     // Prompt-resolution signals: an answer echoed back through the log (ours or
-    // another controller's) retires that prompt; a turn-ending result retires
+    // another controller's) retires that prompt, and so does the worker
+    // withdrawing it (answered at the terminal); a turn-ending result retires
     // them all (the CLI is no longer waiting on anything).
-    if (ev.type === 'control_response' && ev.requestId) this.resolvePromptRemotely(ev.requestId)
+    if (settlesPrompt(ev) && ev.requestId) this.resolvePromptRemotely(ev.requestId)
     if (ev.type === 'result') this.dropAllPrompts('Turn ended.')
     if (ev.type === 'conversation_reset') this.onConversationReset()
     // A fresh blocking control — a QUESTION (pick an option) or a
@@ -652,30 +739,35 @@ class App {
   private onStreamError(err: BridgeError): void {
     if (err.isInactive) {
       this.panel.setToast('Session ended (no longer active).')
-      void this.refreshSessions().then(() => this.backToList())
+      void this.leaveInactive()
       return
     }
-    // Recoverable: the bridge closed the stream after an error frame, so it won't
-    // reconnect itself. Reopen from lastSeq a bounded number of times.
+    // Recoverable: the stream closed itself (the bridge's error frame, a refused
+    // open, silence), so nothing reconnects it. Reopen from lastSeq a bounded
+    // number of times; past that it is lost until the bridge answers a poll
+    // again, which tries it once more each time (see pollOnce).
+    this.streamClose = null
+    this.setStreamDown(true)
     if (this.streamRetries >= STREAM_MAX_RETRIES) {
-      this.panel.setToast(`Stream lost: ${err.message}`)
+      if (!this.streamLost) this.panel.setToast(`Stream lost: ${err.message}`)
+      this.streamLost = true
       return
     }
     this.streamRetries += 1
     this.panel.setToast(`Reconnecting stream… (${this.streamRetries})`)
-    setTimeout(() => {
-      // Only if we're still viewing the same, still-active session.
-      if (this.sid && this.state !== 'list' && this.sessions.some((s) => s.id === this.sid)) {
-        this.closeStream()
-        this.openStream()
-      }
+    // closeStream() clears this timer, so it only ever fires for the session
+    // (and the open) it was set for.
+    this.streamRetryTimer = setTimeout(() => {
+      this.streamRetryTimer = null
+      this.openStream()
     }, STREAM_RETRY_DELAY_MS)
   }
 
   private backToList(): void {
     this.teardownVoice() // an involuntary exit must never leave the mic hot
     this.pendingSend = null // drop any unconfirmed send
-    this.closeStream()
+    this.openSeq++ // an open still in flight must not bring its session back
+    this.dropStream()
     this.sid = null
     this.session = null
     this.log.clear()
@@ -763,6 +855,19 @@ class App {
     }
   }
 
+  /** Pin or unpin the open session — claude.ai/code's pin, so it moves there
+   *  too. Pins lead the session list; the refresh re-sorts it. */
+  private async setPinned(pinned: boolean): Promise<void> {
+    if (!this.sid) return
+    try {
+      const now = await this.rc.setPinned(this.sid, pinned)
+      this.panel.setToast(now ? 'Pinned.' : 'Unpinned.')
+      await this.refreshSessions()
+    } catch (e) {
+      this.onActionError(e)
+    }
+  }
+
   // ── side questions ("Ask aside") ────────────────────────────────────────
   // Answered from the session's conversation without interrupting it or
   // entering its transcript — one model call, no confirm step needed.
@@ -845,23 +950,33 @@ class App {
   }
 
   private async answerPermission(decision: Decision): Promise<void> {
-    if (!this.sid || !this.permEvent?.requestId) return
     const ev = this.permEvent
-    this.answeredIds.add(ev.requestId!) // a replay must never resurrect it
+    const id = ev?.requestId
+    // answeredIds is also the "already on its way" mark: a second tap while the
+    // first answer is in flight must not send it twice.
+    if (!this.sid || !ev || !id || this.answeredIds.has(id)) return
+    this.answeredIds.add(id) // …and a replay must never resurrect it
     try {
       await this.rc.answerPermission(this.sid, {
-        requestId: ev.requestId!,
+        requestId: id,
         toolUseId: ev.toolUseId,
         decision,
         updatedInput: decision === 'allow' ? ev.permissionRequest?.input ?? undefined : undefined,
       })
       this.panel.setToast(decision === 'allow' ? 'Allowed.' : 'Denied.')
     } catch (e) {
-      this.onActionError(e)
-    } finally {
-      this.retirePrompt()
-      if (this.state === 'permission') this.go('session') // presents any next prompt
+      this.onAnswerError(e, id)
+      return
     }
+    if (this.retirePrompt(id) && this.state === 'permission') this.go('session') // presents any next prompt
+  }
+
+  /** An answer didn't get through. The session is still blocked on the prompt,
+   *  so it stays armed and on screen for another try — leaving was the only
+   *  sign of success the glasses give. (A session gone inactive leaves anyway.) */
+  private onAnswerError(e: unknown, requestId: string): void {
+    this.onActionError(e)
+    if (!(e instanceof BridgeError && e.isInactive)) this.answeredIds.delete(requestId)
   }
 
   // ── the blocking-prompt queue ────────────────────────────────────────────
@@ -952,21 +1067,23 @@ class App {
     this.goLiveSession() // the snooze guard in go() keeps it from auto-presenting
   }
 
-  /** Retire the armed prompt after WE answered/dismissed it; arm any next one
-   *  (which defers — the caller's go('session') presents it). */
-  private retirePrompt(): void {
-    const id = this.permEvent?.requestId
-    if (id) {
-      this.answeredIds.add(id)
-      this.prompts = this.prompts.filter((p) => p.requestId !== id)
-    }
+  /** Retire prompt `id` after WE answered/dismissed it. Returns whether it was
+   *  still the armed one — then its screen state is cleared and any next prompt
+   *  armed (which defers; the caller's go('session') presents it). If something
+   *  else retired it while the answer was in flight (the turn ended), whatever
+   *  is armed now is another prompt and is left alone. */
+  private retirePrompt(id: string): boolean {
+    this.answeredIds.add(id)
+    this.prompts = this.prompts.filter((p) => p.requestId !== id)
+    if (this.permEvent?.requestId !== id) return false
     this.clearPromptState()
     if (this.prompts.length) this.armPrompt()
+    return true
   }
 
-  /** A control_response for `requestId` appeared in the stream — if that prompt
-   *  is still queued here, someone else answered it (another controller, the
-   *  terminal): retire it without sending anything. */
+  /** The stream says prompt `requestId` is over — if it is still queued here,
+   *  someone else answered it (another controller) or the worker withdrew it
+   *  (answered at the terminal): retire it without sending anything. */
   private resolvePromptRemotely(requestId: string): void {
     if (this.answeredIds.has(requestId)) return // our own answer echoing back
     if (!this.prompts.some((p) => p.requestId === requestId)) return
@@ -1052,12 +1169,14 @@ class App {
   /** Send the answer (or a cancel) back through the bridge's /dialog route. */
   private async submitQuestion(status: 'completed' | 'cancelled'): Promise<void> {
     const ev = this.permEvent
-    if (!this.sid || !ev?.requestId) {
+    const id = ev?.requestId
+    if (!this.sid || !ev || !id) {
       this.clearPromptState()
       if (this.state === 'question') this.go('session')
       return
     }
-    this.answeredIds.add(ev.requestId) // a replay must never resurrect it
+    if (this.answeredIds.has(id)) return // already on its way (see answerPermission)
+    this.answeredIds.add(id) // …and a replay must never resurrect it
     const subtype = ev.permissionRequest?.subtype ?? ev.blockingSubtype ?? 'request_user_dialog'
     const answers: DialogAnswer[] = this.dialogQuestions.map((q, i) => ({
       header: q.header,
@@ -1066,7 +1185,7 @@ class App {
     }))
     try {
       await this.rc.answerDialog(this.sid, {
-        requestId: ev.requestId,
+        requestId: id,
         subtype,
         dialogKind: ev.permissionRequest?.dialogKind ?? null,
         // AskUserQuestion is a `can_use_tool`; the bridge answers it via the
@@ -1081,22 +1200,27 @@ class App {
         status === 'completed' ? `Answered: ${clip(answers[0]?.options[0] ?? '', 30)}` : 'Question dismissed.',
       )
     } catch (e) {
-      this.onActionError(e)
-    } finally {
-      const completed = status === 'completed'
-      this.retirePrompt()
-      if (this.state === 'question') {
-        // Either path presents the next queued prompt, if there is one.
-        if (completed) this.goLiveSession() // answered → watch it continue
-        else this.go('session')
+      this.onAnswerError(e, id)
+      // Still unanswered: start its picks over, so the next one re-submits.
+      if (this.permEvent?.requestId === id) {
+        this.qIndex = 0
+        this.qPicks = []
+        this.panel.setDialog(this.dialogQuestions, this.qPicks)
+        if (this.state === 'question') this.render()
       }
+      return
+    }
+    if (this.retirePrompt(id) && this.state === 'question') {
+      // Either path presents the next queued prompt, if there is one.
+      if (status === 'completed') this.goLiveSession() // answered → watch it continue
+      else this.go('session')
     }
   }
 
   private onActionError(e: unknown): void {
     if (e instanceof BridgeError && e.isInactive) {
       this.panel.setToast('Session is no longer active.')
-      void this.refreshSessions().then(() => this.backToList())
+      void this.leaveInactive()
     } else {
       this.panel.setToast(`Error: ${(e as Error).message}`)
     }
@@ -1532,6 +1656,7 @@ class App {
       // A set-aside (or otherwise deferred) blocking prompt leads the menu so the
       // wearer can reopen it. permEvent is set iff one is armed but not showing.
       pendingPrompt: this.permEvent ? this.pendingPromptLabel(this.permEvent) : null,
+      pinned: this.session?.pinned,
     })
   }
 
@@ -1562,6 +1687,10 @@ class App {
         break
       case 'submenu':
         this.openSubmenu(action.menu)
+        break
+      case 'pin':
+        void this.setPinned(action.pin)
+        this.go('session')
         break
       case 'archive':
         // Two-tap confirm. Don't re-render (relabeling would rebuild the native
@@ -1686,13 +1815,17 @@ class App {
       case 'list':
         if (this.sessions.length === 0) {
           return {
-            kind: 'text',
-            content: screen({ header: `${APP_TITLE} ${HUD.SEP} sessions`, body: 'No active sessions.', footer: 'dbl-tap to exit' }),
+            kind: 'scroll',
+            header: `${APP_TITLE} ${HUD.SEP} sessions`,
+            body: this.connBridge === 'down' ? 'The bridge stopped answering.' : 'No active sessions.',
+            footer: 'dbl-tap = exit',
           }
         }
         return {
           kind: 'list',
-          header: `${APP_TITLE_SHORT} ${HUD.SEP} ${this.sessions.length} active ${HUD.SEP} tap open ${HUD.SEP} dbl exit`,
+          // The header is its own container, so going offline (the bridge
+          // stopped answering the poll; the rows are stale) costs no rebuild.
+          header: `${APP_TITLE_SHORT} ${HUD.SEP} ${this.connBridge === 'down' ? `${HUD.ATTN} offline` : `${this.sessions.length} active`} ${HUD.SEP} tap open ${HUD.SEP} dbl exit`,
           items: this.listRows(),
         }
       case 'compose':
@@ -1755,9 +1888,13 @@ class App {
           footer: `tap = retry ${HUD.SEP} dbl-tap = exit`,
         }
       case 'error':
+        // Pinned header + footer, like setup: as one full-screen text block the
+        // message pushed the retry hint below the fold.
         return {
-          kind: 'text',
-          content: screen({ header: `${APP_TITLE} ${HUD.SEP} error`, body: this.errorMsg, footer: `tap retry ${HUD.SEP} dbl-tap exit` }),
+          kind: 'scroll',
+          header: `${APP_TITLE} ${HUD.SEP} error`,
+          body: hudSafe(this.errorMsg),
+          footer: `tap = retry ${HUD.SEP} dbl-tap = exit`,
         }
       case 'boot':
       default:
@@ -1766,7 +1903,10 @@ class App {
   }
 
   private listRows(): string[] {
-    return this.sessions.map((s) => `${dot(s.workerStatus)} ${clip(s.title, 32, HUD.ELL)} ${HUD.SEP} ${short(s.workerStatus)}`)
+    // `*` marks a pin (claude.ai's own word for one is "starred").
+    return this.sessions.map(
+      (s) => `${dot(s.workerStatus)} ${s.pinned ? '* ' : ''}${clip(s.title, 32, HUD.ELL)} ${HUD.SEP} ${short(s.workerStatus)}`,
+    )
   }
 
   /** The session header: dot, title, then the live settings — model, effort,
@@ -1803,8 +1943,12 @@ class App {
       }
     }
     // The tail view is "live" while the session is running (auto-following) and
-    // just "latest" when idle — same view, honest label.
-    const tailTag = this.isRunning(s) ? `${HUD.RUN} live` : `${HUD.IDLE} latest`
+    // just "latest" when idle — same view, honest label. With the stream down,
+    // or the bridge not answering the poll (which shows sooner: the browser
+    // spends a while redialling a stream before it reports one lost), it is
+    // neither: what's on screen is as of when it dropped.
+    const offline = this.streamDown || this.connBridge === 'down'
+    const tailTag = offline ? `${HUD.ATTN} offline` : this.isRunning(s) ? `${HUD.RUN} live` : `${HUD.IDLE} latest`
     return {
       kind: 'scroll',
       header,
@@ -1914,7 +2058,7 @@ class App {
    *  self-contained (glasses.ts byte-clamps the body under the firmware cap). */
   private noticeLayout(): Layout {
     const n = this.noticeQueue[0]
-    if (!n) return { kind: 'text', content: screen({ header: `${HUD.ATTN} Notice`, body: '(none)', footer: 'tap = back' }) }
+    if (!n) return { kind: 'scroll', header: `${HUD.ATTN} Notice`, body: '(none)', footer: 'tap = back' }
     const body = [n.title, n.body, n.command].filter(Boolean).join('\n\n')
     return {
       kind: 'scroll',
@@ -1980,6 +2124,8 @@ function infoLines(info: SessionInfo | null, loading: boolean, error: string | n
   if (info.diff) {
     const d = info.diff
     lines.push(d.files ? `changes ${d.files} file${d.files > 1 ? 's' : ''} +${d.added} -${d.removed}` : 'no uncommitted changes')
+  } else if (info.diffPending) {
+    lines.push('changes: still counting, tap to ask again')
   }
   if (loading) lines.push('(refreshing...)')
   return lines
@@ -2020,15 +2166,15 @@ function promptGist(ev: RcEvent): string {
 /**
  * The tail-most blocking control in `events` that nothing after it resolves.
  * An answered control_request is followed by its control_response (any
- * controller's), and a finished turn by its result — so whatever survives the
- * scan is what the session is blocked on right now (callers still cross-check
- * the session's own blocked status).
+ * controller's), a withdrawn one by the worker's cancel, and a finished turn
+ * by its result — so whatever survives the scan is what the session is blocked
+ * on right now (callers still cross-check the session's own blocked status).
  */
 function findPendingControl(events: RcEvent[]): RcEvent | null {
   let pending: RcEvent | null = null
   for (const ev of events) {
     if (ev.isBlockingControl && ev.permissionRequest && ev.requestId) pending = ev
-    else if (ev.type === 'control_response' && ev.requestId && pending?.requestId === ev.requestId) pending = null
+    else if (settlesPrompt(ev) && ev.requestId && pending?.requestId === ev.requestId) pending = null
     else if (ev.type === 'result' || ev.type === 'conversation_reset') pending = null
   }
   return pending

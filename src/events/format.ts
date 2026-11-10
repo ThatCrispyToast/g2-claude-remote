@@ -287,6 +287,11 @@ export function renderEventParts(e: RcEvent): EventParts {
     case 'conversation_reset':
       return { text: `${HUD.SYS} conversation cleared`, tools: [] }
 
+    // The stream's catch-up after a long gap left some events out: say so
+    // where they would have been, rather than read as if nothing happened.
+    case 'catch_up_truncated':
+      return { text: `${HUD.SYS} some earlier events were skipped`, tools: [] }
+
     case 'control_request': {
       // A blocking control — main.ts routes it to the permission or question
       // screen, but it should still read in the log so scrollback shows why the
@@ -315,6 +320,15 @@ export function isQuestionRequest(e: RcEvent): boolean {
   if (p?.questions && p.questions.length > 0) return true
   const tool = p?.toolName ?? ''
   return tool === 'AskUserQuestion'
+}
+
+/** Whether `e` ends the blocking prompt its `requestId` names. The bridge says
+ *  so since 0.5.0: a controller's answer, or the worker withdrawing the prompt
+ *  (it was answered at the terminal). An older bridge passes only the answers
+ *  through, as control_responses. Shared by the stream handler and the
+ *  open-on-a-pending-prompt scan in main.ts. */
+export function settlesPrompt(e: RcEvent): boolean {
+  return e.settlesPrompt ?? e.type === 'control_response'
 }
 
 /** `claude-opus-5-5` → `opus-5-5` (a dated id loses its date); null → '?'. */

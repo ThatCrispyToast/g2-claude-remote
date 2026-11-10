@@ -21,6 +21,14 @@ import {
   type WhoAmI,
 } from './types'
 
+// A request to a bridge that has dropped off the network can hang for minutes
+// (fetch has no timeout of its own), holding up the poll and leaving an answer
+// "on its way" forever. The bridge's own upstream calls give up after 30 s, so
+// past this it isn't going to answer. The worker queries wait longer by design.
+const REQUEST_TIMEOUT_MS = 45_000
+const INFO_TIMEOUT_MS = 75_000 // plan usage + diff: up to ~25 s of worker round trips
+const ASIDE_TIMEOUT_MS = 170_000 // the bridge waits up to 150 s for the answer
+
 export class HttpBridgeClient implements BridgeClient {
   constructor(
     private readonly base: string,
@@ -34,15 +42,20 @@ export class HttpBridgeClient implements BridgeClient {
     return h
   }
 
-  private async req<T>(path: string, init?: RequestInit): Promise<T> {
+  private async req<T>(path: string, init?: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
+    const abort = new AbortController()
+    const timer = setTimeout(() => abort.abort(), timeoutMs)
     let res: Response
+    let text: string
     try {
-      res = await fetch(this.base + path, init)
+      res = await fetch(this.base + path, { ...init, signal: abort.signal })
+      text = await res.text()
     } catch (e) {
-      // Network-level failure (bridge down / unreachable / CORS).
-      throw new BridgeError(`bridge unreachable: ${(e as Error).message}`, 0)
+      // Network-level failure (bridge down / unreachable / CORS), or no answer.
+      throw new BridgeError(abort.signal.aborted ? 'bridge did not answer in time' : `bridge unreachable: ${(e as Error).message}`, 0)
+    } finally {
+      clearTimeout(timer)
     }
-    const text = await res.text()
     let data: unknown = null
     try {
       data = text ? JSON.parse(text) : null
@@ -57,12 +70,8 @@ export class HttpBridgeClient implements BridgeClient {
     return data as T
   }
 
-  private post<T = { ok: boolean }>(path: string, body?: unknown): Promise<T> {
-    return this.req<T>(path, {
-      method: 'POST',
-      headers: this.headers(true),
-      body: JSON.stringify(body ?? {}),
-    })
+  private post<T = { ok: boolean }>(path: string, body?: unknown, timeoutMs?: number): Promise<T> {
+    return this.req<T>(path, { method: 'POST', headers: this.headers(true), body: JSON.stringify(body ?? {}) }, timeoutMs)
   }
 
   private sid(sid: string): string {
@@ -162,17 +171,23 @@ export class HttpBridgeClient implements BridgeClient {
     await this.post(`/api/sessions/${this.sid(sid)}/archive`, {})
   }
 
+  async setPinned(sid: string, pinned: boolean): Promise<boolean> {
+    const res = await this.post<{ pinned?: boolean }>(`/api/sessions/${this.sid(sid)}/pin`, { pinned })
+    return res.pinned ?? pinned
+  }
+
   // -- worker queries (bridge 0.4.0+; an older bridge answers 404) ---------
   async ask(sid: string, question: string, history: AsideTurn[]): Promise<string | null> {
-    const { answer } = await this.post<{ answer: string | null }>(`/api/sessions/${this.sid(sid)}/aside`, {
-      question,
-      history,
-    })
+    const { answer } = await this.post<{ answer: string | null }>(
+      `/api/sessions/${this.sid(sid)}/aside`,
+      { question, history },
+      ASIDE_TIMEOUT_MS,
+    )
     return answer ?? null
   }
 
   info(sid: string): Promise<SessionInfo> {
-    return this.req<SessionInfo>(`/api/sessions/${this.sid(sid)}/info`, { headers: this.headers() })
+    return this.req<SessionInfo>(`/api/sessions/${this.sid(sid)}/info`, { headers: this.headers() }, INFO_TIMEOUT_MS)
   }
 
   async stopTask(sid: string, taskId: string): Promise<void> {

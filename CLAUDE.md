@@ -15,7 +15,7 @@ at build time.
 
 1. **The bridge adds no Anthropic code.** It reuses `claude-rc-api`'s
    `RemoteControlClient` (checked out at `../claude-rc-api`; the bridge needs
-   ≥ 0.4.0 and exits with a `--refresh` hint on an older one) and layers on
+   ≥ 0.5.1 and exits with a `--refresh` hint on an older one) and layers on
    only the active+connected filter, a bearer/CORS guard, and the JSON shaping
    for the app. Session control, prompt answers (`respond_permission` /
    `answer_question`), side questions, streaming, and OAuth (including
@@ -24,7 +24,11 @@ at build time.
 2. **Only-active, always.** Surface and steer only sessions that are `active`
    **and** `connected`. The bridge filters server-side and every control action
    re-checks; a `409` (`BridgeError.isInactive`) means "gone" → toast + back to
-   the list. Never act on an inactive session.
+   the list. Never act on an inactive session. The list call must ask for
+   `statuses="active"`: an unfiltered page is the account's 20 newest sessions,
+   ARCHIVED INCLUDED, so until bridge 0.5.0 a long-running session fell off the
+   glasses once enough newer ones had been archived (found live 2026-11-10: 6
+   of 7 listed).
 3. **Lean on the firmware — don't fight it.** The HUD uses the SDK's *native*
    widgets (`glasses.ts`), modeled on the `nickustinov/demo-app-g2` reference
    app. Never `rebuildPageContainer` while a body is being scrolled — it resets
@@ -80,6 +84,11 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
 - **Bump `version` in both `package.json` and `app.json`** (kept identical) on
   every code/manifest change — `pack` stamps it into the artifact name, and
   `scripts/check-versions.mjs` fails the pack if the two drift.
+- **`MODELS` in `config.ts` is the only model list** (the bridge passes ids
+  straight through). Refresh it when a model ships: one row per tier, ids
+  checked against live sessions. A session on a model the list lacks still gets
+  its own marked row (HUD) / option (panel), so a stale list never shows
+  nothing, or the wrong model, as current.
 - **Every pack is a distribution pack.** `pack` packs the tracked `app.json`
   verbatim, and the build resolves NO `VITE_*` vars (`envPrefix` is swapped to a
   never-matching prefix for `vite build` — see vite.config.ts), so `.env.local`
@@ -119,7 +128,8 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   server with `VITE_BRIDGE_URL=http://localhost:8791 VITE_BRIDGE_TOKEN=x` (process
   env beats `.env.local`). A tap on a real session list can fire into a live
   session, and `assets/store/` must never show real session names — the repo is
-  public. The store shots are staged this way: `--question` blocks
+  public. The mock pins and unpins, and pings like the real bridge. The store
+  shots are staged this way: `--question` blocks
   payment-service on an AskUserQuestion instead of a Bash permission, and a long
   `VITE_QUICK_SENDS` text stages the confirm screen.
 - **No Even App (plain browser) = panel-only mode** — the SDK's bridge object
@@ -215,10 +225,18 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   resolved from `currentSelectItemName` against `GlassesDisplay.listItems`. Keep
   both paths when touching list code — this bug class was reproduced live
   (tapping "Dictate" opened the Commands submenu).
-- **The session list is sorted by title, client-side.** The bridge orders by
-  recent activity, which churns every poll — each reorder is a rebuild that
-  yanks the highlight to the top and re-routes the next tap. Don't surface the
-  bridge's order on a native list.
+- **The session list is sorted pins-first, then by title, client-side.** The
+  bridge orders by recent activity, which churns every poll — each reorder is a
+  rebuild that yanks the highlight to the top and re-routes the next tap. Don't
+  surface the bridge's order on a native list. A pin (claude.ai/code's, the
+  `ui:pinned` tag; `*` on a HUD row, `pinned` on a panel row) moves only when
+  someone moves it, so it is as stable as a title. Compose → Pin / Unpin and
+  the panel's button set it through `POST …/pin`; both show only when the
+  bridge reports `pinned` (0.5.0+).
+- **Message screens are `scroll` layouts, not one text block.** Setup, error,
+  and the empty list pin their title and gesture hint in the header / footer
+  strips. As a single full-screen container (until 1.9.0) the error screen's
+  divider rules wrapped and pushed `tap retry` below the fold.
 - **Exactly one `isEventCapture:1` container per page** (the scroll/tap target).
 - **Root-page exit MUST be `shutDownPageContainer(1)`** (the system exit-confirm
   dialog) — Even Hub review REJECTS a mode-0 immediate exit on the root page
@@ -261,11 +279,13 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   requests: the bridge fetches history `desc` (newest events) so the stream
   resume cursor is never ancient; `EventLog.append` seq-dedupe gates all UI
   side-effects; prompts live in a FIFO (`prompts[]` + `answeredIds`) and retire
-  on a matching `control_response` in the stream (our own answers echo back),
-  on the turn's `result`, or via the poll safety-net when the session leaves
-  `requires_action`. **An assistant event after a `control_request` does NOT
-  mean it was answered.** A prompt presents immediately only while passively
-  watching the live tail; otherwise it defers (footer `! needs you`) and shows
+  on an event that settles them (`settlesPrompt()` in `events/format.ts`: a
+  controller's `control_response`, ours included, or the worker's
+  `control_cancel_request` when it was answered at the terminal — the bridge
+  flags both as `settlesPrompt` since 0.5.0), on the turn's `result`, or via
+  the poll safety-net when the session leaves `requires_action`. **An assistant
+  event after a `control_request` does NOT mean it was answered.** A prompt
+  presents immediately only while passively watching the live tail; otherwise it defers (footer `! needs you`) and shows
   on return to the session view — except a return the wearer didn't make.
   Being backgrounded mid-dictation lands via `leaveVoiceQuietly()` (render,
   not `go`), and a voice error doesn't leave the voice screen at all (see
@@ -273,6 +293,13 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   prompt (reproduced: it allowed a Bash `rm -rf`). A blocked session opens
   straight onto its prompt (`findPendingControl` + `workerStatus ===
   'requires_action'`).
+- **An answer retires its OWN prompt, and only once it got through.**
+  `answeredIds` doubles as the in-flight mark, so a second tap while the POST
+  is out sends nothing; `retirePrompt(id)` leaves alone whatever else got armed
+  meanwhile. (Before 1.9.0 it retired "the armed prompt": with two queued, a
+  second tap dropped the next one unanswered and the session sat blocked.) A
+  failed answer un-marks the id and leaves the prompt on screen — on the
+  glasses, leaving that screen is the only sign an answer landed.
 - **Set-aside = a STICKY defer (`promptSnoozed`).** Double-tap calls
   `snoozePrompt()`: marks the prompt `promptDeferred + promptSnoozed` and drops
   to the live tail without answering. The snooze flag is the one difference
@@ -284,6 +311,37 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   normally while set aside. Because the Compose list varies with pending state,
   it is snapshotted into `composeItems` on entry so a mid-menu stream event
   can't desync the firmware row → action map.
+
+## Streams and connection loss
+
+- **Liveness is a chain, and each link redials on silence.** The API sends a
+  keepalive about every 15 s; claude-rc-api redials an upstream stream silent
+  for 45 s; the bridge passes each keepalive on as an `event: ping` frame (with
+  data — EventSource hides comments and drops data-less frames); and
+  `rc/stream.ts` gives up on a stream that has pinged and then goes quiet for
+  `STREAM_SILENCE_MS`. An older bridge never pings, so its streams are never
+  judged by silence. The ping is also how the bridge frees a stream the app
+  abandoned: without it each one held a thread and an upstream connection
+  until the session's next event (measured: 3 abandoned streams, 3 threads,
+  still there 45 s later).
+- **Three ways a stream dies without the browser reconnecting it**, all routed
+  to `onStreamError`: the bridge's `event: error` frame, a refused open (a
+  non-200 leaves the EventSource CLOSED — silently, before 1.9.0), and silence.
+  It reopens from `lastSeq` up to `STREAM_MAX_RETRIES` times; after that the
+  stream is `streamLost` and each poll the bridge answers tries once more, so
+  a long outage heals itself. Meanwhile the session footer reads `! offline`
+  instead of `● live` (also as soon as a poll fails), and the list header says
+  the same.
+- **`openStream()` closes any stream first, and `openSession` checks
+  `openSeq` after its awaits.** A second tap (or another row, or Back) while a
+  session was still loading used to leave two opens running: the first poured
+  its history into the second's log, where the seq-dedupe then swallowed the
+  right session's events, and its stream was never closed.
+- **The connection screens retry themselves.** With the bridge down
+  (`connBridge === 'down'`), the poll re-runs `checkAuthAndLoad` from `setup` /
+  `error`; any other error waits for a tap. One poll at a time (`polling`), and
+  every bridge request has a timeout (`rc/client.ts`) — fetch has none, and a
+  bridge that dropped off the network hung them for minutes.
 
 ## Side questions ("Ask aside")
 
@@ -414,7 +472,10 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
 
 - **Baked and once — both are deliberate.** `src/notices.ts` holds the app's
   only "important notice" channel (first use: the 1.7.x card telling wearers to
-  `uvx --refresh` their bridge for the ≥2.1.220 send fix, rule 4). Ship a
+  `uvx --refresh` their bridge for the ≥2.1.220 send fix, rule 4). A bridge
+  update carries every earlier fix, so a new "update your bridge" notice
+  REPLACES the older ones rather than stacking a second card with the same
+  command (1.9.0 ships one). Ship a
   notice by appending to the baked `NOTICES` list + a version bump — there is
   NO fetch and NO bridge route, so never add a server side to this. On the
   panel it's a slim dismissible card above the session list (accent wash for

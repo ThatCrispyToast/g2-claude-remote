@@ -3,6 +3,7 @@
 // helpers; the state machine in main.ts drives selection and dispatch.
 
 import { ASIDE_QUESTIONS, EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS } from '../config'
+import { modelShort } from '../events/format'
 import { HUD } from '../glasses'
 import type { PermissionMode } from '../rc/types'
 
@@ -15,6 +16,7 @@ export type ComposeAction =
   | { kind: 'interrupt'; label: string }
   | { kind: 'info'; label: string }
   | { kind: 'submenu'; label: string; menu: SubmenuKind }
+  | { kind: 'pin'; label: string; pin: boolean }
   | { kind: 'archive'; label: string }
   | { kind: 'back'; label: string }
 
@@ -23,9 +25,15 @@ export type ComposeAction =
  * reaches for each on a keyboard-less device. Dictate leads (it's the only
  * open-ended input path), then Ask aside (check in without derailing the
  * session), the one-tap canned sends, the run controls (Interrupt), Session
- * info, the rarer steering (Commands / Model / Mode / Effort), Archive, Back.
+ * info, the rarer steering (Commands / Model / Mode / Effort), Pin, Archive,
+ * Back. `pinned` is the session's pin as the bridge reports it; an older bridge
+ * doesn't (undefined) and can't set one either, so the row is left out.
  */
-export function composeActions(opts: { voiceAvailable: boolean; pendingPrompt?: string | null }): ComposeAction[] {
+export function composeActions(opts: {
+  voiceAvailable: boolean
+  pendingPrompt?: string | null
+  pinned?: boolean
+}): ComposeAction[] {
   const actions: ComposeAction[] = []
   // 0) A blocking prompt the wearer set aside ("answer later"). The session is
   //    waiting on it, so it leads the menu; tapping it reopens the question /
@@ -47,6 +55,9 @@ export function composeActions(opts: { voiceAvailable: boolean; pendingPrompt?: 
   actions.push({ kind: 'submenu', label: `Model ${HUD.GO}`, menu: 'model' })
   actions.push({ kind: 'submenu', label: `Mode ${HUD.GO}`, menu: 'mode' })
   actions.push({ kind: 'submenu', label: `Effort ${HUD.GO}`, menu: 'effort' })
+  if (opts.pinned !== undefined) {
+    actions.push({ kind: 'pin', label: opts.pinned ? 'Unpin session' : 'Pin session', pin: !opts.pinned })
+  }
   actions.push({ kind: 'archive', label: 'Archive session' })
   actions.push({ kind: 'back', label: `${HUD.BACK} Back` })
   return actions
@@ -58,9 +69,12 @@ export interface SubmenuItem {
   current: boolean
 }
 
-/** The Model submenu — current model marked. */
+/** The Model submenu — current model marked. A model this build's list lacks
+ *  (a newer release) still gets its row, so the session's model always shows. */
 export function modelItems(current: string | null): SubmenuItem[] {
-  const items = MODELS.map((m) => ({
+  const known = !current || MODELS.some((m) => m.id === current)
+  const models = known ? MODELS : [{ id: current, label: modelShort(current) }, ...MODELS]
+  const items = models.map((m) => ({
     label: `${m.id === current ? `${HUD.CUR} ` : '  '}${m.label}`,
     value: m.id,
     current: m.id === current,

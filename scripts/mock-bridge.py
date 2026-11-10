@@ -6,7 +6,8 @@ nothing real to steer, and for staging the store screenshots in assets/store/
 (the repo is public, so never shoot real sessions). It implements the read side
 of the bridge API with the shapes in src/rc/types.ts, answers side questions
 and session info with canned replies, carries out a `/clear` send the way a real
-worker does, accepts (and ignores) every other POST, and takes any token.
+worker does, pins and unpins, accepts (and ignores) every other POST, and takes
+any token.
 
     python3 scripts/mock-bridge.py [--port 8791] [--question]
     VITE_BRIDGE_URL=http://localhost:8791 VITE_BRIDGE_TOKEN=x npm run dev
@@ -45,6 +46,7 @@ def _session(
         "permissionMode": "default",
         "lastEventAt": _ago(minutes_ago),
         "unread": False,
+        "pinned": False,
         "userMessageCount": 2,
         "pendingAction": None,
         "effort": effort,
@@ -74,6 +76,7 @@ def _event(seq: int, kind: str, **f: Any) -> dict[str, Any]:
         "isBlockingControl": control is not None,
         "blockingSubtype": "can_use_tool" if control else None,
         "requestId": f"req-{seq}" if control else None,
+        "settlesPrompt": False,
         "toolUseId": f"toolu_{seq}" if control else None,
         "permissionRequest": control,
         "usage": f.get("usage"),
@@ -235,6 +238,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"answer": ASIDE_ANSWER})
         if path.endswith("/effort"):
             return self._json({"ok": True, "via": "control"})
+        if path.endswith("/pin"):
+            session = next(s for s in self.sessions if s["id"] == path.split("/")[3])
+            session["pinned"] = json.loads(body or b"{}").get("pinned") is not False
+            return self._json({"ok": True, "pinned": session["pinned"]})
         self._json({"ok": True})
 
     def do_GET(self) -> None:
@@ -265,7 +272,7 @@ class _Handler(BaseHTTPRequestHandler):
         events.append(_event(seq + 2, "result", subtype="success", usage=_usage(0, 0, 0)))
 
     def _stream(self, sid: str) -> None:
-        """An SSE stream of whatever is new since it opened, held open with keep-alives."""
+        """An SSE stream of whatever is new since it opened, pinging like the bridge."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -275,12 +282,12 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"retry: 3000\n\n")
             sent = len(self.events[sid])
             while True:
+                self.wfile.write(b"event: ping\ndata: 1\n\n")
                 self.wfile.flush()
                 time.sleep(0.5)
                 for ev in self.events[sid][sent:]:
                     self.wfile.write(f"id: {ev['sequenceNum']}\ndata: {json.dumps(ev)}\n\n".encode())
                 sent = len(self.events[sid])
-                self.wfile.write(b": keep-alive\n\n")
         except (BrokenPipeError, ConnectionResetError):
             pass
 

@@ -4,12 +4,14 @@
 // fighting it. Three layouts, each a set of absolutely-positioned containers the
 // firmware draws and (crucially) scrolls itself:
 //
-//   • 'text'   — one full-screen text container (boot, error). Simple.
+//   • 'text'   — one full-screen text container (boot). Simple.
 //   • 'list'   — a fixed header strip + a native ListContainerProperty. The
 //                firmware moves the selection highlight on scroll with no
 //                per-tick re-render, and reports the row via listEvent.
 //   • 'scroll' — a fixed header strip + a firmware-SCROLLED text body + a fixed
-//                footer strip. This is the session / permission / voice screen.
+//                footer strip. This is the session / voice / confirm screen, and
+//                every message screen (setup, error): the strips keep the title
+//                and the gesture hint on screen whatever the body's length.
 //                When the body content overflows its height, the firmware
 //                scrolls it smoothly on swipe (the "Text: basic" feel); the app
 //                only ever hears SCROLL_TOP / SCROLL_BOTTOM *boundary* events.
@@ -57,7 +59,6 @@ export const HUD = {
   CUR: '●', //  the currently-applied model / mode
   SEP: '·', //  field separator (middle dot, U+00B7 — Latin-1)
   ELL: '...', //  truncation marker (real … is unsupported)
-  RULE: '─', //  horizontal rule (light box-drawing, U+2500)
 } as const
 
 const W = 576
@@ -438,16 +439,4 @@ export function hudSafe(s: string): string {
     .replace(/[‘’]/g, "'")
     .replace(/[“”]/g, '"')
     .replace(/…/g, '...')
-}
-
-/** Compose a header / body / footer text screen with divider lines (boot/error). */
-export function screen(parts: { header?: string; body: string; footer?: string }): string {
-  // Wide enough to read as a separator across the 576px screen without wrapping
-  // (the firmware font isn't monospaced, so this is a safe-side count).
-  const rule = HUD.RULE.repeat(30)
-  const out: string[] = []
-  if (parts.header) out.push(parts.header, '', rule, '')
-  out.push(parts.body)
-  if (parts.footer) out.push('', rule, '', parts.footer)
-  return out.join('\n')
 }

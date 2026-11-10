@@ -74,6 +74,9 @@ export interface ActiveSession {
   permissionMode: PermissionMode | null
   lastEventAt: string | null
   unread: boolean
+  /** Pinned in claude.ai/code's sidebar: pins lead the list. Absent from a
+   *  bridge older than 0.5.0, which can't set it either. */
+  pinned?: boolean
   userMessageCount: number
   pendingAction: unknown | null // external_metadata.pending_action (permission summary)
   /** The worker's current effort level (absent on older workers). */
@@ -119,6 +122,8 @@ export interface SessionInfo {
   } | null
   /** Uncommitted git changes; null outside a git repo. */
   diff: { files: number; added: number; removed: number } | null
+  /** The worker was still computing the diff (a big repo): ask again. */
+  diffPending?: boolean
 }
 
 /** A tool_use content block. */
@@ -183,7 +188,19 @@ export interface Usage {
  * bridge's additions, needed to answer permission prompts.
  */
 export interface RcEvent {
-  type: 'user' | 'assistant' | 'system' | 'result' | 'control_request' | 'control_response' | 'conversation_reset' | 'stream_event' | string | null
+  type:
+    | 'user'
+    | 'assistant'
+    | 'system'
+    | 'result'
+    | 'control_request'
+    | 'control_response'
+    | 'control_cancel_request'
+    | 'conversation_reset'
+    | 'catch_up_truncated'
+    | 'stream_event'
+    | string
+    | null
   subtype: string | null
   role: 'user' | 'assistant' | null
   /** 'client' = a controller wrote it (this app, claude.ai…); 'worker' = Claude Code. */
@@ -199,6 +216,11 @@ export interface RcEvent {
   isBlockingControl: boolean
   blockingSubtype: string | null
   requestId: string | null
+  /** This event ends the blocking prompt `requestId` names: a controller
+   *  answered it, or the worker withdrew it (answered at the terminal, or the
+   *  turn moved on). Absent from a bridge older than 0.5.0 — read it through
+   *  `settlesPrompt()` in events/format.ts. */
+  settlesPrompt?: boolean
   toolUseId: string | null
   permissionRequest: PermissionRequest | null
   usage: Usage | null
@@ -272,6 +294,9 @@ export interface BridgeClient {
    *  (the /effort fallback, which also saves it as the host's default). */
   setEffort(sid: string, effort: EffortLevel | null): Promise<string>
   archive(sid: string): Promise<void>
+  /** Pin or unpin the session in claude.ai/code's sidebar (bridge 0.5.0+).
+   *  Resolves to whether it is pinned now. */
+  setPinned(sid: string, pinned: boolean): Promise<boolean>
   /** Ask a side question ("btw"): answered from the conversation without
    *  interrupting it or adding to it. Null = nothing to answer from yet. */
   ask(sid: string, question: string, history: AsideTurn[]): Promise<string | null>

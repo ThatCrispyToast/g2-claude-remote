@@ -130,6 +130,10 @@ export function isBridgeConfigured(): boolean {
 // ─── Polling / streaming ─────────────────────────────────────────────────────
 /** How often the active-session list is refreshed (ms). The list has no SSE. */
 export const POLL_MS = numEnv(env.VITE_POLL_MS, 4000)
+/** A session stream that has pinged (bridge 0.5.0+ passes the API's ~15 s
+ *  keepalive through) and then stays silent this long is dead, whatever the
+ *  socket says. The Claude Code CLI's own limit. */
+export const STREAM_SILENCE_MS = numEnv(env.VITE_STREAM_SILENCE_MS, 45_000)
 /** Events pulled for history when a session is first opened. */
 export const HISTORY_LIMIT = numEnv(env.VITE_HISTORY_LIMIT, 200)
 
@@ -174,7 +178,7 @@ export const MODELS: ModelChoice[] = [
   { id: 'claude-opus-5-5', label: 'Opus 5.5' },
   { id: 'claude-sonnet-5-5', label: 'Sonnet 5.5' },
   { id: 'claude-haiku-5-5', label: 'Haiku 5.5' },
-  { id: 'claude-fable-5-1', label: 'Fable 5.1' },
+  { id: 'claude-fable-5-2', label: 'Fable 5.2' },
 ]
 /** Permission modes offered in the Compose → Mode submenu. */
 export const MODES: PermissionMode[] = ['default', 'plan', 'acceptEdits', 'bypassPermissions']

@@ -64,6 +64,8 @@ export interface PanelCallbacks {
   onSetEffort: (effort: string) => void
   /** Archive the open session (main.ts confirms/executes; the button self-confirms too). */
   onArchive: (sid: string) => void
+  /** Pin / unpin the open session (claude.ai/code's pin). */
+  onSetPinned: (pinned: boolean) => void
   /** Allow / Deny a blocking permission prompt. */
   onAnswerPermission: (decision: Decision) => void
   /** Pick option `label` for question `qIndex` of a blocking dialog. */
@@ -178,6 +180,7 @@ export class Panel {
   private modeSel: HTMLSelectElement | null = null
   private effortSel: HTMLSelectElement | null = null
   private archiveBtn: HTMLButtonElement | null = null
+  private pinBtn: HTMLButtonElement | null = null
   private toastEl: HTMLDivElement | null = null
   private cmdMenuEl: HTMLDivElement | null = null
   private noticesEl: HTMLDivElement | null = null
@@ -334,6 +337,7 @@ ${settingsHtml}
               <span class="field-label">Effort</span>
               <select id="effortSel" class="select">${effortOpts}</select>
             </label>
+            <button id="pinBtn" class="btn" title="Pinned sessions lead the list, here and on claude.ai" hidden>Pin</button>
             <button id="archiveBtn" class="btn danger archive">Archive</button>
           </div>
 
@@ -366,6 +370,7 @@ ${settingsHtml}
     this.modeSel = root.querySelector<HTMLSelectElement>('#modeSel')
     this.effortSel = root.querySelector<HTMLSelectElement>('#effortSel')
     this.archiveBtn = root.querySelector<HTMLButtonElement>('#archiveBtn')
+    this.pinBtn = root.querySelector<HTMLButtonElement>('#pinBtn')
     this.toastEl = root.querySelector<HTMLDivElement>('#toast')
     this.cmdMenuEl = root.querySelector<HTMLDivElement>('#cmdMenu')
     this.noticesEl = root.querySelector<HTMLDivElement>('#notices')
@@ -438,6 +443,9 @@ ${settingsHtml}
     }
 
     this.wireArchive()
+    this.pinBtn?.addEventListener('click', () => {
+      if (this.session) this.cb.onSetPinned(!this.session.pinned)
+    })
 
     injectStyles()
   }
@@ -756,7 +764,7 @@ ${settingsHtml}
 
     const sub = document.createElement('div')
     sub.className = 'session-sub'
-    const bits = [modelLabel(s.model), s.effort ?? '', contextLabel(s), relTime(s.lastEventAt)]
+    const bits = [s.pinned ? 'pinned' : '', modelLabel(s.model), s.effort ?? '', contextLabel(s), relTime(s.lastEventAt)]
     sub.textContent = bits.filter(Boolean).join(' · ')
 
     body.appendChild(name)
@@ -846,12 +854,22 @@ ${settingsHtml}
       this.detailSummary.classList.toggle('needs', !!s.needsAction)
     }
     // Reflect the live settings in the selects (an unknown one shows blank
-    // rather than a guess — an option that doesn't exist selects nothing).
-    if (this.modelSel && model) this.modelSel.value = model
+    // rather than a guess — an option that doesn't exist selects nothing). A
+    // model this build's list lacks (a newer release) is real, though: it gets
+    // an option, by id, so the select never shows another model in its place.
+    if (this.modelSel && model) {
+      if (!Array.from(this.modelSel.options).some((o) => o.value === model)) this.modelSel.add(new Option(model, model))
+      this.modelSel.value = model
+    }
     if (this.modeSel) this.modeSel.value = mode ?? ''
     if (this.effortSel) this.effortSel.value = effort ?? ''
     // Interrupt only makes sense while the worker is running.
     if (this.interruptBtn) this.interruptBtn.disabled = s.workerStatus !== 'running'
+    // The pin is the bridge's to report; one too old to (pre-0.5.0) can't set it.
+    if (this.pinBtn) {
+      this.pinBtn.hidden = s.pinned === undefined
+      this.pinBtn.textContent = s.pinned ? 'Unpin' : 'Pin'
+    }
     this.renderInfo()
   }
 
@@ -919,6 +937,8 @@ ${settingsHtml}
     if (v?.info?.diff) {
       const d = v.info.diff
       row(d.files ? `Changes · ${d.files} file${d.files > 1 ? 's' : ''} +${d.added} −${d.removed}` : 'Changes · none uncommitted')
+    } else if (v?.info?.diffPending) {
+      row('Changes · still being counted, ask again')
     }
     if (v?.loading) row('Asking the worker…', 'info-row muted')
     else if (v?.error) row(v.error, 'info-row muted')
@@ -1217,6 +1237,13 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
       const row = document.createElement('div')
       row.className = 'ev ev-system'
       row.textContent = '◆ conversation cleared'
+      return row
+    }
+
+    case 'catch_up_truncated': {
+      const row = document.createElement('div')
+      row.className = 'ev ev-system'
+      row.textContent = '◆ some earlier events were skipped'
       return row
     }
 

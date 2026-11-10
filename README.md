@@ -49,7 +49,8 @@ Can't connect? Open the bridge's port (default `8790`) in the host firewall.
   scene.yaml`) so what Claude is actually saying stays readable.
 - **Answer blocking prompts** - permission requests and questions arrive as native
   screens (right away if you're watching, `! needs you` in the footer if not).
-  Tap to answer, double-tap to set aside. Answer one elsewhere and it retires itself.
+  Tap to answer, double-tap to set aside. Answer one elsewhere - another
+  device, or the terminal - and it retires itself.
 - **Ask on the side** - check in on a busy session ("What are you doing right
   now?") without interrupting it or adding to its transcript: pick a canned
   question or dictate one, and follow up in context.
@@ -61,7 +62,11 @@ Can't connect? Open the bridge's port (default `8790`) in the host firewall.
   …), send canned replies, or dictate by voice. The menus mark the session's
   real current model, mode, and effort.
 - **Active sessions only** - archived and dead ones never reach the glasses, and
-  every control action re-checks before it acts.
+  every control action re-checks before it acts. Sessions you pinned in
+  claude.ai lead the list, and you can pin or unpin from the menu.
+- **Honest about the connection** - if the bridge stops answering or a stream
+  goes quiet, the HUD says `! offline` instead of `live`, and picks up where it
+  left off when the bridge is back.
 
 <p align="center">
   <img src="assets/store/01-sessions.png" width="49%" alt="Sessions list">
@@ -89,7 +94,7 @@ on the glasses through the firmware's native widgets. The bridge
 [`claude-rc-api`](https://github.com/ThatCrispyToast/claude-rc-api). It runs on
 any machine logged in to Claude Code, borrows that login (surviving token
 rotation), and adds the active-only filter, bearer-token auth, and the routes for
-answering blocking prompts, asking side questions, and session info.
+answering blocking prompts, asking side questions, session info, and pins.
 
 ## Controls
 
@@ -110,7 +115,7 @@ answering blocking prompts, asking side questions, and session info.
 
 The Compose menu leads with Dictate and Ask aside, then the quick-sends
 (`Proceed`, `Run tests`, `Explain` - configurable), `Interrupt`, `Session info`,
-`Commands`, `Model`, `Mode`, `Effort`, and `Archive`. A side question costs one
+`Commands`, `Model`, `Mode`, `Effort`, `Pin`, and `Archive`. A side question costs one
 model call and never reaches the session's transcript, so it skips the send
 confirmation. Slash commands run locally at no token cost; heavy ones (`/compact`,
 `/clear`) go through the confirm screen first. A set-aside prompt reopens from the
@@ -120,7 +125,7 @@ session. No blocking screen can trap you.
 ## The companion panel
 
 The same bundle's DOM is a full control surface in the phone's WebView: sessions
-listed with their effort, context use, and one-line status summary; the
+listed (pins first) with their effort, context use, and one-line status summary; the
 un-clipped event log with tool inputs and usage/cost; free-text sends with `/`
 slash-command autocomplete, plus **Ask aside** for a side question; a session
 card with background tasks (each with a Stop button), plan usage, and
