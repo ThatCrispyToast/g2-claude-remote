@@ -9,6 +9,9 @@ to dictate. A companion phone panel mirrors it all with a fuller control surface
   <img src="assets/store/02-session-live.png" width="70%" alt="A live session streaming on the 576×288 HUD">
 </p>
 
+> [!NOTE]
+> A notable portion of this project is AI-generated. While all relevant code has been appropriately reviewed and tested, you should still operate at your own discretion.
+
 ## Quick start
 
 1. **Install the app** on your glasses from the
