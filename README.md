@@ -1,75 +1,68 @@
 # Claude Remote
 
-Steer live [Claude Code](https://code.claude.com/docs)
-remote-control sessions from [Even Realities G2](https://www.evenrealities.com)
-glasses: the event stream on the HUD, the touchpad to approve and reply, the mic
-to dictate. A companion phone panel mirrors it all with a fuller control surface.
+Monitor and control [Claude Code](https://code.claude.com/docs) remote-control
+sessions from [Even Realities G2](https://www.evenrealities.com) glasses. Read
+session output, answer permission requests, and dictate replies. A companion
+phone panel provides the same controls and a detailed event log.
 
 <p align="center">
   <img src="assets/store/02-session-live.png" width="70%" alt="A live session streaming on the 576×288 HUD">
 </p>
 
 > [!NOTE]
-> A notable portion of this project is AI-generated. While all relevant code has been appropriately reviewed and tested, you should still operate at your own discretion.
+> Parts of this project are AI-generated. The code has been reviewed and tested;
+> use at your own discretion.
 
 ## Quick start
 
 1. **Install the app** on your glasses from the
    [Even Hub](https://hub.evenrealities.com/landing?package_id=com.thatcrispytoast.clauderemote),
-   or sideload a packed `claude-remote-<version>.ehpk`.
+   or sideload `claude-remote-<version>.ehpk`.
 
-2. **Run the bridge** on the machine where you're logged in to Claude Code (needs
-   [uv](https://docs.astral.sh/uv/)) or an analogous Python manager:
+2. **Run the bridge** on a machine logged in to Claude Code. With
+   [uv](https://docs.astral.sh/uv/):
 
    ```bash
    uvx --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge
    ```
 
-   It prints the URLs your phone can reach it at and a bearer token: a word
-   passphrase like `coral-anvil-mango-scoop-visor`, generated on first run and
-   saved to `~/.config/claude-remote/bridge-token`.
+   The bridge prints its URLs and a bearer token. The token is a word passphrase
+   generated on first run and saved to `~/.config/claude-remote/bridge-token`.
 
-3. **Connect** - enter one of those URLs and the token in the panel's Settings
-   card. Add a [Deepgram](https://console.deepgram.com) key there for voice
-   dictation; leave it blank and voice disables itself. Dictation is English
-   unless you also set a language there: any
-   [Deepgram language code](https://developers.deepgram.com/docs/models-languages-overview)
-   (`de`, `pt-BR`, …), or `multi` for speech that mixes languages. The glasses'
-   font covers Latin-1, so most Western European text reads back fine (save
-   French `œ` and the `€` sign); other scripts may show gaps on the HUD, though
-   the message still sends intact.
+3. **Connect** by entering a URL reachable from your phone and the token in the
+   panel's Settings card. For voice dictation, also add a
+   [Deepgram](https://console.deepgram.com) key.
 
-Can't connect? Open the bridge's port (default `8790`) in the host firewall.
+If the phone can't connect, open the bridge's port (default `8790`) in the host
+firewall.
 
 > [!CAUTION]
-> Keep the bridge on a private network i.e. LAN or Tailscale. The token is the only guard, and it can read and steer every remote-control session of the logged-in account. Flags and env vars: [`server/README.md`](server/README.md).
+> Keep the bridge on a private LAN or Tailscale network. Anyone with the token
+> can read and control every remote-control session of the logged-in account.
+
+See [`server/README.md`](server/README.md) for bridge options and updates.
 
 ## What it does
 
-- **Live sessions on the HUD** - each opens on its newest output and auto-follows
-  while running. Scroll up to page through history, down to re-attach to the tail.
-  Runs of tool calls collapse into one compact line (`◆ Read factory.py, Edit
-  scene.yaml`) so what Claude is actually saying stays readable.
-- **Answer blocking prompts** - permission requests and questions arrive as native
-  screens (right away if you're watching, `! needs you` in the footer if not).
-  Tap to answer, double-tap to set aside. Answer one elsewhere - another
-  device, or the terminal - and it retires itself.
-- **Ask on the side** - check in on a busy session ("What are you doing right
-  now?") without interrupting it or adding to its transcript: pick a canned
-  question or dictate one, and follow up in context.
-- **Session info at a glance** - the server's one-line summary of where it
-  stands (or what it needs from you), context use, model / effort / mode,
-  running background tasks, plan usage, and uncommitted git changes.
-- **Steer hands-free** - interrupt, switch model / permission mode / reasoning
-  effort (up to `max`), fire slash commands (`/context`, `/usage`, `/compact`,
-  …), send canned replies, or dictate by voice. The menus mark the session's
-  real current model, mode, and effort.
-- **Active sessions only** - archived and dead ones never reach the glasses, and
-  every control action re-checks before it acts. Sessions you pinned in
-  claude.ai lead the list, and you can pin or unpin from the menu.
-- **Honest about the connection** - if the bridge stops answering or a stream
-  goes quiet, the HUD says `! offline` instead of `live`, and picks up where it
-  left off when the bridge is back.
+- **Live output:** sessions open at the latest output and follow new events.
+  Scroll up for history and down to resume following. Consecutive tool calls
+  share a compact line, such as `◆ Read factory.py, Edit scene.yaml`.
+- **Permissions and questions:** prompts appear on the glasses, with `! needs you`
+  in the footer when you're on another screen. Prompts close when answered on
+  another device or in the terminal.
+- **Side questions:** use Ask aside to ask about a running session without
+  interrupting it or adding to its transcript. Choose a preset question or
+  dictate one, then ask follow-ups.
+- **Session controls:** interrupt, change model, permission mode, or reasoning
+  effort (up to `max`), run slash commands, and send preset or dictated replies.
+  Menus show the current model, mode, and effort.
+- **Session info:** view a status summary, context use, background tasks, plan
+  usage, and uncommitted changes.
+- **Session list:** shows active, connected sessions with claude.ai pins first.
+  Pin or unpin from the menu. Each control action checks that the session is
+  still active and connected.
+- **Connection status:** the HUD shows `! offline` if the bridge or stream stops
+  responding and resumes when the connection returns.
 
 <p align="center">
   <img src="assets/store/01-sessions.png" width="49%" alt="Sessions list">
@@ -91,56 +84,58 @@ claude-remote-bridge (server/) - wraps claude-rc-api
 Anthropic Remote Control API
 ```
 
-The app (`src/`, packed into an `.ehpk`) runs inside the Even phone app and draws
-on the glasses through the firmware's native widgets. The bridge
-([`server/`](server/README.md)) is a small JSON+SSE server over
-[`claude-rc-api`](https://github.com/ThatCrispyToast/claude-rc-api). It runs on
-any machine logged in to Claude Code, borrows that login (surviving token
-rotation), and adds the active-only filter, bearer-token auth, and the routes for
-answering blocking prompts, asking side questions, session info, and pins.
+The app (`src/`, packaged as an `.ehpk`) runs inside the Even phone app and uses
+the glasses' native widgets. The bridge ([`server/`](server/README.md)) exposes
+[`claude-rc-api`](https://github.com/ThatCrispyToast/claude-rc-api) over HTTP and
+SSE. It uses the host's Claude Code login, handles token rotation, filters for
+active sessions, and authenticates requests with a bearer token.
 
 ## Controls
 
 | Screen | Scroll ↑ / ↓ | Tap | Double-tap |
 |---|---|---|---|
-| **Sessions list** | move selection | open session | exit dialog |
-| **Session view** | native scroll - up into history, down to live | open Compose menu | back to list |
-| **Compose menu** | move selection | fire action / enter submenu | back to session |
-| **Commands submenu** | move selection | fire slash command | back to Compose |
-| **Ask aside submenu** | move selection | ask it (or dictate one) | back to Compose |
+| **Sessions list** | move selection | open session | open exit dialog |
+| **Session view** | up for history, down to live | open Compose menu | back to list |
+| **Compose menu** | move selection | run action / open submenu | back to session |
+| **Commands submenu** | move selection | run slash command | back to Compose |
+| **Ask aside submenu** | move selection | ask question / start dictation | back to Compose |
 | **Aside answer** | scroll the answer | ask a follow-up | back to session |
 | **Session info** | scroll | refresh | back to session |
 | **Model / Mode / Effort submenu** | move selection | apply | back to Compose |
-| **Voice dictation** | scroll transcript | done - review before sending | cancel |
+| **Voice dictation** | scroll transcript | finish and review | cancel |
 | **Confirm send** | scroll the message | send | cancel |
-| **Permission prompt** | move between Allow / Deny | pick | set aside |
-| **Question** | move between options | pick (`Dismiss` cancels) | set aside |
+| **Permission prompt** | move between Allow / Deny | select | set aside |
+| **Question** | move between options | select (`Dismiss` cancels) | set aside |
 
-The Compose menu leads with Dictate and Ask aside, then the quick-sends
-(`Proceed`, `Run tests`, `Explain` - configurable), `Interrupt`, `Session info`,
-`Commands`, `Model`, `Mode`, `Effort`, `Pin`, and `Archive`. A side question costs one
-model call and never reaches the session's transcript, so it skips the send
-confirmation. Slash commands run locally at no token cost; heavy ones (`/compact`,
-`/clear`) go through the confirm screen first. A set-aside prompt reopens from the
-Compose menu's `! Answer question` / `! Review permission` row, or by reopening the
-session. No blocking screen can trap you.
+Compose contains dictation, Ask aside, configurable replies (`Proceed`, `Run
+tests`, `Explain`), session controls, pinning, and archiving. Side questions use
+one model call and skip the send confirmation. Slash commands run locally at no
+token cost; `/compact` and `/clear` require confirmation.
 
-## The companion panel
+To reopen a prompt you've set aside, select `! Answer question` or
+`! Review permission` in Compose, or reopen the session.
 
-The same bundle's DOM is a full control surface in the phone's WebView: sessions
-listed (pins first) with their effort, context use, and one-line status summary; the
-un-clipped event log with tool inputs and usage/cost; free-text sends with `/`
-slash-command autocomplete, plus **Ask aside** for a side question; a session
-card with background tasks (each with a Stop button), plan usage, and
-uncommitted changes; every steering control; and the Settings card. It still
-works as a plain-browser web app with no glasses connected.
+### Voice dictation
 
-App updates can also carry a **release notice** - a slim dismissible card above
-the session list for anything important (say, "update your bridge"). Notices are
-baked into the build (nothing is fetched), and each one shows until dismissed,
-then never again on that device. On the glasses the same notice appears once as
-a scrollable screen right after connect - tap acknowledges it, double-tap defers
-it to the next launch - and acknowledging on either surface retires it on both.
+Dictation requires a Deepgram key in Settings and defaults to English. Set a
+[Deepgram language code](https://developers.deepgram.com/docs/models-languages-overview)
+such as `de` or `pt-BR`, or use `multi` for mixed-language speech. Leaving the key
+blank disables dictation.
+
+The glasses' font supports Latin-1. Characters outside that range, including
+French `œ` and `€`, may not display, but the full message is still sent.
+
+## Companion panel
+
+The phone panel provides all session controls and settings, plus a full event
+log with tool inputs, usage, and cost. It supports typed messages, slash-command
+autocomplete, side questions, and stopping background tasks. It also works in a
+browser without glasses.
+
+Release notices ship with app updates and appear above the session list and on
+the glasses after connecting. Tap to dismiss a notice on both displays, or
+double-tap on the glasses to defer it until the next launch. Dismissals are saved
+on the device.
 
 <p align="center">
   <img src="assets/store/08-panel.png" width="45%" alt="Companion phone panel">
@@ -148,24 +143,21 @@ it to the next launch - and acknowledging on either surface retires it on both.
 
 ## Configuration
 
-Two layers on the app side; the higher wins.
+1. **Settings card:** bridge URL, token, Deepgram key, and dictation language.
+   Values persist on the device and override development defaults. Use this to
+   configure an installed `.ehpk`.
+2. **Development defaults:** `VITE_*` variables in `.env.local`, used by
+   `npm run dev`. See [`.env.example`](.env.example) for the full list.
+   Packaged builds exclude these values, including keys and host addresses.
 
-1. **Runtime settings** - the panel's Settings card (bridge URL, token, Deepgram
-   key, dictation language), stored on the device across app restarts. This is
-   how a packed `.ehpk` is configured.
-2. **Dev-server defaults** - `VITE_*` vars in `.env.local`, read by `npm run dev`
-   only ([`.env.example`](.env.example) lists them all). Packs never include them:
-   `npm run pack` builds with env resolution disabled, so no key or host can leak
-   into an artifact.
-
-The bridge takes CLI flags and `RC_BRIDGE_*` env vars, and reads `.env.local` too
-(`VITE_BRIDGE_TOKEN` doubles as its token), so one file configures both sides in
-development.
+The bridge accepts CLI flags, `RC_BRIDGE_*` environment variables, and
+`.env.local`. It also accepts `VITE_BRIDGE_TOKEN`, so the app and bridge can share
+a token in development.
 
 ## Development
 
-Node 18+ for the app; Python 3.10+ with [uv](https://docs.astral.sh/uv/) for the
-bridge.
+Requires Node 18+ for the app and Python 3.10+ with
+[uv](https://docs.astral.sh/uv/) for the bridge.
 
 ```bash
 git clone https://github.com/ThatCrispyToast/g2-claude-remote && cd g2-claude-remote
@@ -179,16 +171,15 @@ npm run dev                    # app dev server → http://0.0.0.0:5175
 npx @evenrealities/evenhub-cli qr --url http://<host>:5175 --external
 ```
 
-Point `VITE_BRIDGE_URL` at an address the phone can reach - a Tailscale MagicDNS
-name or a LAN IP. To hack on `claude-rc-api` at the same time, clone it next to
-this repo and use `npm run bridge:uv`.
+Set `VITE_BRIDGE_URL` to a Tailscale MagicDNS name or LAN IP the phone can reach.
+To develop `claude-rc-api` alongside this app, clone it next to this repository
+and use `npm run bridge:uv`.
 
-**Packaging:** `npm run pack` builds and packs `claude-remote-<version>.ehpk`.
-Every pack is distributable (no env is resolved), and it refuses to run if
-`package.json` and `app.json` disagree on the version - bump both together.
+**Packaging:** `npm run pack` creates `claude-remote-<version>.ehpk`. The versions
+in `package.json` and `app.json` must match; update both when releasing.
 
-**Bridge as a service:** the bridge holds no state, so any service manager works.
-Install it once and point a systemd unit (or equivalent) at `claude-remote-bridge`:
+**Bridge as a service:** install the bridge, then configure your service manager
+to run `claude-remote-bridge`:
 
 ```bash
 uv tool install "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server"
@@ -196,5 +187,5 @@ uv tool install "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdire
 
 ## License
 
-[MIT](LICENSE). Unofficial - not affiliated with Anthropic or Even Realities. The
-Remote Control API surface is reverse-engineered and can change without notice.
+[MIT](LICENSE). This project is not affiliated with Anthropic or Even Realities.
+The Remote Control API is reverse-engineered and may change without notice.
