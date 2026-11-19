@@ -37,17 +37,12 @@ export interface Notice {
 /** Every notice this build knows, newest first. */
 export const NOTICES: Notice[] = [
   {
-    id: '2026-11-10-bridge-0-5',
+    id: '2026-11-19-bridge-0-7',
     level: 'important',
-    title: 'Update your bridge',
-    body:
-      'An older bridge can leave sessions off this list. It saw only your 20 ' +
-      'newest, archived ones included, so a long-running session dropped out as ' +
-      'newer ones came and went. The updated bridge lists every active session, ' +
-      'puts your claude.ai pins first (Pin session is in the menu), clears a ' +
-      'prompt as soon as it is answered at the terminal, and lets the app notice ' +
-      'a stream that has gone quiet. It carries every earlier fix too. Restart ' +
-      'it once with:',
+    title: 'Messages and session controls',
+    body: 'Claude Code may read messages from this app as coming from a peer session. ' +
+      'Use Open in Claude on the phone to send as yourself or run slash commands. ' +
+      'Context and plan usage are available in Session info. Refresh the bridge for older history and session permission rules.',
     command:
       'uvx --refresh --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge',
   },

@@ -20,6 +20,7 @@ import type {
   BackgroundTask,
   RcEvent,
   PermissionRequest,
+  HistoryPage,
   DialogQuestion,
   WhoAmI,
   Decision,
@@ -29,8 +30,8 @@ import type {
   WorkerState,
 } from './rc/types'
 import type { Notice } from './notices'
-import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, STT_LANGUAGE, isSttLanguage, loadRuntimeSettings, saveRuntimeSettings, type RuntimeSettings } from './config'
-import { cleanUserEcho, isQuestionRequest, settingsLine } from './events/format'
+import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS, isSlashInput, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, STT_LANGUAGE, isSttLanguage, loadRuntimeSettings, saveRuntimeSettings, type RuntimeSettings } from './config'
+import { cleanUserEcho, isQuestionRequest, settingsLine, workerNotes, rateLimitLabel, systemActivity } from './events/format'
 
 /** A side question on show: asking (answer + error null), answered, or failed. */
 export interface AsideView {
@@ -53,6 +54,7 @@ export interface PanelCallbacks {
   /** The Back button in the detail view → return to the list. */
   onBackToList: () => void
   /** The free-text send box (or a quick-action button) → send `text` verbatim. */
+  onTakeGlassesDraft: () => string | null
   onSend: (text: string) => void
   /** Interrupt the running turn. */
   onInterrupt: () => void
@@ -67,9 +69,12 @@ export interface PanelCallbacks {
   /** Pin / unpin the open session (claude.ai/code's pin). */
   onSetPinned: (pinned: boolean) => void
   /** Allow / Deny a blocking permission prompt. */
-  onAnswerPermission: (decision: Decision) => void
-  /** Pick option `label` for question `qIndex` of a blocking dialog. */
+  onAnswerPermission: (decision: Decision, note?: string, rule?: string) => void
+  /** Pick option `label` for question `qIndex` of a blocking dialog (a
+   *  multi-select question toggles it). */
   onPickDialogOption: (qIndex: number, label: string) => void
+  /** Done picking for multi-select question `qIndex`: its picks stand. */
+  onConfirmDialogPicks: (qIndex: number) => void
   /** Dismiss / cancel a blocking question dialog. */
   onCancelDialog: () => void
   /** Start / stop voice dictation into the send box. */
@@ -80,6 +85,7 @@ export interface PanelCallbacks {
   /** The aside card's × — forget the shown exchange. */
   onDismissAside: () => void
   /** Fetch plan usage + git changes for the session card. */
+  onOlderEvents: (before: number) => Promise<HistoryPage | null>
   onLoadInfo: () => void
   /** Stop a running background task. */
   onStopTask: (taskId: string) => void
@@ -172,6 +178,7 @@ export class Panel {
   private asideBtn: HTMLButtonElement | null = null
   private logEl: HTMLDivElement | null = null
   private sendInput: HTMLTextAreaElement | null = null
+  private takeDraft: HTMLButtonElement | null = null
   private sendBtn: HTMLButtonElement | null = null
   private dictateBtn: HTMLButtonElement | null = null
   private interimEl: HTMLDivElement | null = null
@@ -195,6 +202,12 @@ export class Panel {
   /** Open/close the Settings card, filling it from storage on open (wireSettings). */
   private toggleSettings = (): void => {}
   /** The currently-open session id (for onArchive), or null in the list view. */
+  private claudeLink: HTMLAnchorElement | null = null
+  private olderButton: HTMLButtonElement | null = null
+  private dialogDrafts = new Map<number, string>()
+  private draftQuestions: DialogQuestion[] | null = null
+  private historyBefore: number | null = null
+  private historyRevision = 0
   private currentSid: string | null = null
   // The open session as last pushed, its live worker settings, background
   // tasks, and the on-demand info — the header meta and the session card are
@@ -300,12 +313,17 @@ ${settingsHtml}
           <div id="permBanner" class="perm" hidden></div>
           <div id="asideCard" class="aside-card" hidden></div>
 
+          <button id="olderEvents" class="btn ghost" hidden>Earlier events</button>
           <div id="log" class="log"></div>
 
           <div class="composer">
+            <div class="settings-hint">Claude may read these messages as coming from a peer session.
+              <a id="claudeLink" target="_blank" rel="noopener noreferrer">Open in Claude</a> to send as yourself or run slash commands.
+              <button id="copyBtn" class="copy-draft">Copy draft</button></div>
+            <button id="takeDraft" class="btn" hidden>Copy glasses draft</button>
             <div id="cmdMenu" class="cmd-menu" hidden></div>
             <textarea id="sendInput" class="send-input" rows="2"
-              placeholder="Message the session… (/ for commands)" enterkeyhint="send"></textarea>
+              placeholder="Message the session…" enterkeyhint="send"></textarea>
             <div id="interim" class="interim"></div>
             <div class="composer-row">
               <button id="sendBtn" class="btn primary">Send</button>
@@ -348,6 +366,7 @@ ${settingsHtml}
     `
 
     // Cache refs.
+    this.claudeLink = root.querySelector<HTMLAnchorElement>('#claudeLink')
     this.connChip = root.querySelector<HTMLDivElement>('#connChip')
     this.originEl = root.querySelector<HTMLDivElement>('#origin')
     this.listView = root.querySelector<HTMLElement>('#listView')
@@ -360,6 +379,8 @@ ${settingsHtml}
     this.asideCard = root.querySelector<HTMLDivElement>('#asideCard')
     this.infoBody = root.querySelector<HTMLDivElement>('#infoBody')
     this.asideBtn = root.querySelector<HTMLButtonElement>('#asideBtn')
+    this.olderButton = root.querySelector<HTMLButtonElement>('#olderEvents')
+    this.olderButton?.addEventListener('click', () => void this.loadOlderEvents())
     this.logEl = root.querySelector<HTMLDivElement>('#log')
     this.sendInput = root.querySelector<HTMLTextAreaElement>('#sendInput')
     this.sendBtn = root.querySelector<HTMLButtonElement>('#sendBtn')
@@ -380,6 +401,14 @@ ${settingsHtml}
     root.querySelector<HTMLButtonElement>('#backBtn')?.addEventListener('click', () => this.cb.onBackToList())
     this.wireSettings(root)
 
+    this.takeDraft = root.querySelector<HTMLButtonElement>('#takeDraft')
+    this.takeDraft?.addEventListener('click', () => {
+      const text = this.cb.onTakeGlassesDraft()
+      if (!text || !this.sendInput) return
+      this.appendDraft(text)
+      void this.copyDraft(this.sendInput.value.length - text.length)
+    })
+    root.querySelector('#copyBtn')?.addEventListener('click', () => void this.copyDraft())
     this.sendBtn?.addEventListener('click', () => this.doSend())
     // Typing after a leading `/` drives the command autocomplete.
     this.sendInput?.addEventListener('input', () => this.updateCommandMenu())
@@ -531,11 +560,35 @@ ${settingsHtml}
     })
   }
 
+  setGlassesDraft(available: boolean): void {
+    if (this.takeDraft) this.takeDraft.hidden = !available
+  }
+
+  private async copyDraft(start = 0): Promise<void> {
+    const box = this.sendInput
+    if (!box?.value.trim()) return this.setToast('Enter a message to copy.')
+    box.focus()
+    box.setSelectionRange(start, box.value.length)
+    try {
+      // A panel served over LAN HTTP may only have the legacy copy action.
+      if (navigator.clipboard) await navigator.clipboard.writeText(box.value.slice(start))
+      else if (!document.execCommand('copy')) throw new Error('manual copy')
+      this.setToast('Copied. Open in Claude to paste and send.')
+    } catch {
+      this.setToast('Draft selected. Use Copy, then Open in Claude.')
+    }
+  }
+
   /** Read + clear the send box, firing onSend when non-empty. */
   private doSend(): void {
     const text = this.sendInput?.value.trim() ?? ''
     if (!text) return
     this.hideCommandMenu()
+    if (isSlashInput(text) && !SLASH_COMMANDS.some((c) => text === `/${c.name}`)) {
+      this.setToast('Open in Claude to run that command. Your draft is ready to copy.')
+      this.sendInput?.select()
+      return
+    }
     this.cb.onSend(text)
     if (this.sendInput) {
       this.sendInput.value = ''
@@ -559,13 +612,7 @@ ${settingsHtml}
   }
 
   // ── Slash-command autocomplete ─────────────────────────────────────────────
-  // Typing `/` in the send box pops a filtered command menu above it, mirroring
-  // Claude Code's own `/` menu. A command is sent as a plain `/name` message
-  // (main.ts → the bridge's /send route); the worker runs it locally. Commands
-  // that take an argument or are heavy/destructive (`confirm`) fill the box and
-  // wait for an explicit Send instead of firing on pick — the panel never routes
-  // through the glasses' confirm screen, so "don't fire on one tap" is honored by
-  // filling-and-waiting here.
+  // The suggestions open session information locally.
 
   private cmdMenuOpen(): boolean {
     return !!this.cmdMenuEl && !this.cmdMenuEl.hidden && this.cmdMatches.length > 0
@@ -607,7 +654,7 @@ ${settingsHtml}
       name.className = 'cmd-name'
       name.textContent = `/${c.name}`
       row.appendChild(name)
-      const hint = c.hint ?? c.label
+      const hint = c.label
       if (hint) {
         const h = document.createElement('span')
         h.className = 'cmd-hint'
@@ -629,20 +676,11 @@ ${settingsHtml}
     this.renderCommandMenu()
   }
 
-  /** Pick command `i`: fire it (plain), or fill the box and wait for Send (takes an
-   *  argument, or is `confirm`-gated). */
+  /** Open the selected session-info shortcut. */
   private chooseCmd(i: number): void {
     const cmd = this.cmdMatches[i]
     if (!cmd || !this.sendInput) return
     this.hideCommandMenu()
-    if (cmd.takesArg || cmd.confirm) {
-      this.sendInput.value = cmd.takesArg ? `/${cmd.name} ` : `/${cmd.name}`
-      this.sendInput.focus()
-      // Keep the caret at the end so a typed argument appends cleanly.
-      const end = this.sendInput.value.length
-      this.sendInput.setSelectionRange(end, end)
-      return
-    }
     this.cb.onSend(`/${cmd.name}`)
     this.sendInput.value = ''
     this.sendInput.blur()
@@ -802,7 +840,12 @@ ${settingsHtml}
 
   // ── Detail view (reveal / header / control-enable) ────────────────────────
   setActiveSession(session: ActiveSession | null): void {
+    this.setHistoryBefore(null)
     this.currentSid = session?.id ?? null
+    if (this.claudeLink) {
+      if (session) this.claudeLink.href = `https://claude.ai/code/${encodeURIComponent(session.id)}`
+      else this.claudeLink.removeAttribute('href')
+    }
     this.hideCommandMenu() // never carry a stale popover across an open/close
     const showDetail = session !== null
     if (this.listView) this.listView.hidden = showDetail
@@ -913,6 +956,10 @@ ${settingsHtml}
     this.renderInfo()
   }
 
+  focusInfo(): void {
+    this.infoBody?.closest('section')?.scrollIntoView({ block: 'center' })
+  }
+
   private renderInfo(): void {
     const body = this.infoBody
     if (!body) return
@@ -943,12 +990,50 @@ ${settingsHtml}
     if (v?.loading) row('Asking the worker…', 'info-row muted')
     else if (v?.error) row(v.error, 'info-row muted')
     const s = this.session
+    const ctx = v?.info?.context ?? s?.context
+    if (s) row(ctx?.percent != null ? `Context · ${ctx.percent}% (${ctx.usedTokens} of ${ctx.maxTokens} tokens)` : 'Context usage unavailable')
+    for (const c of v?.info?.context?.categories ?? []) row(`${c.name} · ${c.tokens} tokens`)
+    if (s?.rateLimit) row(rateLimitLabel(s))
     const settings = this.worker ? settingsLine(this.worker) : ''
     if (s?.ccVersion || settings) row([settings, s?.ccVersion ? `Claude Code ${s.ccVersion}` : ''].filter(Boolean).join(' · '), 'info-row muted')
   }
 
   // ── Event log ─────────────────────────────────────────────────────────────
-  setEvents(events: RcEvent[]): void {
+  private setHistoryBefore(before?: number | null): void {
+    this.historyBefore = before ?? null
+    this.historyRevision++
+    if (this.olderButton) {
+      this.olderButton.hidden = this.historyBefore == null
+      this.olderButton.disabled = false
+    }
+  }
+
+  private async loadOlderEvents(): Promise<void> {
+    const before = this.historyBefore
+    const button = this.olderButton
+    const log = this.logEl
+    if (before == null || !button || button.disabled || !log) return
+    const revision = this.historyRevision
+    button.disabled = true
+    const page = await this.cb.onOlderEvents(before)
+    if (revision !== this.historyRevision) return
+    button.disabled = false
+    if (!page) return
+    const previous = log.firstElementChild
+    const offset = previous?.getBoundingClientRect().top
+    const fragment = document.createDocumentFragment()
+    for (const e of page.events) {
+      if (e.sequenceNum == null || e.sequenceNum >= before || this.seen.has(e.sequenceNum)) continue
+      this.seen.add(e.sequenceNum)
+      const node = this.eventNode(e)
+      if (node) fragment.appendChild(node)
+    }
+    log.prepend(fragment)
+    if (previous && offset != null) log.scrollTop += previous.getBoundingClientRect().top - offset
+    this.setHistoryBefore(page.before != null && page.before < before ? page.before : null)
+  }
+
+  setEvents(events: RcEvent[], before?: number | null): void {
     if (!this.logEl) return
     this.logEl.textContent = ''
     this.seen = new Set()
@@ -957,6 +1042,7 @@ ${settingsHtml}
       if (e.sequenceNum != null) this.seen.add(e.sequenceNum)
       this.appendNode(e)
     }
+    this.setHistoryBefore(before)
     this.autoScroll()
   }
 
@@ -978,14 +1064,15 @@ ${settingsHtml}
     if (!this.logEl) return
     // The panel twin of EventLog's reset: only what follows a /clear stays. `seen`
     // survives, so a replay can't bring the old events back.
-    if (e.type === 'conversation_reset') {
+    if (e.type === 'conversation_reset' && !e.parentToolUseId) {
+      this.setHistoryBefore(null)
       this.logEl.textContent = ''
       this.lastFold = null
     }
-    const node = renderEventNode(e)
+    const node = this.eventNode(e)
     if (!node) return
     const foldable = node.childElementCount === 0
-    const key = foldable ? `${node.className}\0${node.textContent ?? ''}` : ''
+    const key = foldable ? `${e.parentToolUseId ?? ''}\0${node.className}\0${node.textContent ?? ''}` : ''
     if (foldable && this.lastFold?.key === key) {
       this.lastFold.count++
       this.lastFold.el.textContent = `${this.lastFold.base} ×${this.lastFold.count}`
@@ -993,6 +1080,16 @@ ${settingsHtml}
     }
     this.logEl.appendChild(node)
     this.lastFold = foldable ? { key, base: node.textContent ?? '', count: 1, el: node } : null
+  }
+
+  private eventNode(e: RcEvent): HTMLDivElement | null {
+    const node = renderEventNode(e)
+    if (!node) return null
+    if (e.parentToolUseId) {
+      node.prepend(document.createTextNode('Subagent · '))
+      node.classList.add('subagent')
+    }
+    return node
   }
 
   /** Follow the newest event unless the reader scrolled up into history. */
@@ -1068,19 +1165,42 @@ ${settingsHtml}
     const deny = document.createElement('button')
     deny.className = 'btn danger'
     deny.textContent = 'Deny'
-    deny.addEventListener('click', () => this.cb.onAnswerPermission('deny'))
+    const note = document.createElement('input')
+    note.className = 'set-input'
+    note.placeholder = 'Optional reason for denying'
+    note.setAttribute('aria-label', note.placeholder)
+    deny.addEventListener('click', () => this.cb.onAnswerPermission('deny', note.value.trim()))
     acts.appendChild(allow)
     acts.appendChild(deny)
-    banner.appendChild(acts)
+    if (p.sessionRule) {
+      const rule = document.createElement('button')
+      rule.className = 'btn session-rule'
+      rule.textContent = `Allow for this session · ${p.sessionRule}`
+      rule.onclick = () => this.cb.onAnswerPermission('allow', undefined, p.sessionRule!)
+      acts.appendChild(rule)
+    }
+    banner.append(note, acts)
+  }
+
+  showExternalDialog(): void {
+    if (!this.permBanner) return
+    this.permBanner.hidden = false
+    this.permBanner.textContent = 'Open this session in Claude to answer its dialog.'
   }
 
   // ── Question dialog (AskUserQuestion / request_user_dialog) ─────────────────
   /** Render a blocking QUESTION with its options as buttons (or hide when null).
    *  Shares the permission banner — only one blocking prompt is ever pending. A
-   *  picked option shows selected; clicking one answers that question. */
-  setDialog(questions: DialogQuestion[] | null, picks: string[][]): void {
+   *  picked option shows selected. Clicking one answers a single-select
+   *  question; a multi-select toggles it and is answered by its Done button
+   *  (`done[i]` = question i is settled). */
+  setDialog(questions: DialogQuestion[] | null, picks: string[][], done: boolean[]): void {
     const banner = this.permBanner
     if (!banner) return
+    if (questions !== this.draftQuestions) {
+      this.dialogDrafts.clear()
+      this.draftQuestions = questions
+    }
     if (!questions || questions.length === 0) {
       banner.hidden = true
       banner.textContent = ''
@@ -1100,7 +1220,7 @@ ${settingsHtml}
 
       const qt = document.createElement('div')
       qt.className = 'q-text'
-      qt.textContent = q.question || q.header || 'Question'
+      qt.textContent = `${q.question || q.header || 'Question'}${q.multiSelect ? ' (pick any)' : ''}`
       block.appendChild(qt)
 
       const opts = document.createElement('div')
@@ -1114,7 +1234,43 @@ ${settingsHtml}
         b.addEventListener('click', () => this.cb.onPickDialogOption(qi, o.label))
         opts.appendChild(b)
       }
-      block.appendChild(opts)
+      const custom = document.createElement('input')
+      custom.placeholder = 'Other answer'
+      custom.setAttribute('aria-label', `Other answer for ${q.question}`)
+      custom.className = 'set-input'
+      const other = document.createElement('button')
+      other.className = 'btn'
+      other.textContent = q.multiSelect ? 'Add answer' : 'Use answer'
+      custom.value = this.dialogDrafts.get(qi) ?? ''
+      other.disabled = !custom.value.trim()
+      custom.oninput = () => {
+        this.dialogDrafts.set(qi, custom.value)
+        other.disabled = !custom.value.trim()
+      }
+      other.onclick = () => {
+        const value = custom.value.trim()
+        if (!value) return
+        this.dialogDrafts.delete(qi)
+        this.cb.onPickDialogOption(qi, value)
+      }
+      for (const label of picks[qi] ?? []) {
+        if (options.some((o) => o.label === label)) continue
+        const pick = document.createElement('button')
+        pick.className = 'btn chosen'
+        pick.textContent = label
+        pick.onclick = () => this.cb.onPickDialogOption(qi, label)
+        opts.appendChild(pick)
+      }
+      block.append(opts, custom, other)
+      if (q.multiSelect) {
+        const n = picks[qi]?.length ?? 0
+        const ok = document.createElement('button')
+        ok.className = `btn q-done${n > 0 && !done[qi] ? ' primary' : ''}`
+        ok.textContent = done[qi] ? `Done · ${n} picked` : n > 0 ? `Done (${n})` : 'Done'
+        ok.disabled = n === 0 || !!done[qi]
+        ok.addEventListener('click', () => this.cb.onConfirmDialogPicks(qi))
+        block.appendChild(ok)
+      }
       banner.appendChild(block)
     })
 
@@ -1195,6 +1351,16 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
     }
 
     case 'user': {
+      // What the worker left in the user slot (a finished background task, an
+      // interrupt marker) is a system row, as on the HUD — not a message.
+      const notes = workerNotes(e.text)
+      if (notes) {
+        if (notes.length === 0) return null
+        const row = document.createElement('div')
+        row.className = 'ev ev-system'
+        row.textContent = notes.map((n) => `◆ ${n}`).join('\n')
+        return row
+      }
       // Clean local-command echoes the same way the HUD does: strip the
       // model-directed caveat block and unwrap `<command-name>` / stdout tags, so
       // a fired slash command reads as `/context`, not raw XML tag soup.
@@ -1226,6 +1392,7 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
       let label = ''
       if (e.subtype === 'init') label = e.workerState ? `◆ ${settingsLine(e.workerState)}` : `◆ session started (${e.model ?? 'unknown'})`
       else if (e.subtype === 'compact_boundary') label = '◆ context compacted'
+      if (!label && systemActivity(e)) label = `◆ ${systemActivity(e)}`
       if (!label) return null
       const row = document.createElement('div')
       row.className = 'ev ev-system'
@@ -1458,12 +1625,16 @@ function injectStyles(): void {
       white-space: pre-wrap; word-break: break-word; }
     .perm-acts { display: flex; gap: 6px; }
     .perm-acts .btn { flex: 1; }
+    .perm-acts { flex-wrap: wrap; }
+    .perm-acts .session-rule { flex-basis: 100%; overflow-wrap: anywhere; white-space: normal; }
+
     /* Question dialog (options as buttons) */
     .q-block { display: flex; flex-direction: column; gap: 6px; }
     .q-text { font-size: 15px; font-weight: 400; color: var(--tc-1st); line-height: 1.4; }
     .q-opts { display: flex; flex-direction: column; gap: 6px; }
     .q-opt { width: 100%; min-width: 0; text-align: left; white-space: normal; background: var(--bc-1st); }
     .q-opt.chosen { color: var(--tc-hi); background: var(--bc-hi); }
+    .q-done { align-self: flex-start; }
 
     /* ── Side question card (a white card: an answer, not a warning) ────────── */
     .aside-card { display: flex; flex-direction: column; gap: 6px; padding: 12px 16px;
@@ -1498,7 +1669,7 @@ function injectStyles(): void {
     .ev-user { display: flex; justify-content: flex-end; }
     .ev-user .ev-text { color: var(--tc-hi); font-weight: 400; background: var(--bc-hi);
       padding: 8px 12px; border-radius: var(--r); max-width: 85%; }
-    .ev-system { color: var(--tc-2nd); font-size: 13px; font-weight: 400; }
+    .ev-system { color: var(--tc-2nd); font-size: 13px; font-weight: 400; white-space: pre-line; }
     .ev-result { font-size: 13px; font-weight: 400; font-variant-numeric: tabular-nums; }
     .ev-result.ok { color: var(--tc-green); }
     .ev-result.err { color: var(--tc-red); }
@@ -1517,6 +1688,7 @@ function injectStyles(): void {
     .send-input::placeholder { color: var(--tc-2nd); }
     .interim { font-size: 13px; color: var(--tc-2nd); font-style: italic; padding: 0 2px; }
     .interim[hidden] { display: none; }
+    .copy-draft { font: inherit; color: inherit; background: none; border: 0; padding: 2px 4px; text-decoration: underline; cursor: pointer; }
     .composer-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
     .composer-row .btn { min-width: 0; padding: 12px 6px; }
     /* Canned sends: even, intentional widths (3-up then 2-up at phone width),

@@ -28,26 +28,9 @@ export interface QuickSend {
   text: string
 }
 
-/**
- * A slash command the wearer can fire from the Compose → Commands submenu (glasses)
- * or the panel's `/` autocomplete. Sent to the worker as a plain `/name` message —
- * remote-control workers execute slash commands locally at zero cost (the same
- * mechanism the effort control's fallback relies on), so no dedicated bridge route
- * is needed.
- */
 export interface SlashCommand {
-  /** The command name WITHOUT the leading slash, e.g. `compact`. */
   name: string
-  /** Display label, e.g. `Compact context`. */
   label: string
-  /** One-line description for the panel autocomplete row. */
-  hint?: string
-  /** Takes a free-text argument: the panel fills `/name ` and waits for typed
-   *  input instead of sending on pick. Ignored on the glasses (fired bare). */
-  takesArg?: boolean
-  /** Heavy or destructive → don't fire on a single interaction. Glasses route it
-   *  through the confirm screen; the panel fills the box and waits for Send. */
-  confirm?: boolean
 }
 
 /** How full a session's context window is (from the session's metadata). */
@@ -81,6 +64,7 @@ export interface ActiveSession {
   pendingAction: unknown | null // external_metadata.pending_action (permission summary)
   /** The worker's current effort level (absent on older workers). */
   effort: EffortLevel | string | null
+  rateLimit?: { status: string; resetsAt: number | null } | null
   context: ContextUsage | null
   /** The server's one-line post-turn summary of where the session stands. */
   summary: string | null
@@ -113,7 +97,14 @@ export interface AsideTurn {
 }
 
 /** What GET …/info asks the worker for; each part is null when it didn't answer. */
+export type InfoSection = 'all' | 'context' | 'usage'
 export interface SessionInfo {
+  context?: {
+    usedTokens: number | null
+    maxTokens: number | null
+    percent: number | null
+    categories: { name: string; tokens: number }[]
+  }
   usage: {
     /** The plan's usage windows: `session` (5-hour), `weekly_all`, and
      *  `weekly_scoped` (one model's own weekly cap — `model` names it). */
@@ -160,6 +151,7 @@ export interface PermissionRequest {
   toolName: string | null
   toolUseId: string | null
   input: Record<string, unknown> | null
+  sessionRule?: string | null
   suggestions: unknown | null
   dialogKind: string | null // request_user_dialog `dialog_kind`, else null
   questions: DialogQuestion[] // parsed question(s)+options (empty for tool perms)
@@ -204,6 +196,9 @@ export interface RcEvent {
   subtype: string | null
   role: 'user' | 'assistant' | null
   /** 'client' = a controller wrote it (this app, claude.ai…); 'worker' = Claude Code. */
+  parentToolUseId?: string | null
+  systemStatus?: string | null
+  taskSummary?: string | null
   source: 'client' | 'worker' | string | null
   text: string
   toolUses: ToolUse[]
@@ -254,12 +249,19 @@ export class BridgeError extends Error {
   }
 }
 
+export interface HistoryPage {
+  events: RcEvent[]
+  /** Oldest sequence number, exclusive on the next read. Absent on older bridges. */
+  before?: number | null
+}
+
 /** The client's view of the bridge, implemented in rc/client.ts. */
 export interface BridgeClient {
   whoami(): Promise<WhoAmI>
   listActive(): Promise<ActiveSession[]>
   getSession(sid: string): Promise<ActiveSession>
   getHistory(sid: string, limit?: number): Promise<RcEvent[]>
+  getHistoryPage(sid: string, before?: number, limit?: number): Promise<HistoryPage>
   /** Open the live SSE stream. Returns an unsubscribe fn. */
   streamEvents(
     sid: string,
@@ -269,7 +271,7 @@ export interface BridgeClient {
   send(sid: string, text: string): Promise<void>
   answerPermission(
     sid: string,
-    p: { requestId: string; toolUseId?: string | null; decision: Decision; message?: string; updatedInput?: unknown },
+    p: { requestId: string; toolUseId?: string | null; decision: Decision; message?: string; sessionRule?: string; updatedInput?: unknown },
   ): Promise<void>
   /** Answer a blocking question. AskUserQuestion arrives as a `can_use_tool`
    *  permission, so `toolUseId` + the original `input` are passed through so the
@@ -294,6 +296,9 @@ export interface BridgeClient {
    *  (the /effort fallback, which also saves it as the host's default). */
   setEffort(sid: string, effort: EffortLevel | null): Promise<string>
   archive(sid: string): Promise<void>
+  /** Clear the session's unread mark, as opening it in claude.ai does
+   *  (bridge 0.6.0+; an older one answers 404). */
+  markRead(sid: string): Promise<void>
   /** Pin or unpin the session in claude.ai/code's sidebar (bridge 0.5.0+).
    *  Resolves to whether it is pinned now. */
   setPinned(sid: string, pinned: boolean): Promise<boolean>
@@ -301,6 +306,6 @@ export interface BridgeClient {
    *  interrupting it or adding to it. Null = nothing to answer from yet. */
   ask(sid: string, question: string, history: AsideTurn[]): Promise<string | null>
   /** Plan usage + uncommitted git changes, asked of the worker. */
-  info(sid: string): Promise<SessionInfo>
+  info(sid: string, section?: InfoSection): Promise<SessionInfo>
   stopTask(sid: string, taskId: string): Promise<void>
 }

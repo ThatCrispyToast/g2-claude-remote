@@ -3,7 +3,7 @@
 It is a purpose-built sibling of ``claude-rc``'s ``webui.py``: a dependency-free
 ``http.server`` that wraps :class:`claude_rc.client.RemoteControlClient` and
 exposes exactly what the glasses UI needs. It differs from the stock webui in
-seven deliberate ways, each required by this app:
+eight deliberate ways, each required by this app:
 
 1. **Active-only.** ``GET /api/sessions`` returns *only* sessions that are
    ``status == "active"`` **and** ``connection_status == "connected"`` — i.e.
@@ -53,6 +53,14 @@ seven deliberate ways, each required by this app:
    pinging, and a ping the bridge can't deliver is how it learns the app has
    gone — a quiet session's stream otherwise held its thread and its upstream
    connection until the session's next event.
+8. **History that holds the conversation.** ``GET …/events`` reads the newest
+   events and then keeps reading back until they include some transcript. A
+   worker posts a fresh ``system/init`` for every controller that attaches, so
+   the newest 200 events of a session that sat idle while it was checked from
+   claude.ai are settings and control traffic only (seen live: the first line
+   of conversation 224 to 414 events back), and the app opened it empty.
+   ``POST …/read`` clears the session's unread mark, as opening it in
+   claude.ai does.
 
 Run it — the goal is "one command and the glasses can connect":
 
@@ -76,6 +84,7 @@ as the token) → the persisted token file → generate-and-persist.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hmac
 import ipaddress
 import json
@@ -122,9 +131,10 @@ try:
     from claude_rc import PINNED_TAG
     from claude_rc import __version__ as _rc_api_version
     from claude_rc.client import ControlRejected, ControlTimeout
-    from claude_rc.events import RC, Event, _to_int, cli_dialog_response
+    from claude_rc.events import RC, Event, _to_int
 
-    _rc_api_too_old = tuple(map(int, re.findall(r"\d+", _rc_api_version)[:3])) < (0, 5, 1)
+    _rc_version = tuple(map(int, re.findall(r"\d+", _rc_api_version)[:3]))
+    _rc_api_too_old = _rc_version < (0, 5, 1)
 except ImportError:  # pragma: no cover - operator error
     _rc_api_too_old = True
 if _rc_api_too_old:  # pragma: no cover - operator error
@@ -183,6 +193,15 @@ ASIDE_TIMEOUT_S = 150.0
 # further than this many pages: a thousand active sessions is not a real list.
 LIST_PAGE = 200
 LIST_MAX_PAGES = 5
+# A session's history is read newest-first a page at a time, until it holds
+# this many events a reader would see (see `_is_transcript`) or this many pages
+# have been read. Each page is one upstream call, about a third of a second.
+HISTORY_PAGE = 200
+HISTORY_MAX_PAGES = 6
+HISTORY_MIN_TRANSCRIPT = 40
+# A JSON body this long is sent gzipped to a client that takes it: a deep
+# history is mostly repeated keys, and the phone may be on a mobile network.
+GZIP_MIN_BYTES = 2048
 
 # --- route patterns (first hit wins) ---------------------------------------
 _SID = r"(?P<sid>[^/]+)"
@@ -200,6 +219,7 @@ _R_MODEL = re.compile(rf"^/api/sessions/{_SID}/model$")
 _R_PERMMODE = re.compile(rf"^/api/sessions/{_SID}/permission_mode$")
 _R_EFFORT = re.compile(rf"^/api/sessions/{_SID}/effort$")
 _R_ARCHIVE = re.compile(rf"^/api/sessions/{_SID}/archive$")
+_R_READ = re.compile(rf"^/api/sessions/{_SID}/read$")
 _R_PIN = re.compile(rf"^/api/sessions/{_SID}/pin$")
 
 
@@ -229,6 +249,25 @@ def _context(ext: dict) -> Optional[dict]:
     return {"usedTokens": used, "maxTokens": most, "percent": round(100 * used / most)}
 
 
+def _rate_limit(ext: dict) -> Optional[dict]:
+    info = ext.get("rate_limit_info")
+    if not isinstance(info, dict) or info.get("status") not in ("allowed", "allowed_warning", "rejected"):
+        return None
+    return {"status": info["status"], "resetsAt": _to_int(info.get("resetsAt"))}
+
+
+def _takes_gzip(value: str) -> bool:
+    choices = {}
+    for item in value.lower().split(","):
+        name, _, params = item.strip().partition(";")
+        try:
+            quality = float(params.strip().removeprefix("q=")) if params else 1.0
+        except ValueError:
+            quality = 0.0
+        choices[name.strip()] = 0 < quality <= 1
+    return choices.get("gzip", choices.get("*", False))
+
+
 def session_to_json(s: dict) -> dict:
     """Trim a raw upstream session into the ``ActiveSession`` shape (camelCase)."""
     cfg = s.get("config") or {}
@@ -250,10 +289,22 @@ def session_to_json(s: dict) -> dict:
         "pendingAction": ext.get("pending_action") or None,
         "effort": ext.get("effort_level") or None,
         "context": _context(ext),
+        "rateLimit": _rate_limit(ext),
         "summary": summary.get("status_detail") or None,
         "needsAction": summary.get("needs_action") or None,
         "ccVersion": ext.get("container_cc_version") or None,
     }
+
+
+def _is_transcript(ev: Event) -> bool:
+    """Whether a reader would call ``ev`` part of the conversation: something
+    said, a tool run, a turn's end. Settings snapshots, control traffic,
+    tool-result echoes and thinking-only frames are not."""
+    if ev.type == "result":
+        return True
+    if ev.type == "assistant":
+        return bool(ev.text().strip() or ev.tool_uses())
+    return ev.type == "user" and bool(re.sub(r"<local-command-caveat>.*?</local-command-caveat>", "", ev.text(), flags=re.S).strip())
 
 
 def _assistant_model(ev: Event) -> Optional[str]:
@@ -322,6 +373,23 @@ def _dialog_info(req: dict) -> dict:
     return {"dialogKind": dialog_kind, "questions": questions, "prompt": prompt}
 
 
+def _session_rule(updates: Any, tool_name: str) -> Optional[str]:
+    """Offer a single worker-supplied, session-only rule whose scope fits on glass."""
+    if not isinstance(updates, list) or len(updates) != 1 or not isinstance(updates[0], dict):
+        return None
+    update = updates[0]
+    if (update.get("type"), update.get("destination"), update.get("behavior")) != ("addRules", "session", "allow"):
+        return None
+    rules = update.get("rules")
+    if not isinstance(rules, list) or len(rules) != 1 or not isinstance(rules[0], dict):
+        return None
+    rule = rules[0]
+    content = rule.get("ruleContent")
+    if not tool_name or rule.get("toolName") != tool_name or not isinstance(content, str) or not content.strip():
+        return None
+    return f"{tool_name}({content})"
+
+
 def _permission_request(ev: Event) -> Optional[dict]:
     """The details out of a blocking control request — either a tool-permission
     (``can_use_tool``) or a question (``request_user_dialog`` / ``side_question``).
@@ -346,6 +414,7 @@ def _permission_request(ev: Event) -> Optional[dict]:
         "toolName": req.get("tool_name") or req.get("name") or (req.get("tool") or {}).get("name"),
         "toolUseId": tool_use_id,
         "input": req.get("input") or req.get("tool_input") or (req.get("tool") or {}).get("input"),
+        "sessionRule": _session_rule(req.get("permission_suggestions"), req.get("tool_name")) if _rc_version >= (0, 7, 1) else None,
         "suggestions": req.get("permission_suggestions") or req.get("suggestions"),
         "dialogKind": dialog["dialogKind"],
         "questions": dialog["questions"],
@@ -419,26 +488,31 @@ def event_to_json(ev: Event) -> dict:
         "usage": _usage(ev),
         "workerState": _worker_state(ev),
         "tasks": _tasks(ev),
+        "parentToolUseId": ev.payload.get("parent_tool_use_id"),
+        "systemStatus": ev.payload.get("status") if ev.type == "system" else None,
+        "taskSummary": (ev.payload.get("summary") or ev.payload.get("status")) if ev.subtype == "task_notification" else None,
     }
 
 
-def _answers_map(answers: Any) -> dict[str, Any]:
+def _answers_map(answers: Any) -> dict[str, str]:
     """Fold the app's ``[{header, question, options: [chosen labels]}]`` into the
-    AskUserQuestion answer map: ``{<question text>: <label | [labels]>}``.
+    AskUserQuestion answer map: ``{<question text>: <label, label…>}``.
 
-    The tool keys answers by the *question* string, so that's the key. A single
-    pick is a bare label; a multi-select is the list. Unanswered questions are
-    simply omitted (→ the tool reports them as "(no option selected)").
+    The tool keys answers by the *question* string, so that's the key, and
+    every answer is a string: a multi-select's labels are comma-separated (the
+    tool's own schema: "question text -> answer string; multi-select answers
+    are comma-separated"). Unanswered questions are simply omitted (→ the tool
+    reports them as "(no option selected)").
     """
-    out: dict[str, Any] = {}
+    out: dict[str, str] = {}
     for a in answers or []:
         if not isinstance(a, dict):
             continue
         q = a.get("question") or a.get("header")
-        picks = [p for p in (a.get("options") or []) if p]
+        picks = [str(p) for p in (a.get("options") or []) if p]
         if not q or not picks:
             continue
-        out[q] = picks[0] if len(picks) == 1 else picks
+        out[q] = ", ".join(picks)
     return out
 
 
@@ -517,8 +591,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _json(self, obj: Any, status: int = 200) -> None:
         body = json.dumps(obj).encode()
+        packed = len(body) >= GZIP_MIN_BYTES and _takes_gzip(self.headers.get("Accept-Encoding", ""))
+        if packed:
+            body = gzip.compress(body, compresslevel=5)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Vary", "Accept-Encoding")
+        if packed:
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self._cors()
@@ -574,18 +654,16 @@ class _Handler(BaseHTTPRequestHandler):
             m = _R_EVENTS.match(path)
             if m:
                 self._require_active(m["sid"])
-                limit = self._qint(self._query(), "limit", 200)
-                # NEWEST `limit` events (desc + reverse → oldest→newest). Fetching
-                # asc would return the OLDEST slice of a long session, leaving the
-                # app's resume cursor so far behind that the stream replays the
-                # whole backlog (incl. every long-answered permission prompt).
-                evs = self.rc.list_events(m["sid"], limit=limit, sort_order="desc")
-                evs.reverse()
-                return self._json({"events": [event_to_json(e) for e in evs]})
+                query = self._query()
+                before = query.get("before", [None])[0]
+                if before is not None and not before.isdecimal():
+                    return self._json({"error": "invalid history cursor"}, status=400)
+                evs, older = self._history(m["sid"], self._qint(query, "limit", HISTORY_PAGE), before)
+                return self._json({"events": [event_to_json(e) for e in evs], "before": older})
             m = _R_INFO.match(path)
             if m:
                 self._require_active(m["sid"])
-                return self._json(self._info(m["sid"]))
+                return self._json(self._info(m["sid"], self._query().get("section", ["all"])[0]))
             m = _R_SESSION.match(path)
             if m:
                 return self._json({"session": session_to_json(self._require_active(m["sid"]))})
@@ -608,6 +686,8 @@ class _Handler(BaseHTTPRequestHandler):
                 text = (body.get("text") or "").strip()
                 if not text:
                     return self._json({"error": "empty message", "status": 400}, status=400)
+                if re.match(r"^/[A-Za-z0-9_:-]+(?:\s|$)", text):
+                    return self._json({"error": "Run slash commands in Claude. Session info shows context and usage.", "status": 422}, status=422)
                 self.rc.send_message(m["sid"], text)
                 return self._json({"ok": True})
             m = _R_ASIDE.match(path)
@@ -640,6 +720,22 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._json({"error": "missing request_id", "status": 400}, status=400)
                 if decision not in ("allow", "deny"):
                     return self._json({"error": "decision must be allow|deny", "status": 400}, status=400)
+                extra = {}
+                if body.get("session_rule"):
+                    if _rc_version < (0, 7, 1):
+                        return self._json({"error": "Refresh claude-rc-api for session rules"}, status=422)
+                    # Resolve the worker's own offer again. The phone names the rule
+                    # it displayed and cannot supply an arbitrary settings update.
+                    info = self.rc.initialize(m["sid"])
+                    pending = info.get("pending_permission_requests") or []
+                    original = next((entry for entry in pending
+                                     if isinstance(entry, dict) and entry.get("request_id") == request_id), {})
+                    req = original.get("request") or original
+                    updates = req.get("permission_suggestions")
+                    if decision != "allow" or _session_rule(updates, req.get("tool_name")) != body["session_rule"]:
+                        return self._json({"error": "Session rule is no longer offered", "status": 422}, status=422)
+                    self._require_active(m["sid"])
+                    extra["updated_permissions"] = updates
                 self.rc.respond_permission(
                     m["sid"],
                     request_id,
@@ -647,6 +743,7 @@ class _Handler(BaseHTTPRequestHandler):
                     tool_input=body.get("updated_input"),
                     tool_use_id=body.get("tool_use_id"),
                     message=body.get("message"),
+                    **extra,
                 )
                 return self._json({"ok": True})
             m = _R_DIALOG.match(path)
@@ -660,8 +757,7 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._json({"error": "status must be completed|cancelled", "status": 400}, status=400)
                 # AskUserQuestion is delivered as a `can_use_tool` permission, so it
                 # is answered on the PERMISSION path (allow + updatedInput.answers;
-                # an empty map is the graceful dismiss) — only the rarer true dialog
-                # kinds use the {status, result} shape.
+                # an empty map is the graceful dismiss). Other dialogs need their own schema.
                 answers = body.get("answers")
                 if body.get("subtype") == "can_use_tool":
                     self.rc.answer_question(
@@ -672,9 +768,7 @@ class _Handler(BaseHTTPRequestHandler):
                         tool_use_id=body.get("tool_use_id"),
                     )
                 else:
-                    completed = status == "completed"
-                    result = {"answers": answers} if completed and answers else None
-                    self.rc.send_raw(m["sid"], cli_dialog_response(request_id, completed=completed, result=result))
+                    return self._json({"error": "Answer this dialog in Claude.", "status": 422}, status=422)
                 return self._json({"ok": True})
             m = _R_INTERRUPT.match(path)
             if m:
@@ -723,6 +817,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self._require_active(m["sid"])
                 self.rc.archive_session(m["sid"])
                 return self._json({"ok": True})
+            m = _R_READ.match(path)
+            if m:
+                self._require_active(m["sid"])
+                self.rc.mark_read(m["sid"])
+                return self._json({"ok": True})
             m = _R_PIN.match(path)
             if m:
                 self._require_active(m["sid"])
@@ -749,6 +848,42 @@ class _Handler(BaseHTTPRequestHandler):
                 break
         return out
 
+    def _history(self, sid: str, limit: int, before: Optional[str] = None) -> tuple[list[Event], Optional[int]]:
+        """The session's newest events, oldest first: ``limit`` of them, and
+        then as many more as it takes to hold some conversation.
+
+        NEWEST, so desc: an asc read is the session's OLDEST slice, which would
+        leave the app's resume cursor so far behind that the stream replayed
+        the whole backlog, every long-answered prompt included. And further
+        back than ``limit`` because the newest events are often not
+        conversation at all (see point 8 at the top). The read stops at a
+        ``conversation_reset``: nothing before a /clear is shown anyway.
+        """
+        size = max(1, min(limit, HISTORY_PAGE))  # the first read; the rest are whole pages
+        out: list[Event] = []
+        shown = 0
+        cursor = before
+        older = None
+        for _ in range(HISTORY_MAX_PAGES):
+            page = self.rc.list_events(sid, limit=size, sort_order="desc", cursor=cursor)
+            if cursor is not None:
+                page = [e for e in page if e.sequence_num is not None and e.sequence_num < int(cursor)]
+            reset = next((i for i, ev in enumerate(page) if ev.type == RC.CONVERSATION_RESET and not ev.payload.get("parent_tool_use_id")), None)
+            if reset is not None:
+                out.extend(page[:reset + 1])
+                older = None
+                break
+            out.extend(page)
+            seqs = [e.sequence_num for e in page if e.sequence_num is not None]
+            older = min(seqs) if len(page) == size and seqs else None
+            shown += sum(map(_is_transcript, page))
+            if older is None or (len(out) >= limit and shown >= HISTORY_MIN_TRANSCRIPT):
+                break
+            cursor = str(older)
+            size = HISTORY_PAGE
+        out.reverse()
+        return out, older
+
     def _whoami(self) -> dict:
         try:
             creds = load_credentials()
@@ -764,12 +899,21 @@ class _Handler(BaseHTTPRequestHandler):
             "token_len": len(creds.access_token),
         }
 
-    def _info(self, sid: str) -> dict:
+    def _info(self, sid: str, section: str = "all") -> dict:
         """Plan usage + uncommitted git changes, asked of the worker (each a
         control round trip that leaves a request/response pair in the event
         log). Best-effort per part: a refusal or timeout nulls that part
         (``diffPending``: the worker was still computing the diff — ask again)."""
         out: dict[str, Any] = {"usage": None, "diff": None, "diffPending": False}
+        if section == "context":
+            usage = self.rc.get_context_usage(sid, timeout=10.0)
+            out["context"] = {
+                "usedTokens": usage.get("totalTokens"), "maxTokens": usage.get("maxTokens"),
+                "percent": usage.get("percentage"),
+                "categories": [{"name": c["name"], "tokens": c["tokens"]} for c in usage.get("categories") or []
+                               if isinstance(c, dict) and isinstance(c.get("name"), str) and isinstance(c.get("tokens"), int)],
+            }
+            return out
         try:
             usage = self.rc.get_usage(sid, timeout=10.0)
             limits = (usage.get("rate_limits") or {}).get("limits") or []
@@ -790,6 +934,8 @@ class _Handler(BaseHTTPRequestHandler):
             }
         except (ControlRejected, ControlTimeout):
             pass
+        if section == "usage":
+            return out
         try:
             diff = self.rc.get_workspace_diff(sid, timeout=12.0)
             if diff is not None:

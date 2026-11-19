@@ -31,19 +31,23 @@ dependency. To pick up fixes, run once with `--refresh`:
 uvx --refresh --from "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge
 ```
 
-In particular, **"messages send (HTTP 200, they appear in the session) but
-Claude never responds"** on Claude Code ≥ 2.1.220 is fixed in `claude-rc-api`
-0.2.1 — newer workers only start a turn for messages whose ingest identifies as
-a human client, and older library versions identified as something the worker
-demotes to a peer-agent message. Refresh as above to get it. The same goes for
-the app's **Ask aside** and **Session info** (bridge 0.4.0), and for a
-**session missing from the list**: until bridge 0.5.0 the list was the
-account's 20 newest sessions, archived ones included, so a long-running session
-dropped off it. Bridge 0.5.0 needs `claude-rc-api` 0.5.1 (the list filter,
-pins, stream keepalives; since 0.4.0 its token refreshes save only the new
-tokens over Claude Code's login instead of rewriting its whole block, and it
-reads the login from the macOS Keychain). An older library makes the bridge
-exit with this hint.
+A successful send confirms delivery. On 2026-11-19 a Claude Code 2.1.328
+worker treated bridge sends as peer messages and spent a turn declining
+`/context`. The change in claude-rc-api 0.2.1 helped older workers. Updating
+the bridge cannot assign a human sender to a message. Open the session in
+Claude on the web or phone for human-authored messages and slash commands.
+
+Bridge 0.4.0 added Ask aside and Session info. Version 0.5.0 paginates the
+active-session list so older running sessions remain visible. Version 0.6.0
+reads back past repeated settings events to find the conversation.
+The bridge requires claude-rc-api 0.5.1 or newer.
+
+Bridge 0.7.0 pages older history with the exclusive `before` cursor from
+`GET …/events`. A null cursor ends history at the first event or the latest
+conversation reset. The app gets the current rate limit from session metadata.
+With claude-rc-api 0.7.1+, permission prompts can also offer a session rule.
+The bridge confirms the worker still offers that exact rule before sending it.
+Persistent host permission settings stay under the terminal user's control.
 
 Also works with `pip install "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server"`
 then `claude-remote-bridge`, or from a repo checkout via `python3 server/rc_bridge.py`.
@@ -74,8 +78,11 @@ one-line status summary and claude.ai pin; per-session SSE event streams
 carrying the worker's live model / effort / permission mode and background
 tasks, with a `ping` frame every ~15 s (the app redials a stream that stops
 pinging, and the bridge drops one whose app has gone);
-send/interrupt/model/mode/effort/pin/archive controls; routes that **answer
-blocking permission prompts and questions**; and worker queries: `POST …/aside`
+a session's recent history, read back far enough to hold some conversation
+and gzipped for a client that takes it; send/interrupt/model/mode/effort/pin/
+archive controls and `POST …/read` (clear the unread mark); routes that
+**answer blocking permission prompts and questions**; and worker queries:
+`POST …/aside`
 (a side question, answered without interrupting the session or entering its
 transcript), `GET …/info` (plan usage + uncommitted git changes) and
 `POST …/stop_task`. It adds no Anthropic protocol code of its own, keeps no

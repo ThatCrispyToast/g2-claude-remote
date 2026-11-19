@@ -134,7 +134,8 @@ export const POLL_MS = numEnv(env.VITE_POLL_MS, 4000)
  *  keepalive through) and then stays silent this long is dead, whatever the
  *  socket says. The Claude Code CLI's own limit. */
 export const STREAM_SILENCE_MS = numEnv(env.VITE_STREAM_SILENCE_MS, 45_000)
-/** Events pulled for history when a session is first opened. */
+/** Newest events asked for when a session is opened. A floor, not a cap: a
+ *  0.6.0 bridge reads further back until the window holds some conversation. */
 export const HISTORY_LIMIT = numEnv(env.VITE_HISTORY_LIMIT, 200)
 
 // ─── Glasses display ─────────────────────────────────────────────────────────
@@ -241,49 +242,15 @@ function parseAsideQuestions(raw: unknown): string[] {
 }
 export const ASIDE_QUESTIONS: string[] = parseAsideQuestions(env.VITE_ASIDE_QUESTIONS)
 
-/**
- * Slash commands offered in the Compose → Commands submenu (glasses) and the
- * panel's `/` autocomplete. Sent to the session as a plain `/name` message —
- * remote-control workers run slash commands locally at zero cost (the mechanism
- * the effort control's fallback uses). The default set is deliberately limited to
- * "fire-and-observe" commands that behave over remote-control; interactive ones
- * (/login, /config, /vim…) have no remote meaning and must not go here. Override
- * with a JSON array of {name,label,hint?,takesArg?,confirm?} in VITE_SLASH_COMMANDS.
- */
-function parseSlashCommands(raw: unknown): SlashCommand[] {
-  if (typeof raw === 'string' && raw.trim()) {
-    try {
-      const arr = JSON.parse(raw)
-      if (Array.isArray(arr)) {
-        return arr
-          .filter((c) => c && typeof c.name === 'string' && typeof c.label === 'string')
-          .map((c) => ({
-            name: String(c.name).replace(/^\/+/, ''), // tolerate a leading slash in config
-            label: c.label,
-            hint: typeof c.hint === 'string' ? c.hint : undefined,
-            takesArg: Boolean(c.takesArg),
-            confirm: Boolean(c.confirm),
-          }))
-      }
-    } catch {
-      /* fall through to defaults */
-    }
-  }
-  // This set is validated live against a remote-control worker (see CLAUDE.md
-  // "Slash commands"): each runs LOCALLY at zero model cost. Commands the worker
-  // refuses over RC (/status, /release-notes → "isn't available over Remote
-  // Control") or that aren't real local commands (/todos → falls through to a
-  // model turn) are deliberately excluded. /cost is just a redirect to /usage,
-  // so we ship /usage directly.
-  return [
-    { name: 'context', label: 'Context usage', hint: 'Tokens left in context' },
-    { name: 'usage', label: 'Usage', hint: 'Session + weekly usage' },
-    { name: 'mcp', label: 'MCP servers', hint: 'MCP connection status' },
-    { name: 'compact', label: 'Compact context', hint: 'Summarize history to free space', takesArg: true, confirm: true },
-    { name: 'clear', label: 'Clear history', hint: 'Wipe the conversation', confirm: true },
-  ]
+/** Local shortcuts to session information. Neither posts a user message. */
+export const SLASH_COMMANDS: SlashCommand[] = [
+  { name: 'context', label: 'Context usage' },
+  { name: 'usage', label: 'Plan usage' },
+]
+
+export function isSlashInput(text: string): boolean {
+  return /^\/[\w:-]+(?:\s|$)/u.test(text.trim())
 }
-export const SLASH_COMMANDS: SlashCommand[] = parseSlashCommands(env.VITE_SLASH_COMMANDS)
 
 // ─── Voice dictation (optional; reuses the glasses mic + Deepgram) ───────────
 // Text INPUT on a keyboard-less device: hold-free voice dictation. Streams the

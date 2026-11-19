@@ -15,7 +15,7 @@
 // the left edge — `»` you, plain text = assistant, `◆` a tool, `◇` a result,
 // `☉` a system line, `!` a question/permission.
 
-import type { RcEvent, ToolUse, WorkerState } from '../rc/types'
+import type { ActiveSession, RcEvent, ToolUse, WorkerState } from '../rc/types'
 import { clip, HUD } from '../glasses'
 import { TOOL_ARG_CHARS, HUD_CHARS_PER_ROW } from '../config'
 
@@ -78,6 +78,29 @@ export function cleanUserEcho(text: string): string {
   const stdout = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/.exec(stripped)?.[1]
   if (stdout != null) return stdout.trim()
   return stripped
+}
+
+/**
+ * The notes the WORKER left in the user slot, one readable line each, or null
+ * when the text is an ordinary message. Two kinds arrive there (seen live): a
+ * finished background task's `<task-notification>` (an XML-ish block of ids,
+ * paths and a `<summary>` — it wakes the model, and read raw it filled the HUD
+ * with tag soup; several can share one event), and the `[Request interrupted
+ * by user]` marker an interrupt leaves. Neither is something anyone typed, so
+ * both surfaces render each note as a system line, not as a message. Whatever
+ * follows a notification block is addressed to the model, and is dropped.
+ */
+export function workerNotes(text: string): string[] | null {
+  const t = text.trim()
+  if (t.startsWith('<task-notification>')) {
+    return [...t.matchAll(/<task-notification>([\s\S]*?)<\/task-notification>/g)].map(([, block]) => {
+      const summary = /<summary>([\s\S]*?)<\/summary>/.exec(block)?.[1]?.replace(/\s+/g, ' ').trim()
+      const status = /<status>([^<]*)<\/status>/.exec(block)?.[1]?.trim()
+      return summary || `background task ${status || 'finished'}`
+    })
+  }
+  if (/^\[Request interrupted by user[^\]]*\]$/.test(t)) return ['interrupted']
+  return null
 }
 
 // ─── Tool chains ─────────────────────────────────────────────────────────────
@@ -253,6 +276,20 @@ const NOTHING: EventParts = { text: '', tools: [] }
  * tool_result lands between every pair of consecutive tool_uses, so treating it
  * as a break would make every chain exactly one tool long.
  */
+export function rateLimitLabel(session: ActiveSession): string {
+  const limit = session.rateLimit
+  if (!limit) return ''
+  const status = { allowed: 'allowed', allowed_warning: 'near limit', rejected: 'reached' }[limit.status] ?? limit.status
+  const reset = limit.resetsAt ? new Date(limit.resetsAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''
+  return `Rate limit: ${status}${reset ? ` (resets ${reset})` : ''}`
+}
+
+export function systemActivity(e: RcEvent): string {
+  if (e.subtype === 'status' && e.systemStatus === 'compacting') return 'compacting context'
+  if (e.subtype === 'task_notification') return e.taskSummary || 'background task updated'
+  return ''
+}
+
 export function renderEventParts(e: RcEvent): EventParts {
   switch (e.type) {
     case 'assistant':
@@ -260,6 +297,8 @@ export function renderEventParts(e: RcEvent): EventParts {
       return { text: cleanProse(e.text), tools: e.toolUses.map(toolChainEntry) }
 
     case 'user': {
+      const notes = workerNotes(e.text)
+      if (notes) return { text: notes.map((n) => `${HUD.SYS} ${n}`).join('\n'), tools: [] }
       // The wearer's / echoed sends. A bare tool_result (no text) is HUD noise.
       const text = cleanProse(cleanUserEcho(e.text))
       return text ? { text: `${HUD.USER} ${text}`, tools: [] } : NOTHING
@@ -279,6 +318,8 @@ export function renderEventParts(e: RcEvent): EventParts {
         const line = e.workerState ? settingsLine(e.workerState) : `session started ${HUD.SEP} ${modelShort(e.model)}`
         return { text: `${HUD.SYS} ${line}`, tools: [] }
       }
+      const activity = systemActivity(e)
+      if (activity) return { text: `${HUD.SYS} ${activity}`, tools: [] }
       if (e.subtype === 'compact_boundary') return { text: `${HUD.SYS} context compacted`, tools: [] }
       return NOTHING
     }

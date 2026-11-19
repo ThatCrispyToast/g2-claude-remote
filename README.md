@@ -41,16 +41,37 @@ on the glasses, but messages send intact.
 - **Scroll** to select or read. In a session, scroll up for history and down for
   live output.
 - **Tap** to open or confirm. Tap session output to open Compose for replies,
-  commands, and model, mode, or effort changes.
+  context and plan usage, and model, mode, or effort changes.
 - **Double-tap** to go back, cancel dictation, or set a prompt aside. Reopen
   deferred prompts from Compose.
+- **Prompts** list Allow and Deny, or a question's options. Details shows the
+  whole command or question before you answer. A pick-any question marks each
+  option you tap. Submit sends the selection. Type an Other answer on the phone
+  or dictate one on the glasses. Deny can include a reason. When the worker
+  offers a session-only permission rule, the app shows its scope before approval.
 
 Ask aside answers questions without interrupting the session or adding to its
 transcript. Each question uses one model call.
 
+### Sending messages and running commands
+
+On a Claude Code 2.1.328 test worker (2026-11-19), typed and dictated messages
+arrived as messages from a peer session. The worker answered ordinary text and
+spent a model turn refusing `/context`. Other worker versions may behave
+differently. Use **Open in Claude** in the phone panel to send as yourself or
+run commands such as `/compact` and `/clear`. To transfer a glasses dictation,
+leave it on the confirmation screen and tap **Copy glasses draft** on the phone,
+then paste it into Claude. For a typed message, use **Copy draft**. The app's **Context usage** and
+**Plan usage** shortcuts show session data directly. [Remote Control](https://code.claude.com/docs/en/remote-control)
+
+Scroll to the top of history on the glasses, or select **Earlier events** on the
+panel, to read back to the last conversation reset. Older history, rate-limit
+status and session permission rules require bridge 0.7.0. Answer other kinds
+of worker dialogs in Claude.
+
 ## Development
 
-Requires Node 18+ and Python 3.10+.
+Requires Node 22.13+ on the 22.x line or Node 24+, and Python 3.10+.
 
 ```bash
 git clone https://github.com/ThatCrispyToast/g2-claude-remote && cd g2-claude-remote

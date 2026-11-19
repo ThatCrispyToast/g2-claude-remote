@@ -83,11 +83,7 @@ export function modelItems(current: string | null): SubmenuItem[] {
   return items
 }
 
-/**
- * The Commands submenu — each row fires a slash command (`/name`). A command is a
- * one-shot action, not a persistent setting, so nothing is ever marked `current`;
- * `value` carries the bare command name for the state machine to dispatch.
- */
+/** Session-info shortcuts on the glasses. */
 export function commandItems(): SubmenuItem[] {
   const items: SubmenuItem[] = SLASH_COMMANDS.map((c) => ({
     label: `/ ${c.label}`,

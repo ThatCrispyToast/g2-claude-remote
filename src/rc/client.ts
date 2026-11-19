@@ -13,6 +13,8 @@ import {
   type AsideTurn,
   type BridgeClient,
   type Decision,
+  type HistoryPage,
+  type InfoSection,
   type DialogAnswer,
   type EffortLevel,
   type PermissionMode,
@@ -98,11 +100,13 @@ export class HttpBridgeClient implements BridgeClient {
   }
 
   async getHistory(sid: string, limit: number = HISTORY_LIMIT): Promise<RcEvent[]> {
-    const { events } = await this.req<{ events: RcEvent[] }>(
-      `/api/sessions/${this.sid(sid)}/events?limit=${limit}`,
-      { headers: this.headers() },
-    )
-    return events ?? []
+    return (await this.getHistoryPage(sid, undefined, limit)).events
+  }
+
+  getHistoryPage(sid: string, before?: number, limit = HISTORY_LIMIT): Promise<HistoryPage> {
+    const query = new URLSearchParams({ limit: String(limit) })
+    if (before != null) query.set('before', String(before))
+    return this.req(`/api/sessions/${this.sid(sid)}/events?${query}`, { headers: this.headers() })
   }
 
   streamEvents(sid: string, fromSeq: number, handlers: StreamHandlers): () => void {
@@ -116,13 +120,14 @@ export class HttpBridgeClient implements BridgeClient {
 
   async answerPermission(
     sid: string,
-    p: { requestId: string; toolUseId?: string | null; decision: Decision; message?: string; updatedInput?: unknown },
+    p: { requestId: string; toolUseId?: string | null; decision: Decision; message?: string; sessionRule?: string; updatedInput?: unknown },
   ): Promise<void> {
     await this.post(`/api/sessions/${this.sid(sid)}/permission`, {
       request_id: p.requestId,
       tool_use_id: p.toolUseId ?? null,
       decision: p.decision,
       message: p.message,
+      session_rule: p.sessionRule,
       updated_input: p.updatedInput,
     })
   }
@@ -171,6 +176,10 @@ export class HttpBridgeClient implements BridgeClient {
     await this.post(`/api/sessions/${this.sid(sid)}/archive`, {})
   }
 
+  async markRead(sid: string): Promise<void> {
+    await this.post(`/api/sessions/${this.sid(sid)}/read`, {})
+  }
+
   async setPinned(sid: string, pinned: boolean): Promise<boolean> {
     const res = await this.post<{ pinned?: boolean }>(`/api/sessions/${this.sid(sid)}/pin`, { pinned })
     return res.pinned ?? pinned
@@ -186,8 +195,8 @@ export class HttpBridgeClient implements BridgeClient {
     return answer ?? null
   }
 
-  info(sid: string): Promise<SessionInfo> {
-    return this.req<SessionInfo>(`/api/sessions/${this.sid(sid)}/info`, { headers: this.headers() }, INFO_TIMEOUT_MS)
+  info(sid: string, section: InfoSection = 'all'): Promise<SessionInfo> {
+    return this.req<SessionInfo>(`/api/sessions/${this.sid(sid)}/info?section=${section}`, { headers: this.headers() }, INFO_TIMEOUT_MS)
   }
 
   async stopTask(sid: string, taskId: string): Promise<void> {

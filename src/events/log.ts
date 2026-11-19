@@ -9,13 +9,20 @@
 // windowFrom) sized to a byte budget, never splitting a line.
 
 import { renderEventParts, packToolChain } from './format'
-import { byteLen, HUD } from '../glasses'
+import { byteLen, clampBytes, HUD } from '../glasses'
 import type { RcEvent } from '../rc/types'
 
 /** Cap on rendered lines kept — a long session can't grow the log unbounded. */
 const MAX_LINES = 500
+/** How far into a clipped line's kept end to look for the start of a word. */
+const WORD_SEEK = 12
+/** The glyphs format.ts leads a line with. A clipped line keeps its own, so the
+ *  end of a `»` message still reads as the wearer's, not as Claude's prose. */
+const LEADS: string[] = [HUD.USER, HUD.SYS, HUD.DONE, HUD.TOOL, HUD.ATTN]
 
 export class EventLog {
+  constructor(private readonly maxLines = MAX_LINES) {}
+
   private lines: string[] = []
   private seen = new Set<number>()
   // The OPEN tool chain: where its block starts in `lines`, and every entry it
@@ -60,8 +67,10 @@ export class EventLog {
       if (this.seen.has(e.sequenceNum)) return false
       this.seen.add(e.sequenceNum)
     }
-    if (e.type === 'conversation_reset') this.dropLines()
-    const { text, tools } = renderEventParts(e)
+    if (e.type === 'conversation_reset' && !e.parentToolUseId) this.dropLines()
+    const parts = renderEventParts(e)
+    const text = e.parentToolUseId && parts.text ? `Subagent: ${parts.text}` : parts.text
+    const tools = e.parentToolUseId ? parts.tools.map((t) => `Subagent ${t}`) : parts.tools
     if (!text && tools.length === 0) return true // drops without breaking the chain
     if (text) {
       this.chainStart = -1
@@ -109,8 +118,8 @@ export class EventLog {
 
   /** Enforce MAX_LINES, keeping the open chain's index pointing at its block. */
   private trim(): void {
-    if (this.lines.length <= MAX_LINES) return
-    const dropped = this.lines.length - MAX_LINES
+    if (this.lines.length <= this.maxLines) return
+    const dropped = this.lines.length - this.maxLines
     this.lines.splice(0, dropped)
     if (this.chainStart < 0) return
     // Trimming shifts every index down. A chain whose own block was partly
@@ -146,9 +155,13 @@ export class EventLog {
    * and never auto-scrolls to the bottom, so a live body that overflows its
    * container height hides exactly the newest lines — the ones live mode exists
    * to show. Bytes alone can't guarantee a fit (lines wrap, spacers cost a full
-   * row for one byte), so each line is costed at its wrapped-row estimate,
-   * spacer blank lines are skipped (vertical space is unaffordable here), and a
-   * single over-budget newest line is tail-clipped rather than dropped.
+   * row for one byte), so each line is costed at its wrapped-row estimate and
+   * spacer blank lines are skipped (vertical space is unaffordable here). A
+   * line that doesn't fit whole gives its END to whatever rows are left (see
+   * `clippedEnd`): for the newest line that is the live edge, and for an older
+   * one it is what borders the lines below it. (Dropping it instead left those
+   * rows empty: a finished turn showed its `done` line and none of the answer
+   * above it.)
    */
   tailRows(maxRows: number, charsPerRow: number, maxBytes: number): string {
     const out: string[] = []
@@ -159,11 +172,9 @@ export class EventLog {
       if (!line) continue // inter-event spacer
       const cost = Math.max(1, Math.ceil(line.length / charsPerRow))
       const size = byteLen(line) + (out.length > 0 ? 1 : 0)
-      if (out.length > 0 && (rows + cost > maxRows || bytes + size > maxBytes)) break
-      if (out.length === 0 && (cost > maxRows || size > maxBytes)) {
-        // The newest line alone overflows: keep its END (that's the live edge).
-        const keep = Math.max(charsPerRow, maxRows * charsPerRow - HUD.ELL.length)
-        out.push(`${HUD.ELL}${line.slice(Math.max(0, line.length - keep))}`)
+      if (rows + cost > maxRows || bytes + size > maxBytes) {
+        const end = clippedEnd(line, (maxRows - rows) * charsPerRow, maxBytes - bytes - 1)
+        if (end) out.push(end)
         break
       }
       out.push(line)
@@ -216,6 +227,26 @@ export class EventLog {
     this.foldLine = ''
     this.foldCount = 0
   }
+}
+
+/**
+ * The end of `line` as `...the last of it`, within `chars` characters and
+ * `bytes` bytes, or '' when that leaves nothing worth a row. It starts on a
+ * whole word when one begins soon enough, never on half a surrogate pair, and
+ * keeps the line's lead glyph (`» ...the last of it`).
+ */
+function clippedEnd(line: string, chars: number, bytes: number): string {
+  const lead = LEADS.find((g) => line.startsWith(`${g} `))
+  const head = lead ? `${lead} ${HUD.ELL}` : HUD.ELL
+  const room = bytes - byteLen(head)
+  if (chars <= head.length || room <= 0) return ''
+  let end = clampBytes(line.slice(head.length - chars), room, 'tail')
+  const first = end.charCodeAt(0)
+  if (first >= 0xdc00 && first <= 0xdfff) end = end.slice(1) // the back half of a pair
+  const word = end.indexOf(' ') + 1
+  if (word > 0 && word <= WORD_SEEK && end.length - word >= WORD_SEEK) end = end.slice(word)
+  end = end.trimStart()
+  return end.length >= WORD_SEEK / 2 ? `${head}${end}` : ''
 }
 
 /** Clamp `i` into the valid `[0, len]` window-boundary range (NaN → 0). */

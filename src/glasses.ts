@@ -7,7 +7,9 @@
 //   • 'text'   — one full-screen text container (boot). Simple.
 //   • 'list'   — a fixed header strip + a native ListContainerProperty. The
 //                firmware moves the selection highlight on scroll with no
-//                per-tick re-render, and reports the row via listEvent.
+//                per-tick re-render, and reports the row via listEvent. The
+//                strip is one line unless the layout asks for more rows (a
+//                prompt's question or command, which must be read to answer).
 //   • 'scroll' — a fixed header strip + a firmware-SCROLLED text body + a fixed
 //                footer strip. This is the session / voice / confirm screen, and
 //                every message screen (setup, error): the strips keep the title
@@ -75,6 +77,10 @@ const BRIDGE_CALL_TIMEOUT_MS = 4000
 // tall enough that a line clears its height AND its top+bottom padding, or the
 // header and footer sprout a scrollbar. This height leaves comfortable margin.
 const STRIP_H = 42
+// Each further line of a taller list header (see `headerRows`), and the most a
+// header may take: the list below it still needs room for a few rows.
+const LINE_H = 27
+const MAX_HEADER_ROWS = 3
 // Firmware caps per native list, both validated on (re)build — an over-cap page
 // is REJECTED WHOLE and the screen silently keeps its old contents. Rows beyond
 // 20 are dropped; item text is clamped by UTF-8 BYTES (a 64-char row holding
@@ -97,8 +103,20 @@ const FTR_ID = 3
 
 export type Layout =
   | { kind: 'text'; content: string }
-  | { kind: 'list'; header: string; items: string[] }
+  | ListLayout
   | { kind: 'scroll'; header: string; body: string; footer: string }
+
+/** A native list under a header strip. `headerRows` makes the strip taller
+ *  (default one line). `key` names what the list IS: a different key rebuilds
+ *  the page even when the rows read the same, so one prompt's Allow / Deny is
+ *  never silently reused as the next one's. */
+export interface ListLayout {
+  kind: 'list'
+  header: string
+  items: string[]
+  headerRows?: number
+  key?: string
+}
 
 export class GlassesDisplay {
   private started = false
@@ -126,6 +144,14 @@ export class GlassesDisplay {
    *  applied (clamped) — what listEvent.currentSelectItemName echoes back. */
   get listItems(): readonly string[] {
     return this.curItems
+  }
+
+  /** Whether the native list on the glasses RIGHT NOW is `layout`'s: same rows,
+   *  same header height, same key. False while its build is still on its way
+   *  over BLE, and after one that failed — so a caller can tell a tap on this
+   *  list from a tap on whatever is still under the wearer's finger. */
+  showsList(layout: ListLayout): boolean {
+    return this.kind === 'list' && this.curItemsSig === listPlan(layout).sig
   }
 
   /** Create the initial page (a text screen). Call once before anything else —
@@ -186,7 +212,7 @@ export class GlassesDisplay {
       case 'text':
         return this.applyText(layout.content)
       case 'list':
-        return this.applyList(layout.header, layout.items)
+        return this.applyList(layout)
       case 'scroll':
         return this.applyScroll(layout.header, layout.body, layout.footer)
     }
@@ -206,12 +232,10 @@ export class GlassesDisplay {
   }
 
   // ── list (fixed header + native list) ──────────────────────────────────
-  private async applyList(header: string, rawItems: string[]): Promise<void> {
-    const items = (rawItems.length ? rawItems : ['(none)'])
-      .slice(0, MAX_LIST_ITEMS)
-      .map((i) => clampBytes(i.replace(/\s+/g, ' '), MAX_ITEM_BYTES, 'head'))
-    const itemsSig = items.join('')
-    const hdr = header.slice(0, 200)
+  private async applyList(layout: ListLayout): Promise<void> {
+    const { items, rows, sig: itemsSig } = listPlan(layout)
+    const stripH = STRIP_H + (rows - 1) * LINE_H
+    const hdr = layout.header.slice(0, 200)
 
     if (this.kind !== 'list' || itemsSig !== this.curItemsSig) {
       // Items can't be mutated in place — (re)build the whole page.
@@ -219,13 +243,13 @@ export class GlassesDisplay {
         containerTotalNum: 2,
         // A thin header strip, then the framed native list — the same frame as the
         // scroll body, so the list is clearly set off from the header above it.
-        textObject: [textBox(HDR_ID, 'hdr', hdr, strip(0, STRIP_H), { capture: 0 })],
+        textObject: [textBox(HDR_ID, 'hdr', hdr, strip(0, stripH), { capture: 0 })],
         listObject: [
           new ListContainerProperty({
             xPosition: 0,
-            yPosition: STRIP_H + 4,
+            yPosition: stripH + 4,
             width: W,
-            height: H - STRIP_H - 4,
+            height: H - stripH - 4,
             containerID: BODY_ID,
             containerName: 'list',
             isEventCapture: 1,
@@ -354,6 +378,18 @@ export class GlassesDisplay {
   }
 }
 
+/** A list layout as it goes on the glass: its rows clamped to the firmware's
+ *  caps, its header's height in rows, and the signature a rebuild is keyed on.
+ *  The height is geometry and the key is identity, so both are in it. (Rows
+ *  hold no newline — whitespace is collapsed — so it is a safe separator.) */
+function listPlan(layout: ListLayout): { items: string[]; rows: number; sig: string } {
+  const items = (layout.items.length ? layout.items : ['(none)'])
+    .slice(0, MAX_LIST_ITEMS)
+    .map((i) => clampBytes(i.replace(/\s+/g, ' '), MAX_ITEM_BYTES, 'head'))
+  const rows = Math.max(1, Math.min(Math.trunc(layout.headerRows ?? 1) || 1, MAX_HEADER_ROWS))
+  return { items, rows, sig: [rows, layout.key ?? '', ...items].join('\n') }
+}
+
 // ─── container geometry helpers ──────────────────────────────────────────────
 type Box = { x: number; y: number; w: number; h: number; pad?: number }
 
@@ -409,13 +445,17 @@ export function byteLen(s: string): number {
  */
 export function clampBytes(s: string, maxBytes: number, keep: 'head' | 'tail' = 'head'): string {
   if (byteLen(s) <= maxBytes) return s
-  let out = s
-  while (out.length > 0 && byteLen(out) > maxBytes) {
-    const over = byteLen(out) - maxBytes
-    const drop = Math.max(1, Math.ceil(over / 3)) // worst case 3 bytes per char
-    out = keep === 'tail' ? out.slice(drop) : out.slice(0, out.length - drop)
+  const points = Array.from(s)
+  if (keep === 'tail') points.reverse()
+  let used = 0
+  let count = 0
+  for (const point of points) {
+    used += byteLen(point)
+    if (used > maxBytes) break
+    count++
   }
-  return out
+  const kept = points.slice(0, count)
+  return (keep === 'tail' ? kept.reverse() : kept).join('')
 }
 
 /**
@@ -432,11 +472,74 @@ export function liveTail(text: string, tailChars = LIVE_BODY_BYTES): string {
 /** Fold typography the firmware font can't draw into plain ASCII. The font has
  *  no emoji or dingbats and silently drops unknown glyphs, so text authored for
  *  the panel (release notices) must be folded — em/en dashes, curly quotes,
- *  ellipsis — before it goes on glass. HUD-set glyphs pass through untouched. */
+ *  ellipsis — before it goes on glass. So must a backtick: the font has no
+ *  glyph for it either (measured), and a command shown without its backticks
+ *  reads as a different command. HUD-set glyphs pass through untouched. */
 export function hudSafe(s: string): string {
   return s
     .replace(/[—–]/g, '-')
-    .replace(/[‘’]/g, "'")
+    .replace(/[‘’`]/g, "'")
     .replace(/[“”]/g, '"')
     .replace(/…/g, '...')
+}
+
+// ─── Firmware font metrics ───────────────────────────────────────────────────
+// The font is proportional: `l` is 4 px wide and `m` 16, so a char count says
+// little about where a line wraps (a strip holds 56 chars of one text and 64 of
+// another). These are its advance widths in px, measured in the simulator on
+// 2026-11-19 from runs of 24 of each printable ASCII glyph; lines of known text
+// came out within 2% of what they predict. Real hardware may differ a little.
+const ADVANCES: [number, string][] = [
+  [4, "l:!'|"],
+  [5, 'ijI.,;/\\ '],
+  [6, 't"()'],
+  [7, 'fr1[]'],
+  [8, 'J{}*'],
+  [9, 'kzL_'],
+  [10, 'ceosEFT-=+<>^'],
+  [11, 'abdghnpquvxyCS2'],
+  [12, 'BDGHKNOPQRUZ03456789?$'],
+  [13, 'AVXY'],
+  [14, '#%'],
+  [15, 'w&'],
+  [16, 'mMW~'],
+  [17, '@'],
+]
+const ADVANCE = new Map<string, number>(ADVANCES.flatMap(([px, chars]) => [...chars].map((c): [string, number] => [c, px])))
+/** For what wasn't measured: accented letters and the HUD's own glyphs. */
+const DEFAULT_ADVANCE = 12
+/** What one row of a header / footer strip holds: its 564 px inside the
+ *  padding, less a margin for the measuring. */
+const STRIP_TEXT_PX = 552
+
+/** The width of `s` in the firmware font, in px. */
+export function textWidth(s: string): number {
+  let px = 0
+  for (const c of s) px += ADVANCE.get(c) ?? DEFAULT_ADVANCE
+  return px
+}
+
+/** The rows `text` takes in a header strip. Wrapped at spaces only, where the
+ *  firmware may also break after punctuation, so this never counts too few; a
+ *  word wider than a row is broken across rows. */
+export function stripRows(text: string): number {
+  let rows = 1
+  let used = 0
+  for (const word of text.split(' ')) {
+    const px = textWidth(word)
+    const need = used ? px + textWidth(' ') : px
+    if (used + need <= STRIP_TEXT_PX) {
+      used += need
+      continue
+    }
+    if (used) rows++ // the word starts a new row…
+    rows += Math.floor(Math.max(0, px - 1) / STRIP_TEXT_PX) // …and may fill more than one
+    used = px ? ((px - 1) % STRIP_TEXT_PX) + 1 : 0
+  }
+  return rows
+}
+
+/** Whether `text` fits on one row of a header strip. */
+export function fitsStripRow(text: string): boolean {
+  return textWidth(text) <= STRIP_TEXT_PX
 }

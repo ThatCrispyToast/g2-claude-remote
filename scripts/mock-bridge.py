@@ -9,11 +9,12 @@ and session info with canned replies, carries out a `/clear` send the way a real
 worker does, pins and unpins, accepts (and ignores) every other POST, and takes
 any token.
 
-    python3 scripts/mock-bridge.py [--port 8791] [--question]
+    python3 scripts/mock-bridge.py [--port 8791] [--question | --multi]
     VITE_BRIDGE_URL=http://localhost:8791 VITE_BRIDGE_TOKEN=x npm run dev
 
-Sessions: api-refactor (running), docs-site (idle), and payment-service, blocked
-on a Bash permission, or on an AskUserQuestion with --question.
+Sessions: api-refactor (running), docs-site (idle, with a finished background
+task), and payment-service, blocked on a Bash permission, or on an
+AskUserQuestion with --question (pick one) or --multi (pick any).
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import re
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 def _ago(minutes: int) -> str:
@@ -51,6 +52,7 @@ def _session(
         "pendingAction": None,
         "effort": effort,
         "context": {"usedTokens": context * 10_000, "maxTokens": 1_000_000, "percent": context},
+        "rateLimit": {"status": "allowed", "resetsAt": None},
         "summary": summary,
         "needsAction": needs_action,
         "ccVersion": "2.1.301",
@@ -80,7 +82,7 @@ def _event(seq: int, kind: str, **f: Any) -> dict[str, Any]:
         "toolUseId": f"toolu_{seq}" if control else None,
         "permissionRequest": control,
         "usage": f.get("usage"),
-        "source": "client" if kind == "user" else "worker",
+        "source": f.get("source") or ("client" if kind == "user" else "worker"),
         "workerState": f.get("state"),
         "tasks": f.get("tasks"),
     }
@@ -120,7 +122,28 @@ RATE_LIMIT_QUESTION = {
 }
 
 
-def build_world(question: bool) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+CHECKS_QUESTION = {
+    "header": "Checks",
+    "question": "Which checks should gate the staging deploy?",
+    "multiSelect": True,
+    "options": [
+        {"label": "Unit tests", "description": "fast, already green"},
+        {"label": "Load test", "description": "ten minutes against staging"},
+        {"label": "Smoke test", "description": "after the deploy lands"},
+    ],
+}
+
+# What a worker posts when a background command finishes: a note in the user
+# slot, which the app renders as a system line rather than a message.
+TASK_NOTIFICATION = (
+    "<task-notification>\n<task-id>b7xk2m9qa</task-id>\n<tool-use-id>toolu_mock</tool-use-id>\n"
+    "<output-file>/tmp/claude/tasks/b7xk2m9qa.output</output-file>\n<status>completed</status>\n"
+    '<summary>Background command "Link check on the built site" completed (exit code 0)</summary>\n'
+    "</task-notification>"
+)
+
+
+def build_world(question: dict[str, Any] | None) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     sessions = [
         _session("session_mock_api", "api-refactor", "running", "claude-opus-5-5", 0, effort="xhigh", context=62,
                  summary="Checkout API on the new session store; fixing the coupon totals test"),
@@ -131,9 +154,10 @@ def build_world(question: bool) -> tuple[list[dict[str, Any]], dict[str, list[di
                  needs_action="approve the staging deploy (./scripts/deploy.sh staging)"),
     ]
     if question:
-        blocker = _permission("AskUserQuestion", {"questions": [RATE_LIMIT_QUESTION]}, [RATE_LIMIT_QUESTION])
+        blocker = _permission("AskUserQuestion", {"questions": [question]}, [question])
     else:
         blocker = _permission("Bash", {"command": "./scripts/deploy.sh staging", "description": "Deploy to staging"})
+        blocker["sessionRule"] = "Bash(./scripts/deploy.sh staging)"
     events = {
         "session_mock_api": [
             _event(1, "system", subtype="init", model="claude-opus-5-5",
@@ -171,6 +195,7 @@ def build_world(question: bool) -> tuple[list[dict[str, Any]], dict[str, list[di
                 ],
             ),
             _event(4, "result", subtype="success", usage=_usage(3, 41.5, 0.12)),
+            _event(5, "user", text=TASK_NOTIFICATION, source="worker"),
         ],
         "session_mock_pay": [
             _event(1, "system", subtype="init", model="claude-opus-5-5",
@@ -257,11 +282,21 @@ class _Handler(BaseHTTPRequestHandler):
         if not session:
             return self._json({"error": "session not active", "status": 409}, status=409)
         if m["rest"] == "/events":
-            return self._json({"events": self.events.get(session["id"], [])})
+            events = self.events.get(session["id"], [])
+            query = parse_qs(urlparse(self.path).query)
+            if "before" in query:
+                events = [e for e in events if e["sequenceNum"] < int(query["before"][0])]
+            limit = max(1, int(query.get("limit", ["200"])[0]))
+            page = events[-limit:]
+            return self._json({"events": page, "before": page[0]["sequenceNum"] if len(events) > limit else None})
         if m["rest"] == "/stream":
             return self._stream(session["id"])
         if m["rest"] == "/info":
-            return self._json(INFO)
+            section = parse_qs(urlparse(self.path).query).get("section", ["all"])[0]
+            if section == "context":
+                return self._json({"context": {**session["context"], "categories": [
+                    {"name": "Messages", "tokens": session["context"]["usedTokens"]}]}, "usage": None, "diff": None})
+            return self._json({**INFO, "diff": None} if section == "usage" else INFO)
         return self._json({"session": session})
 
     def _clear(self, sid: str) -> None:
@@ -295,9 +330,12 @@ class _Handler(BaseHTTPRequestHandler):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--port", type=int, default=8791, help="port (default 8791)")
-    ap.add_argument("--question", action="store_true", help="block payment-service on a question, not a permission")
+    kind = ap.add_mutually_exclusive_group()
+    kind.add_argument("--question", action="store_true", help="block payment-service on a question, not a permission")
+    kind.add_argument("--multi", action="store_true", help="block it on a pick-any (multi-select) question")
     args = ap.parse_args()
-    _Handler.sessions, _Handler.events = build_world(args.question)
+    question = CHECKS_QUESTION if args.multi else RATE_LIMIT_QUESTION if args.question else None
+    _Handler.sessions, _Handler.events = build_world(question)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), _Handler)
     server.daemon_threads = True
     print(f"mock bridge on http://localhost:{args.port} (any token)", flush=True)

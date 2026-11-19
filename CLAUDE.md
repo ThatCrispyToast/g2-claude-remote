@@ -35,20 +35,14 @@ at build time.
    the native scroll position. Steady-state changes are per-container
    `textContainerUpgrade`s (header / body / footer diffed independently); a full
    rebuild only when the layout kind or a native list's items change.
-4. **Sends live or die by `anthropic-client-platform`.** Since Claude Code
-   ~2.1.220 the RC backend stamps that request header into every ingested
-   event's `client_platform`, and the worker starts a turn for an inbound user
-   message only when the stamp is a *human* platform (`ios` / `android` /
-   `web_claude_ai` / `desktop_app` — set read out of the 2.1.234 binary).
-   Anything else is demoted to **peer origin** ("Another Claude session sent a
-   message" framing, `isMeta`), and the worker's peer gate may park it forever —
-   the observed failure is exactly "POST /send returns 200, the message shows
-   in the session, Claude never responds" (2.1.219 predates the gate, which is
-   why downgrading "fixed" it). claude-rc-api ≥ 0.2.1 identifies as
-   `web_claude_ai`; the fix lives THERE (rule 1) — and `uvx` deployments cache
-   the resolved git dep, so they need one `--refresh` run to pick it up. The
-   permission / question / interrupt control paths were never gated; only
-   message injection was.
+4. **The server assigns message origin.** From about Claude Code 2.1.220,
+   claude-rc-api 0.2.1's platform header helped older workers run controller
+   messages. On 2026-11-19 a 2.1.328 test worker received library sends
+   without a `client_platform`. It called the sender “the peer session” and
+   spent a model turn declining `/context`. Permission and question answers,
+   side questions, mode, effort and interrupt worked on that worker.
+   App 1.11.0 offers local context/usage shortcuts and a phone link to the
+   session in Claude for human-authored messages and supported slash commands.
 5. **Effort is a control, with a command fallback.** 2.1.301 workers apply
    the `apply_flag_settings` control (`effortLevel` low…`max`, null = auto)
    **session-scoped**, persisting nothing, and re-emit `system/init` with the
@@ -166,7 +160,11 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   (`EventLog.tailRows`) is budgeted by estimated visual ROWS (`LIVE_BODY_ROWS` ×
   `HUD_CHARS_PER_ROW`, wrapping counted) so it always fits — a byte budget alone
   can't guarantee that. Every session opens on this tail (`● live` running /
-  `○ latest` idle); scroll-up enters history.
+  `○ latest` idle); scroll-up enters history. A line that doesn't fit whole
+  gives its END to the rows left, cut at a word and keeping its lead glyph
+  (`...a broken link to the install page.`, `» ...ending here`). Until 1.10.0
+  only the newest line did, so a finished turn showed `◇ done` under four empty
+  rows and none of the answer.
 - **Consecutive tool_uses COLLAPSE into chain lines — never one line each.**
   Measured on live sessions: ~6 tool calls per line of assistant prose, in runs
   of up to 27, and one verbose `◆ Name  <input>` line each (a long path or shell
@@ -201,6 +199,30 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   line being identical — an init that differs (e.g. after a model switch) still
   gets its own row, which is signal. Don't narrow it to init-specific
   suppression.
+- **Not every `user` event is a message.** The worker writes notes into the
+  user slot: a finished background task's `<task-notification>` block (ids, an
+  output path, a `<summary>`), and `[Request interrupted by user]`.
+  `workerNotes` (`events/format.ts`) turns each into one system line on both
+  surfaces
+  (`☉ Background command "…" completed (exit code 0)`). Raw, the block filled
+  the HUD with tag soup under a `»`, as if the wearer had said it. `workerNotes`
+  returns one line per block (several can share an event) and drops what
+  follows them, which is addressed to the model.
+- **A list's header strip is one line unless the layout asks for more**
+  (`headerRows`, up to 3; `glasses.ts` grows the strip and shrinks the list).
+  Only the prompt screens ask: a strip overflowing its height gets a scrollbar
+  and a half-cut second line, which is how a long permission command used to
+  read. The height is part of the list's rebuild signature. `fitHeader`
+  (main.ts) clips the text to what the rows hold, MEASURED: `glasses.ts` has
+  the firmware font's advance widths (`textWidth`, `stripRows`; taken from
+  the simulator, 24-glyph runs, within 2% on known lines). The font is
+  proportional — `l` is 4 px, `m` 16 — so a strip holds 56 chars of one text
+  and 64 of another, and a char budget either cut a header short above an
+  empty row or let it spill. The backtick has NO glyph (`hudSafe` folds it to
+  `'`). A permission's header leads with its most telling
+  input (`headerInput`); a file path too long for a row keeps its END, from a
+  directory boundary (`.../Dashboard/Widget.tsx`), since the file is what is
+  being asked about.
 - **Content caps are BYTES, not chars** (~1000 per rebuild, ~2000 per upgrade,
   999 in the simulator; native lists: 20 rows, ~63 bytes per item), and HUD
   glyphs are 2–3 bytes each — an oversize container is **silently dropped** (the
@@ -260,11 +282,48 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   was misread as a blocking question and would have popped a bogus question
   screen.
 - **Two kinds, two screens, both native lists.** A blocking `control_request`
-  is either a **tool-permission** (the `permission` screen: `[Allow, Deny]`,
-  Allow=row 0; answered via `/permission` — the full tool input lives on the
-  panel, the HUD shows a clip) or a **question** (the `question` screen: the
-  options + a trailing `← Dismiss` row; answered via `/dialog`). On BOTH,
-  double-tap **sets the prompt aside** (sends nothing — see below).
+  is either a **tool-permission** (the `permission` screen: `[Allow, Deny,
+  Details]`, Allow=row 0; answered via `/permission`) or a **question** (the
+  `question` screen: the options, `Submit` for a pick-any, `Details`, and a
+  trailing `← Dismiss` row; answered via `/dialog`). On BOTH, double-tap **sets
+  the prompt aside** (sends nothing — see below).
+- **`Details` is how a prompt is read before it is answered.** The header
+  holds two rows of a permission's input (three of a question); the `detail`
+  screen is a natively-scrolled body with all of it — the whole command, a
+  plan, a question with every option's description — clamped at `DETAIL_BYTES`
+  with a pointer to the phone past that. It decides nothing: tap or double-tap
+  goes back to the list. Its text is fixed on entry, and it counts as "on the
+  prompt" (`onPromptScreen()`), so a prompt settled elsewhere still leaves it.
+- **A prompt's list takes no tap until it is ON THE GLASS, and has been for
+  `PROMPT_TAP_GUARD_MS`** (`promptTapOk()`). The app switches screens when the
+  event arrives; the glass repaints a BLE round trip later. A tap already on
+  its way (meant as "menu" on the live view, the second of two on a list row,
+  a second Allow as the next prompt slides in, a second tap leaving Details)
+  landed on row 0 of a prompt nobody had read, which is Allow. The test is the
+  display's own mirror, not a timer started at the state change:
+  `GlassesDisplay.showsList(layout)` is true only once the build of exactly
+  this list has come back from the SDK, and `onListRebuild` stamps when. Every
+  change to a prompt's list is a rebuild (it presents, the next question
+  follows, a pick-any toggles), so one test covers them — which is why a
+  prompt's layout carries a `key` (its `requestId`, plus the question index):
+  two prompts both read `Allow / Deny / Details`, and without the key the
+  second was a header upgrade on the first one's page. A list whose write was
+  dropped takes no tap until `poll()`'s render repaints it.
+- **`poll()` re-renders every tick, on every screen.** A no-op while the glass
+  matches (the display diffs each container), and the repaint after a dropped
+  write. Before 1.10.0 only the session list did; any other screen whose write
+  failed stayed wrong until something else changed it.
+- **A pick-any question toggles; Submit settles it.** `multiSelect` options
+  carry `●` / `○`, each tap rebuilds the list (highlight back to row 0, so
+  Submit sits BELOW the options: a stray tap re-toggles, never submits), and
+  `qDone[i]` — not "has a pick" — says a question is settled. The Submit row
+  appears with the first pick, so no row does nothing. Until 1.10.0
+  every question took one pick and moved on. The answer goes as ONE
+  comma-separated string in the question's own order: the tool's schema is a
+  string per question ("multi-select answers are comma-separated"; verified
+  live on 2.1.328, `"…"="Apple, Cherry"`). main.ts joins it, so an older
+  bridge, which would have sent a list, gets it right too. The panel has the
+  same toggle and a `Done` button.
 - **`AskUserQuestion` arrives as a `can_use_tool` permission** (confirmed live),
   NOT a `request_user_dialog`: its `input` carries the `questions`, and `/dialog`
   answers it on the PERMISSION path — claude-rc-api's `answer_question` sends
@@ -272,9 +331,8 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   it; the bridge's `_question_input` rebuilds them if lost) plus `answers`, a
   map keyed by **question TEXT** → chosen label (list for multi-select; empty
   map = graceful dismiss). Discriminator: `isQuestionRequest` in
-  `events/format.ts`. The `{status, result}` shape (`cli_dialog_response`) is
-  an UNCONFIRMED fallback for true `request_user_dialog` kinds — verify
-  against a live sample before trusting it.
+  `events/format.ts`. For a true `request_user_dialog`, direct the wearer to the session in Claude.
+  The result schema depends on the dialog kind.
 - **Prompts QUEUE; they never hijack.** Three guards against stale/replayed
   requests: the bridge fetches history `desc` (newest events) so the stream
   resume cursor is never ancient; `EventLog.append` seq-dedupe gates all UI
@@ -291,8 +349,8 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   not `go`), and a voice error doesn't leave the voice screen at all (see
   Dictation language): a tap meant as "done" there would otherwise answer the
   prompt (reproduced: it allowed a Bash `rm -rf`). A blocked session opens
-  straight onto its prompt (`findPendingControl` + `workerStatus ===
-  'requires_action'`).
+  straight onto its prompt (`findPendingControls`: every unresolved one, oldest
+  first, + `workerStatus === 'requires_action'`).
 - **An answer retires its OWN prompt, and only once it got through.**
   `answeredIds` doubles as the in-flight mark, so a second tap while the POST
   is out sends nothing; `retirePrompt(id)` leaves alone whatever else got armed
@@ -311,6 +369,26 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   normally while set aside. Because the Compose list varies with pending state,
   it is snapshotted into `composeItems` on entry so a mid-menu stream event
   can't desync the firmware row → action map.
+
+## History and the unread mark
+
+- **The newest 200 events are often not the conversation.** Every controller
+  attach mints `system/init`s (see HUD gotchas), with `system/status` and the
+  control traffic around them. Measured on six live sessions 2026-11-19: four
+  had NO transcript in their newest 200 events, the first line of conversation
+  sitting 224 to 414 events back, and the app opened them on a lone
+  `☉ opus-5-5 · max effort · bypass x98`. The bridge (0.6.0) now reads back a
+  page at a time until the window holds `HISTORY_MIN_TRANSCRIPT` events a
+  reader would see, stopping at a `conversation_reset` or `HISTORY_MAX_PAGES`.
+  It still returns every event in the window, in order: the app's folding,
+  cursor and pending-prompt scan need them all. Responses are gzipped for a
+  client that takes it (a 340 KB history travels as about 45 KB).
+- **Opening a session reads it.** `markRead()` (`POST …/read`) clears the
+  unread mark on open and again on each `result` that arrives while it is
+  open, as claude.ai does — but only while someone can be looking: the app in
+  front on the glasses (`foreground`, from FOREGROUND_EXIT / _ENTER), or, with
+  no glasses, the page visible. Best-effort and silent: an older bridge 404s
+  it.
 
 ## Streams and connection loss
 
@@ -392,6 +470,12 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   is still finishing (mic close + Deepgram flush) is ignored, per dictation
   run (`finishingRun`; a finish a newer run overtook backs off too): a
   double-clicked Stop used to send the transcript split across two messages.
+- **A failed action is said on the glasses.** `onActionError` puts
+  `! not sent: <reason>` (or `failed: …`) in the session footer for
+  `HUD_NOTE_MS`, as well as the panel's toast. The toast was all there was, so
+  a wearer who never looked at the phone took a send that never left for one
+  that had. The note has the strip to itself (it is one line), and goes with
+  its session, or when a send gets through.
 - **Cancel returns to `pendingSend.back`:** the Compose menu for a canned send
   (so re-pick is one tap; `listSelectIndex` is reset to match the rebuilt list),
   the live session for a dictation (its mic is already closed). `backToList`
@@ -400,39 +484,10 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
 
 ## Slash commands
 
-- **They ride `/send` — no bridge route.** A slash command is just a `/name`
-  message; RC workers execute it locally at zero cost (the same mechanism the
-  effort control's fallback uses — see rule 5). The Compose → Commands submenu
-  (`commandItems`, `fireSlashCommand`) and the panel's `/` autocomplete both go
-  through the existing `send`/`onSend` path. Adding a command is a `SLASH_COMMANDS`
-  config entry (`VITE_SLASH_COMMANDS` overrides it in dev), never new bridge code.
-- **Curate to fire-and-observe commands only, and VALIDATE live.** Not every
-  command works over remote-control, and the failure modes are silent-ish:
-  - **Refused by the worker** — some print `"/<name> isn't available over Remote
-    Control."` as an assistant line and do nothing. Confirmed live (2026-07-17,
-    Haiku RC worker): `/status` and `/release-notes` both refuse this way. Keep
-    them out.
-  - **Not a real local command** — an unrecognized `/name` is NOT echoed as a
-    local command; it falls through to the model as a literal user message and
-    triggers a full (tool-using) turn. Confirmed: `/todos` did exactly this
-    (assistant → ToolSearch → TaskList). This is the worst case — it spends a
-    model turn — so never ship an unverified name.
-  - **Aliases** — `/cost` redirects to `/usage` (the echo shows
-    `<command-name>/usage`), so ship the canonical name.
-  - **Verified good** (local, `$0`, glanceable output): `/context`, `/usage`,
-    `/mcp`, `/compact`. `/clear` runs (no error, no model turn) with no
-    `<local-command-stdout>`; its feedback is the transcript emptying (see below).
-  - Interactive ones (`/login`, `/config`, `/vim`, `/ide`, `/terminal-setup`)
-    have no remote meaning. Mind machine-global semantics too: like `/effort`,
-    some commands persist a machine default rather than being session-scoped.
-  - Test harness: send `/name` via `POST /api/sessions/<sid>/send`, then read
-    `/events` — a good command shows the `<command-name>` + `<local-command-stdout>`
-    echo with zero `result.usage.costUsd` and no assistant turn.
-- **`confirm:true` = don't fire on one interaction** (heavy/destructive, e.g.
-  `/compact`, `/clear`). On the glasses it routes through the send-confirm screen;
-  on the panel it fills the box and waits for an explicit Send. `takesArg:true`
-  makes the panel fill `/name ` and wait for a typed argument (glasses fire bare
-  — v1 has no on-glasses argument entry; dictated args are a planned fast-follow).
+- The HUD commands list and panel autocomplete expose two local shortcuts.
+  Context usage asks the worker for the token breakdown. Plan usage asks for
+  the session and weekly limits. Each uses its own info query. Other slash input stays in the panel for copying into Claude. Typed
+  chat, quick sends and dictation still use the bridge's ordinary send path.
 - **Command echoes are cleaned on BOTH surfaces by `cleanUserEcho`** (exported
   from `events/format.ts`, used by the HUD's `renderEventParts` AND the panel's
   `renderEventNode`). It unwraps `<command-name>` / `<command-args>` /
@@ -458,7 +513,7 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
 - **Both surfaces reset where they ingest** (`EventLog.append`, `Panel.appendNode`)
   so a history fetch spanning a clear and a live one behave alike: everything
   older goes and a lone `conversation cleared` row stays. Their `seen` sets
-  survive it, so an SSE replay can't resurrect anything. `findPendingControl`
+  survive it, so an SSE replay can't resurrect anything. `findPendingControls`
   treats a reset like a `result`. main.ts's `onConversationReset` drops the rest:
   queued prompts, a frozen history window, the aside card, and (`noteEvent`) the
   aside follow-up history.
@@ -475,7 +530,7 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   `uvx --refresh` their bridge for the ≥2.1.220 send fix, rule 4). A bridge
   update carries every earlier fix, so a new "update your bridge" notice
   REPLACES the older ones rather than stacking a second card with the same
-  command (1.9.0 ships one). Ship a
+  command (1.11.0 ships one, for bridge 0.7.0). Ship a
   notice by appending to the baked `NOTICES` list + a version bump — there is
   NO fetch and NO bridge route, so never add a server side to this. On the
   panel it's a slim dismissible card above the session list (accent wash for

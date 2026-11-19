@@ -49,7 +49,7 @@ export class LiveCaptioner {
   /** Consecutive failed connects; reset once a connection proves stable. */
   private attempts = 0
   private everConnected = false
-  private pending: Uint8Array[] = []
+  private pending: Uint8Array<ArrayBuffer>[] = []
   private pendingBytes = 0
   private lastSendAt = 0
   private keepAliveTimer: number
@@ -81,7 +81,7 @@ export class LiveCaptioner {
   feed(pcm: Uint8Array): void {
     if (this.stopped) return
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(pcm)
+      this.ws.send(pcm.slice())
       this.lastSendAt = performance.now()
       return
     }

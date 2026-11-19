@@ -14,9 +14,9 @@
 import { OsEventTypeList, waitForEvenAppBridge } from '@evenrealities/even_hub_sdk'
 import type { EvenAppBridge, EvenHubEvent } from '@evenrealities/even_hub_sdk'
 
-import { APP_TITLE, APP_TITLE_SHORT, HISTORY_WINDOW_BYTES, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES, LIVE_BODY_ROWS, POLL_MS, SETTINGS_KEY, SLASH_COMMANDS, currentBridge, isBridgeConfigured } from './config'
+import { APP_TITLE, APP_TITLE_SHORT, HISTORY_WINDOW_BYTES, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES, LIVE_BODY_ROWS, POLL_MS, SETTINGS_KEY, isSlashInput, currentBridge, isBridgeConfigured } from './config'
 import { markNoticeSeen, unseenNotices, type Notice } from './notices'
-import { GlassesDisplay, HUD, clip, hudSafe, liveTail, type Layout } from './glasses'
+import { GlassesDisplay, HUD, clampBytes, clip, fitsStripRow, hudSafe, liveTail, stripRows, type Layout, type ListLayout } from './glasses'
 import { HttpBridgeClient } from './rc/client'
 import { BridgeError } from './rc/types'
 import type {
@@ -28,13 +28,15 @@ import type {
   DialogOption,
   DialogQuestion,
   EffortLevel,
+  HistoryPage,
+  InfoSection,
   PermissionMode,
   RcEvent,
   SessionInfo,
   WorkerState,
 } from './rc/types'
 import { EventLog } from './events/log'
-import { cleanProse, isQuestionRequest, modelShort, modeShort, settlesPrompt } from './events/format'
+import { cleanProse, isQuestionRequest, modelShort, modeShort, settlesPrompt, rateLimitLabel } from './events/format'
 import {
   ASIDE_DICTATE,
   asideItems,
@@ -61,6 +63,9 @@ type State =
   | 'confirm'
   | 'permission'
   | 'question'
+  | 'reply'
+  | 'replyDetail'
+  | 'detail'
   | 'aside'
   | 'info'
   | 'notice'
@@ -83,12 +88,30 @@ const HEADER_CHARS = 56
 const CTX_WARN_PCT = 50
 // Side-question exchanges kept per session and sent with a follow-up.
 const ASIDE_HISTORY = 4
+// A prompt's list takes no tap until it has been on the glass this long. The
+// app switches screens the moment an event arrives, but the glass repaints a
+// BLE round trip later and the wearer needs a beat to see it: a tap already on
+// its way (meant as "menu" on the live view, the second of two on a list row,
+// a second Allow as the next prompt slides in) would land on row 0 of a prompt
+// nobody had read yet, which is Allow. See promptTapOk().
+const PROMPT_TAP_GUARD_MS = 900
+// The rows a permission's / a question's header strip may take.
+const PERMISSION_HEADER_ROWS = 2
+const QUESTION_HEADER_ROWS = 3
+// The prompt-details body, under the display's per-container byte cap with
+// room for the "rest is on the phone" line.
+const DETAIL_BYTES = 900
+// How long a failed action stays in the session footer.
+const HUD_NOTE_MS = 7000
 
 /** Race a bridge RPC against a timeout so a slow or unimplemented native method
  *  can never stall boot or a settings save; resolves to `fallback` on timeout. */
 function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
   return Promise.race([p, new Promise<T>((r) => setTimeout(() => r(fallback), ms))])
 }
+
+type VoicePurpose = 'send' | 'aside' | 'other' | 'deny'
+type PromptReply = { id: string; index: number; kind: 'other' | 'deny' | 'rule'; text: string }
 
 class App {
   // Rebuilt in place when the wearer saves new connection settings on the panel,
@@ -140,6 +163,11 @@ class App {
   //               boundary returns to live; to the top boundary loads an older
   //               window. [histTop, histEnd) is the window's line range.
   private histMode: 'live' | 'history' = 'live'
+  private recentHistory: HistoryPage = { events: [] }
+  // Each visited page is frozen while live events continue in the tail.
+  private historyPages: { log: EventLog; before?: number | null }[] = []
+  private pageIndex = 0
+  private loadingPage: EventLog | null = null
   private histBody = ''
   private histTop = 0
   private histEnd = 0
@@ -169,7 +197,8 @@ class App {
   // its words (failVoice); `voiceStatus` is the Deepgram stream's state, for the
   // voice screen's header
   private interim = ''
-  private voicePurpose: 'send' | 'aside' = 'send'
+  private promptReply: PromptReply | null = null
+  private voicePurpose: VoicePurpose = 'send'
   private voiceFrom: 'panel' | 'glasses' = 'glasses'
   private voiceStatus: VoiceStatus = 'connecting'
   // A glasses dictation that died (failVoice): the voice screen stays up,
@@ -192,6 +221,7 @@ class App {
   // never polled: each fetch leaves control events in the session's log.
   private info: SessionInfo | null = null
   private infoError: string | null = null
+  private infoSection: InfoSection = 'all'
   private infoLoading = false
   private infoSeq = 0
 
@@ -220,13 +250,29 @@ class App {
   private promptSnoozed = false
   private readonly answeredIds = new Set<string>()
   private promptArmedAt = 0 // performance.now() when prompts[0] was armed
+  private listBuiltAt = 0 // performance.now() when the list now on the glass was built
+  // Whether the app is in front on the glasses (FOREGROUND_EXIT / _ENTER): a
+  // turn that ends while it isn't has not been read.
+  private foreground = true
   private archiveArmed = false
+  // The armed prompt read in full (the 'detail' screen): its text, fixed on
+  // entry so the natively-scrolled body never changes under the reader.
+  private detailBody = ''
 
   // question flavor: the wearer picks option(s) per question, answered
-  // sequentially; `qPicks[i]` holds the chosen labels.
+  // sequentially; `qPicks[i]` holds the chosen labels and `qDone[i]` whether
+  // that question is settled (a pick settles a single-select; a multi-select
+  // toggles its picks until Submit).
   private dialogQuestions: DialogQuestion[] = []
   private qIndex = 0
   private qPicks: string[][] = []
+  private qDone: boolean[] = []
+
+  // A failed action, said on the glasses too (the session footer, briefly).
+  // The panel's toast was all there was, so a wearer who never looked at the
+  // phone took a send that never left for one that had.
+  private hudNote = ''
+  private hudNoteTimer: ReturnType<typeof setTimeout> | null = null
 
   // Release notices on the glasses (notices.ts): the unseen notices queued for
   // the one-time interstitial, and whether it already presented this launch —
@@ -244,20 +290,44 @@ class App {
     this.panel = new Panel({
       onSelectSession: (sid) => void this.openSession(sid),
       onBackToList: () => this.backToList(),
-      onSend: (text) => void this.send(text),
+      onTakeGlassesDraft: () => {
+        if (this.state !== 'confirm' || !this.pendingSend) return null
+        const text = this.pendingSend.text
+        this.cancelPendingSend()
+        return text
+      },
+      onSend: (text) => {
+        if (text === '/context' || text === '/usage') {
+          this.panel.focusInfo()
+          void this.loadInfo(text === '/usage' ? 'usage' : 'context')
+        } else void this.send(text)
+      },
       onInterrupt: () => void this.interrupt(),
       onSetModel: (m) => void this.applyModel(m),
       onSetMode: (m) => void this.applyMode(m),
       onSetEffort: (e) => void this.applyEffort(e),
       onArchive: () => void this.archive(),
       onSetPinned: (pinned) => void this.setPinned(pinned),
-      onAnswerPermission: (d) => void this.answerPermission(d),
+      onAnswerPermission: (d, note, rule) => void this.answerPermission(d, note, rule),
       onPickDialogOption: (qIndex, label) => this.recordPick(qIndex, label),
+      onConfirmDialogPicks: (qIndex) => this.confirmPicks(qIndex),
       onCancelDialog: () => void this.submitQuestion('cancelled'),
       onStartVoice: () => void this.startVoice('send', 'panel'),
       onStopVoice: () => void this.commitVoice(),
       onAskAside: (q) => void this.askAside(q, 'panel'),
       onDismissAside: () => this.dismissAside(),
+      onOlderEvents: async (before) => {
+        const sid = this.sid
+        const run = this.openSeq
+        if (!sid) return null
+        try {
+          const page = await this.rc.getHistoryPage(sid, before)
+          return run === this.openSeq ? page : null
+        } catch (e) {
+          if (run === this.openSeq) this.onActionError(e)
+          return null
+        }
+      },
       onLoadInfo: () => void this.loadInfo(),
       onStopTask: (id) => void this.stopTask(id),
       onApplySettings: () => void this.applySettings(),
@@ -294,6 +364,7 @@ class App {
       // instead of Allow.
       this.glasses.onListRebuild = () => {
         this.listSelectIndex = 0
+        this.listBuiltAt = performance.now()
       }
       this.voice = new VoiceDictation(this.bridge)
       // Bounded: a startup page stuck on BLE no longer holds up the connect
@@ -493,6 +564,11 @@ class App {
     } finally {
       this.polling = false
     }
+    // Every tick, on every screen: a no-op while the glass matches (the display
+    // diffs), and the repaint when a write was dropped. Without it a screen
+    // whose write failed stayed wrong until something else changed it — and a
+    // prompt whose list never landed took no taps (promptTapOk).
+    this.render()
   }
 
   private async pollOnce(): Promise<void> {
@@ -529,7 +605,6 @@ class App {
       // A stream given up on comes back with the bridge: it just answered,
       // and still lists the session. (Not while an attempt is still dialling.)
       if (this.streamLost && !this.streamClose && this.sid) this.openStream()
-      if (this.state === 'list') this.render()
     } catch {
       // Transient; the next tick retries. What's on screen is stale meanwhile,
       // and says so.
@@ -548,6 +623,7 @@ class App {
   // ── open / close a session ─────────────────────────────────────────────
   private async openSession(sid: string): Promise<void> {
     const run = ++this.openSeq
+    this.pendingSend = null
     this.dropStream()
     this.sid = sid
     this.log.clear()
@@ -557,14 +633,16 @@ class App {
     this.resetSessionExtras()
     this.session = this.sessions.find((s) => s.id === sid) ?? null
     try {
-      const session = await this.rc.getSession(sid) // 409s if not active
-      const history = await this.rc.getHistory(sid) // the NEWEST events, oldest→newest
+      // Together: the session (409s if not active) and its history — the NEWEST
+      // events, oldest→newest, reaching back to some conversation.
+      const [session, history] = await Promise.all([this.rc.getSession(sid), this.rc.getHistoryPage(sid)])
       // Overtaken while the bridge answered — a second tap, another row, Back.
       // The newer open (or the list) owns the log, the stream and the screen;
       // carrying on would pour this session's events into them.
       if (run !== this.openSeq) return
       this.session = session
-      for (const ev of history) {
+      this.recentHistory = { ...history, events: history.events.slice() }
+      for (const ev of history.events) {
         this.log.append(ev)
         this.noteEvent(ev)
         if (ev.sequenceNum != null) this.lastSeq = Math.max(this.lastSeq, ev.sequenceNum)
@@ -572,14 +650,16 @@ class App {
       this.panel.setActiveSession(this.session)
       this.panel.setWorkerState(this.worker)
       this.panel.setTasks(this.tasks)
-      this.panel.setEvents(history)
+      this.panel.setEvents(history.events, history.before)
       // A session that is blocked on the user RIGHT NOW opens straight onto its
-      // prompt: the tail-most control_request with no resolution after it
-      // (answered ones are followed by their control_response / the turn's
-      // result), cross-checked against the session's own blocked status.
-      const pending = findPendingControl(history)
-      if (pending && this.session?.workerStatus === 'requires_action') this.queuePrompt(pending)
+      // prompt: every control_request with no resolution after it (answered
+      // ones are followed by their control_response / the turn's result),
+      // oldest first, cross-checked against the session's own blocked status.
+      if (this.session?.workerStatus === 'requires_action') {
+        for (const pending of findPendingControls(history.events)) this.queuePrompt(pending)
+      }
       this.openStream()
+      this.markRead()
       this.go('session')
     } catch (e) {
       if (run !== this.openSeq) return
@@ -599,6 +679,16 @@ class App {
         this.fail(`Could not open session.\n${(e as Error).message}`)
       }
     }
+  }
+
+  /** Clear the open session's unread mark: it is being read, here, as it would
+   *  be in claude.ai — so only while someone can be looking (the app in front
+   *  on the glasses; without glasses, the page visible). Best-effort and
+   *  silent: an older bridge has no such route, and nothing waits on it. */
+  private markRead(): void {
+    const sid = this.sid
+    const watched = this.glasses ? this.foreground : document.visibilityState !== 'hidden'
+    if (sid && watched) void this.rc.markRead(sid).catch(() => {})
   }
 
   /** (Re)open the open session's stream from the last event seen. Any stream
@@ -657,6 +747,12 @@ class App {
     // re-trigger UI — the log's sequenceNum dedupe is the gate for everything
     // below, most importantly the blocking-prompt routing.
     if (!this.log.append(ev)) return
+    if (ev.type === 'conversation_reset' && !ev.parentToolUseId) this.recentHistory = { events: [], before: null }
+    this.recentHistory.events.push(ev)
+    if (this.recentHistory.events.length > 1200) {
+      this.recentHistory.events.shift()
+      if (this.recentHistory.before !== undefined) this.recentHistory.before = this.recentHistory.events[0]?.sequenceNum
+    }
     this.noteEvent(ev)
     this.panel.appendEvent(ev)
     // Prompt-resolution signals: an answer echoed back through the log (ours or
@@ -664,8 +760,11 @@ class App {
     // withdrawing it (answered at the terminal); a turn-ending result retires
     // them all (the CLI is no longer waiting on anything).
     if (settlesPrompt(ev) && ev.requestId) this.resolvePromptRemotely(ev.requestId)
-    if (ev.type === 'result') this.dropAllPrompts('Turn ended.')
-    if (ev.type === 'conversation_reset') this.onConversationReset()
+    if (ev.type === 'result' && !ev.parentToolUseId) {
+      this.dropAllPrompts('Turn ended.')
+      this.markRead() // the turn ended in front of the wearer
+    }
+    if (ev.type === 'conversation_reset' && !ev.parentToolUseId) this.onConversationReset()
     // A fresh blocking control — a QUESTION (pick an option) or a
     // tool-permission (allow/deny) — joins the prompt queue; queuePrompt decides
     // whether it can show now or must wait for the wearer.
@@ -690,6 +789,7 @@ class App {
    *  event carries only the permission mode, so merge — never let its nulls
    *  erase the model or effort an init reported. */
   private noteEvent(ev: RcEvent): void {
+    if (ev.parentToolUseId) return
     if (ev.workerState) {
       const prev = this.worker ?? { model: null, effort: null, permissionMode: null, ccVersion: null }
       const next = { ...prev }
@@ -719,6 +819,7 @@ class App {
     this.infoError = null
     this.infoLoading = false
     this.infoSeq++
+    this.clearHudNote()
     this.panel.setWorkerState(null)
     this.panel.setTasks([])
     this.panel.setAside(null)
@@ -766,6 +867,8 @@ class App {
   private backToList(): void {
     this.teardownVoice() // an involuntary exit must never leave the mic hot
     this.pendingSend = null // drop any unconfirmed send
+    this.recentHistory = { events: [] }
+    this.historyPages = []
     this.openSeq++ // an open still in flight must not bring its session back
     this.dropStream()
     this.sid = null
@@ -780,6 +883,7 @@ class App {
 
   /** Fire-and-forget dictation teardown for involuntary exits. Safe when idle. */
   private teardownVoice(): void {
+    this.voiceRun++
     void this.voice?.cancel()
     this.interim = ''
     this.panel.setInterim('')
@@ -790,11 +894,20 @@ class App {
   private async send(text: string): Promise<void> {
     const t = text.trim()
     if (!t || !this.sid) return
+    if (isSlashInput(t)) {
+      this.noteOnHud('Run slash commands in Claude on your phone')
+      this.panel.setToast('Open in Claude to run that command.')
+      return
+    }
     try {
       await this.rc.send(this.sid, t)
       this.panel.setToast(`Sent: ${clip(t, 40)}`)
+      if (this.hudNote) {
+        this.clearHudNote() // a resend that went through un-says "not sent"
+        if (this.state === 'session') this.render()
+      }
     } catch (e) {
-      this.onActionError(e)
+      this.onActionError(e, 'not sent')
     }
   }
 
@@ -830,16 +943,20 @@ class App {
 
   /** Set reasoning effort; the sentinel 'auto' clears back to the model default. */
   private async applyEffort(effort: string): Promise<void> {
-    if (!this.sid) return
+    const sid = this.sid
+    if (!sid) return
     const level = effort === 'auto' ? null : (effort as EffortLevel)
     try {
-      const via = await this.rc.setEffort(this.sid, level)
-      this.effortBySid.set(this.sid, level)
-      // An older worker only takes the /effort command, which ALSO saves the
-      // level as that machine's default for the model — say so.
-      this.panel.setToast(via === 'command' ? `Effort → ${effort} (also saved as the host's default)` : `Effort → ${effort}`)
+      const via = await this.rc.setEffort(sid, level)
+      if (sid !== this.sid) return
+      if (via === 'control') {
+        this.effortBySid.set(sid, level)
+        this.panel.setToast(`Effort → ${effort}`)
+      } else if (via === 'command') {
+        this.panel.setToast(`Sent /effort ${effort}. If the worker runs it, it also saves the host default.`)
+      } else this.panel.setToast('Effort requested. Waiting for the worker to report it.')
     } catch (e) {
-      this.onActionError(e)
+      if (sid === this.sid) this.onActionError(e)
     }
   }
 
@@ -916,22 +1033,24 @@ class App {
   /** Ask the worker for plan usage + git changes (the rest of the info screen
    *  is already known). One fetch at a time: each leaves control events in the
    *  session's log, so a burst of taps mustn't multiply them. */
-  private async loadInfo(): Promise<void> {
+  private async loadInfo(section: InfoSection = 'all'): Promise<void> {
     const sid = this.sid
-    if (!sid || this.infoLoading) return
+    if (!sid || (this.infoLoading && this.infoSection === section)) return
+    if (this.infoSection !== section) this.info = null
+    this.infoSection = section
     const seq = ++this.infoSeq
     this.infoLoading = true
     this.panel.setInfo({ info: this.info, error: null, loading: true })
     if (this.state === 'info') this.render()
     try {
-      const info = await this.rc.info(sid)
+      const info = await this.rc.info(sid, section)
       if (seq !== this.infoSeq) return
       this.info = info
       this.infoError = null
     } catch (e) {
       if (seq !== this.infoSeq) return
       if (e instanceof BridgeError && e.isInactive) return this.onActionError(e)
-      this.infoError = workerError(e, 'plan usage + changes')
+      this.infoError = workerError(e, section === 'all' ? 'plan usage + changes' : section)
     } finally {
       if (seq === this.infoSeq) this.infoLoading = false
     }
@@ -949,9 +1068,10 @@ class App {
     }
   }
 
-  private async answerPermission(decision: Decision): Promise<void> {
+  private async answerPermission(decision: Decision, message?: string, sessionRule?: string): Promise<void> {
     const ev = this.permEvent
     const id = ev?.requestId
+    const run = this.openSeq
     // answeredIds is also the "already on its way" mark: a second tap while the
     // first answer is in flight must not send it twice.
     if (!this.sid || !ev || !id || this.answeredIds.has(id)) return
@@ -960,15 +1080,16 @@ class App {
       await this.rc.answerPermission(this.sid, {
         requestId: id,
         toolUseId: ev.toolUseId,
-        decision,
+        decision, message, sessionRule,
         updatedInput: decision === 'allow' ? ev.permissionRequest?.input ?? undefined : undefined,
       })
+      if (run !== this.openSeq) return
       this.panel.setToast(decision === 'allow' ? 'Allowed.' : 'Denied.')
     } catch (e) {
-      this.onAnswerError(e, id)
+      if (run === this.openSeq) this.onAnswerError(e, id)
       return
     }
-    if (this.retirePrompt(id) && this.state === 'permission') this.go('session') // presents any next prompt
+    if (this.retirePrompt(id) && this.onPromptScreen()) this.go('session') // presents any next prompt
   }
 
   /** An answer didn't get through. The session is still blocked on the prompt,
@@ -1005,7 +1126,10 @@ class App {
     this.permEvent = ev
     this.promptArmedAt = performance.now()
     this.promptSnoozed = false // a freshly armed prompt is never pre-snoozed
-    if (isQuestionRequest(ev)) {
+    if (ev.permissionRequest?.subtype === 'request_user_dialog') {
+      this.dialogQuestions = []
+      this.panel.showExternalDialog()
+    } else if (isQuestionRequest(ev)) {
       const p = ev.permissionRequest
       let questions = p?.questions ?? []
       if (questions.length === 0) {
@@ -1021,13 +1145,11 @@ class App {
         ]
       }
       this.dialogQuestions = questions
-      this.qIndex = 0
-      this.qPicks = []
-      this.panel.setDialog(this.dialogQuestions, this.qPicks)
+      this.resetPicks()
+      this.panel.setDialog(this.dialogQuestions, this.qPicks, this.qDone)
     } else {
       this.dialogQuestions = []
-      this.qIndex = 0
-      this.qPicks = []
+      this.resetPicks()
       this.panel.setPermission(ev.permissionRequest)
     }
     if (this.state === 'session' && this.histMode === 'live') {
@@ -1048,6 +1170,52 @@ class App {
     this.listSelectIndex = 0
     this.state = isQuestionRequest(ev) ? 'question' : 'permission'
     this.render()
+  }
+
+  /** Whether a tap on a prompt's list is one to act on: the list on the glass
+   *  must be THIS prompt's as it stands now (not a screen still under the
+   *  wearer's finger while the build crosses BLE, not the previous question,
+   *  not the rows from before a toggle), and it must have been there for
+   *  PROMPT_TAP_GUARD_MS. Every way a prompt's list changes is a rebuild — it
+   *  presents itself or is opened, the next question follows, a pick-any
+   *  option toggles, Details is left — so one test covers them all. A list
+   *  that never lands (a dropped write) takes no tap until the poll's render
+   *  repaints it. */
+  private promptTapOk(): boolean {
+    const layout = this.layout()
+    if (layout.kind !== 'list' || !this.glasses?.showsList(layout)) return false
+    return performance.now() - this.listBuiltAt >= PROMPT_TAP_GUARD_MS
+  }
+
+  /** The glasses are on the armed prompt: its list, or its details. */
+  private onPromptScreen(): boolean {
+    return this.state === 'permission' || this.state === 'question' || this.state === 'detail' || this.state === 'reply' || this.state === 'replyDetail' || (this.state === 'voice' && (this.voicePurpose === 'other' || this.voicePurpose === 'deny'))
+  }
+
+  /** Read the armed prompt in full: a permission's whole input (the header
+   *  holds two rows of it), or a question with every option's description.
+   *  Decides nothing — a tap or a double-tap goes back to the Allow / Deny or
+   *  option list. The text is fixed here, so the body the firmware scrolls
+   *  never changes under the reader. */
+  private openPromptDetail(): void {
+    const ev = this.permEvent
+    if (!ev) return
+    const text = hudSafe(
+      isQuestionRequest(ev)
+        ? questionDetail(this.dialogQuestions, this.qIndex)
+        : inputDetail(ev.permissionRequest?.input ?? null),
+    )
+    const head = clampBytes(text, DETAIL_BYTES, 'head')
+    this.detailBody = head.length < text.length ? `${head}\n${HUD.ELL} (the rest is on the phone panel)` : head
+    this.go('detail')
+  }
+
+  /** Leave the details for the prompt's list — or the session, if the prompt
+   *  was settled meanwhile. */
+  private closePromptDetail(): void {
+    this.promptReply = null
+    if (this.permEvent) this.presentPrompt()
+    else this.go('session')
   }
 
   /** "Answer later": set the armed question aside WITHOUT answering it. Unlike an
@@ -1094,7 +1262,7 @@ class App {
     this.clearPromptState()
     this.panel.setToast('Prompt was answered elsewhere.')
     if (this.prompts.length) this.armPrompt()
-    if (this.state === 'permission' || this.state === 'question') this.go('session')
+    if (this.onPromptScreen()) this.go('session')
   }
 
   /** Retire every queued prompt (the turn ended / the block vanished). */
@@ -1103,7 +1271,7 @@ class App {
     for (const p of this.prompts) if (p.requestId) this.answeredIds.add(p.requestId)
     this.prompts = []
     this.clearPromptState()
-    if (this.state === 'permission' || this.state === 'question') {
+    if (this.onPromptScreen()) {
       this.panel.setToast(msg)
       this.go('session')
     }
@@ -1111,14 +1279,23 @@ class App {
 
   /** Clear the armed prompt's screen/panel state (queue bookkeeping is separate). */
   private clearPromptState(): void {
+    this.promptReply = null
+    if (this.state === 'voice' && (this.voicePurpose === 'other' || this.voicePurpose === 'deny')) this.teardownVoice()
     this.permEvent = null
     this.dialogQuestions = []
-    this.qIndex = 0
-    this.qPicks = []
+    this.resetPicks()
+    this.detailBody = ''
     this.promptDeferred = false
     this.promptSnoozed = false
     this.panel.setPermission(null)
-    this.panel.setDialog(null, [])
+    this.panel.setDialog(null, [], [])
+  }
+
+  /** Start the armed question's answers over. */
+  private resetPicks(): void {
+    this.qIndex = 0
+    this.qPicks = []
+    this.qDone = []
   }
 
   /** Forget everything prompt-related (session open / leave). */
@@ -1134,55 +1311,109 @@ class App {
     return [{ label: 'Proceed', description: '' }]
   }
 
-  /** Tap in the question screen: pick the highlighted option, or dismiss. */
-  private pickHighlighted(): void {
-    const opts = this.optionsFor(this.dialogQuestions[this.qIndex])
-    // The list is [...options, "← Dismiss"]; the trailing row cancels.
-    if (this.listSelectIndex >= opts.length) {
-      void this.submitQuestion('cancelled')
-      return
+  /** The question screen's rows, top to bottom: the options (a multi-select's
+   *  marked picked / not), Submit for a multi-select, Details, Dismiss. */
+  private questionRows(): QuestionRow[] {
+    if (this.permEvent?.permissionRequest?.subtype === 'request_user_dialog') {
+      return [{ kind: 'later', text: 'Set aside' }]
     }
-    const opt = opts[this.listSelectIndex]
-    if (opt) this.recordPick(this.qIndex, opt.label)
+    const q = this.dialogQuestions[this.qIndex]
+    const picks = this.qPicks[this.qIndex] ?? []
+    const rows: QuestionRow[] = this.optionsFor(q).map((o) => ({
+      kind: 'option',
+      label: o.label,
+      text: q?.multiSelect ? `${picks.includes(o.label) ? HUD.RUN : HUD.IDLE} ${optionLabel(o)}` : optionLabel(o),
+    }))
+    if (this.voice?.available) rows.push({ kind: 'other', text: 'Dictate other answer' })
+    // Submit shows once there is something to submit (the list is rebuilt on
+    // every toggle anyway), so there is no row that would do nothing.
+    if (q?.multiSelect && picks.length) rows.push({ kind: 'submit', text: `${HUD.SEND} Submit (${picks.length})` })
+    rows.push({ kind: 'details', text: `Details ${HUD.GO}` })
+    rows.push({ kind: 'dismiss', text: `${HUD.BACK} Dismiss` })
+    return rows
   }
 
-  /** Record a chosen option for a question (from a gesture or the panel), then
-   *  advance to the next unanswered question or submit when all are answered. */
+  /** Tap in the question screen: act on the highlighted row. */
+  private pickHighlighted(): void {
+    const row = this.questionRows()[this.listSelectIndex]
+    if (!row) return
+    if (row.kind === 'later') this.snoozePrompt()
+    else if (row.kind === 'other') this.startPromptReply('other')
+    else if (row.kind === 'option') this.recordPick(this.qIndex, row.label)
+    else if (row.kind === 'submit') this.confirmPicks(this.qIndex)
+    else if (row.kind === 'details') this.openPromptDetail()
+    else void this.submitQuestion('cancelled')
+  }
+
+  /** An option was chosen (a gesture or the panel). A single-select question
+   *  is settled by it; a multi-select toggles it, and is settled by Submit
+   *  (confirmPicks). Until 1.10.0 every question took one pick and moved on,
+   *  so a "pick any" question could only ever be answered with one option. */
   private recordPick(qIndex: number, label: string): void {
-    if (qIndex < 0 || qIndex >= this.dialogQuestions.length) return
-    this.qPicks[qIndex] = [label] // single-select on the glasses (v1)
-    this.panel.setDialog(this.dialogQuestions, this.qPicks)
-    if (this.allAnswered()) {
+    const q = this.dialogQuestions[qIndex]
+    if (!q) return
+    if (q.multiSelect) {
+      const picks = this.qPicks[qIndex] ?? []
+      this.qPicks[qIndex] = picks.includes(label) ? picks.filter((l) => l !== label) : [...picks, label]
+      this.qDone[qIndex] = false
+      this.panel.setDialog(this.dialogQuestions, this.qPicks, this.qDone)
+      if (this.state === 'question') this.render() // the rebuilt list highlights row 0 again
+      return
+    }
+    this.qPicks[qIndex] = [label]
+    this.qDone[qIndex] = true
+    this.advanceQuestion()
+  }
+
+  /** Submit on a multi-select question: its picks stand. */
+  private confirmPicks(qIndex: number): void {
+    if (!this.dialogQuestions[qIndex]?.multiSelect) return
+    if (!this.qPicks[qIndex]?.length) {
+      this.panel.setToast('Pick at least one option, or dismiss the question.')
+      return
+    }
+    this.qDone[qIndex] = true
+    this.advanceQuestion()
+  }
+
+  /** A question was settled: send the answers once all are, else show the next. */
+  private advanceQuestion(): void {
+    this.panel.setDialog(this.dialogQuestions, this.qPicks, this.qDone)
+    const next = this.dialogQuestions.findIndex((_, i) => !this.qDone[i])
+    if (next < 0) {
       void this.submitQuestion('completed')
       return
     }
-    const next = this.dialogQuestions.findIndex((_, i) => (this.qPicks[i]?.length ?? 0) === 0)
-    if (next >= 0) this.qIndex = next
+    this.qIndex = next
     this.listSelectIndex = 0
     if (this.state === 'question') this.render()
-  }
-
-  private allAnswered(): boolean {
-    return this.dialogQuestions.length > 0 && this.dialogQuestions.every((_, i) => (this.qPicks[i]?.length ?? 0) > 0)
   }
 
   /** Send the answer (or a cancel) back through the bridge's /dialog route. */
   private async submitQuestion(status: 'completed' | 'cancelled'): Promise<void> {
     const ev = this.permEvent
     const id = ev?.requestId
+    const run = this.openSeq
     if (!this.sid || !ev || !id) {
       this.clearPromptState()
-      if (this.state === 'question') this.go('session')
+      if (this.onPromptScreen()) this.go('session')
       return
     }
     if (this.answeredIds.has(id)) return // already on its way (see answerPermission)
     this.answeredIds.add(id) // …and a replay must never resurrect it
     const subtype = ev.permissionRequest?.subtype ?? ev.blockingSubtype ?? 'request_user_dialog'
-    const answers: DialogAnswer[] = this.dialogQuestions.map((q, i) => ({
-      header: q.header,
-      question: q.question,
-      options: this.qPicks[i] ?? [],
-    }))
+    // A multi-select's picks go in the question's own order — and, to
+    // AskUserQuestion (a `can_use_tool`), as ONE comma-separated string: the
+    // tool takes a string per question ("multi-select answers are
+    // comma-separated"). Joined here, so a bridge older than 0.6.0 (which would
+    // have sent a list) gets it right too. A true dialog keeps the labels apart.
+    const answers: DialogAnswer[] = this.dialogQuestions.map((q, i) => {
+      const picks = this.qPicks[i] ?? []
+      const ordered = q.options.map((o) => o.label).filter((l) => picks.includes(l))
+      ordered.push(...picks.filter((label) => !ordered.includes(label)))
+      const options = !q.multiSelect || !ordered.length ? picks : subtype === 'can_use_tool' ? [ordered.join(', ')] : ordered
+      return { header: q.header, question: q.question, options }
+    })
     try {
       await this.rc.answerDialog(this.sid, {
         requestId: id,
@@ -1196,42 +1427,98 @@ class App {
         status,
         answers: status === 'completed' ? answers : undefined,
       })
+      if (run !== this.openSeq) return
       this.panel.setToast(
         status === 'completed' ? `Answered: ${clip(answers[0]?.options[0] ?? '', 30)}` : 'Question dismissed.',
       )
     } catch (e) {
+      if (run !== this.openSeq) return
       this.onAnswerError(e, id)
       // Still unanswered: start its picks over, so the next one re-submits.
       if (this.permEvent?.requestId === id) {
-        this.qIndex = 0
-        this.qPicks = []
-        this.panel.setDialog(this.dialogQuestions, this.qPicks)
+        this.resetPicks()
+        this.panel.setDialog(this.dialogQuestions, this.qPicks, this.qDone)
         if (this.state === 'question') this.render()
       }
       return
     }
-    if (this.retirePrompt(id) && this.state === 'question') {
+    if (this.retirePrompt(id) && this.onPromptScreen()) {
       // Either path presents the next queued prompt, if there is one.
       if (status === 'completed') this.goLiveSession() // answered → watch it continue
       else this.go('session')
     }
   }
 
-  private onActionError(e: unknown): void {
+  /** An action failed. A session gone inactive is left; anything else is said
+   *  on both surfaces — `what` leads the glasses' note (`not sent: …`). */
+  private onActionError(e: unknown, what = 'failed'): void {
     if (e instanceof BridgeError && e.isInactive) {
       this.panel.setToast('Session is no longer active.')
       void this.leaveInactive()
     } else {
       this.panel.setToast(`Error: ${(e as Error).message}`)
+      this.noteOnHud(`${what}: ${(e as Error).message}`)
     }
   }
 
+  /** Show `msg` in the session footer for a few seconds (see `hudNote`). */
+  private noteOnHud(msg: string): void {
+    this.clearHudNote()
+    this.hudNote = clip(hudSafe(msg), 48, HUD.ELL)
+    this.hudNoteTimer = setTimeout(() => {
+      this.clearHudNote()
+      if (this.state === 'session') this.render()
+    }, HUD_NOTE_MS)
+    if (this.state === 'session') this.render()
+  }
+
+  /** Drop the footer note: it timed out, was overtaken, or its session was left. */
+  private clearHudNote(): void {
+    if (this.hudNoteTimer) clearTimeout(this.hudNoteTimer)
+    this.hudNoteTimer = null
+    this.hudNote = ''
+  }
+
   // ── voice dictation ────────────────────────────────────────────────────
-  private async startVoice(purpose: 'send' | 'aside', from: 'panel' | 'glasses'): Promise<void> {
+  private startPromptReply(kind: PromptReply['kind']): void {
+    const p = this.permEvent
+    if (!p?.requestId) return
+    this.promptReply = { id: p.requestId, index: this.qIndex, kind, text: '' }
+    if (kind === 'rule') {
+      this.promptReply.text = p.permissionRequest?.sessionRule ?? ''
+      this.go('reply')
+    } else void this.startVoice(kind, 'glasses')
+  }
+
+  private reviewPromptText(text: string): void {
+    const reply = this.promptReply
+    if (!reply || reply.id !== this.permEvent?.requestId || reply.index !== this.qIndex) {
+      this.closePromptDetail()
+      return
+    }
+    reply.text = text
+    if (text) this.go('reply')
+    else this.closePromptDetail()
+  }
+
+  private commitReply(): void {
+    const reply = this.promptReply
+    if (!reply || reply.id !== this.permEvent?.requestId || reply.index !== this.qIndex) return
+    if (reply.kind === 'rule') void this.answerPermission('allow', undefined, reply.text)
+    else if (reply.kind === 'deny') void this.answerPermission('deny', reply.text)
+    else {
+      this.promptReply = null
+      this.presentPrompt()
+      this.recordPick(reply.index, reply.text)
+    }
+  }
+
+  private async startVoice(purpose: VoicePurpose, from: 'panel' | 'glasses'): Promise<void> {
     if (!this.voice?.available) {
       this.panel.setToast('Voice dictation needs a Deepgram key.')
       return
     }
+    if (purpose === 'send' || purpose === 'aside') this.promptReply = null
     this.voicePurpose = purpose
     this.voiceFrom = from
     this.voiceStatus = 'connecting'
@@ -1289,6 +1576,10 @@ class App {
   private async commitVoice(): Promise<void> {
     const text = await this.finishDictation()
     if (text === null) return // a finish already under way owns the result
+    if (this.voicePurpose === 'other' || this.voicePurpose === 'deny') {
+      if (this.state === 'voice') this.reviewPromptText(text)
+      return
+    }
     if (this.voicePurpose === 'aside') {
       if (text) await this.askAside(text, 'glasses')
       else if (this.state === 'voice') this.go('session')
@@ -1308,7 +1599,8 @@ class App {
     const text = await this.finishDictation()
     if (text === null) return // a finish already under way owns the result
     if (this.state !== 'voice') return // involuntarily left the voice screen meanwhile
-    if (!text) this.go('session')
+    if (this.voicePurpose === 'other' || this.voicePurpose === 'deny') this.reviewPromptText(text)
+    else if (!text) this.go('session')
     else if (this.voicePurpose === 'aside') void this.askAside(text, 'glasses') // read-only: no confirm
     else this.confirmSend(text, 'session')
   }
@@ -1341,7 +1633,8 @@ class App {
   private reviewStoppedDictation(): void {
     const text = this.voiceStop?.text ?? ''
     this.voiceStop = null
-    if (text) this.confirmSend(text, 'session')
+    if (this.promptReply) this.closePromptDetail()
+    else if (text) this.confirmSend(text, 'session')
     else this.go('session')
   }
 
@@ -1354,7 +1647,10 @@ class App {
     this.panel.setInterim('')
     this.panel.setDictating(false)
     if (this.state !== 'voice') return
-    if (backgrounded) this.leaveVoiceQuietly()
+    if (backgrounded) {
+      if (this.promptReply) this.promptDeferred = true
+      this.leaveVoiceQuietly()
+    } else if (this.promptReply) this.closePromptDetail()
     else this.go('session')
   }
 
@@ -1446,12 +1742,16 @@ class App {
         // Backgrounded — never leave the mic hot, nor the voice screen up
         // claiming to listen over a closed one.
         // A stopped dictation has nothing live: it stays up, words and all.
+        this.foreground = false
         if (this.state === 'voice' && !this.voiceStop) void this.cancelVoice(true)
         else void this.voice?.cancel()
         return
       case OsEventTypeList.FOREGROUND_ENTER_EVENT:
         // Back in front: a write made while hidden may have been dropped, which
-        // leaves the mirror invalidated — render() repaints only if so.
+        // leaves the mirror invalidated — render() repaints only if so. And an
+        // open session is being read again.
+        this.foreground = true
+        this.markRead()
         this.render()
         return
       case CLICK:
@@ -1491,21 +1791,41 @@ class App {
         if (this.voiceStop) this.reviewStoppedDictation()
         else void this.reviewDictation() // finish dictating → review before sending
         break
+      case 'replyDetail':
+        this.go('reply')
+        break
       case 'confirm':
         this.commitPendingSend() // tap = send the held message
         break
+      case 'reply':
+        if (this.promptTapOk()) {
+          if (this.listSelectIndex === 0) this.closePromptDetail()
+          else if (this.listSelectIndex === 1) this.commitReply()
+          else this.go('replyDetail')
+        }
+        break
       case 'permission':
-        void this.answerPermission(this.listSelectIndex >= 1 ? 'deny' : 'allow') // tap the highlighted Allow/Deny row
+        if (!this.promptTapOk()) break
+        // The first three rows retain their positions on every permission.
+        if (this.listSelectIndex === 0) void this.answerPermission('allow')
+        else if (this.listSelectIndex === 1) void this.answerPermission('deny')
+        else if (this.listSelectIndex === 2) this.openPromptDetail()
+        else if (this.permissionLayout().items[this.listSelectIndex] === 'Deny with a note') this.startPromptReply('deny')
+        else if (this.permissionLayout().items[this.listSelectIndex] === 'Allow for session') this.startPromptReply('rule')
         break
       case 'question':
-        this.pickHighlighted() // tap the highlighted option (or the Dismiss row)
+        if (!this.promptTapOk()) break
+        this.pickHighlighted() // an option, Submit, Details or Dismiss
+        break
+      case 'detail':
+        this.closePromptDetail()
         break
       case 'aside':
         // Answered → ask a follow-up (the submenu; history rides along).
         if (this.aside?.answer != null || this.aside?.error) this.openSubmenu('aside')
         break
       case 'info':
-        void this.loadInfo() // tap = refresh
+        void this.loadInfo(this.infoSection) // tap = refresh
         break
       case 'notice':
         this.ackNotice() // got it — never shows again on this device
@@ -1534,6 +1854,9 @@ class App {
       case 'voice':
         void this.cancelVoice()
         break
+      case 'replyDetail':
+        this.go('reply')
+        break
       case 'confirm':
         this.cancelPendingSend() // dbl-tap = back out without sending
         break
@@ -1542,6 +1865,10 @@ class App {
         break
       case 'question':
         this.snoozePrompt() // dbl-tap sets the question aside to answer later
+        break
+      case 'reply':
+      case 'detail':
+        this.closePromptDetail() // back to its Allow / Deny or option list
         break
       case 'aside':
       case 'info':
@@ -1582,32 +1909,68 @@ class App {
 
   /** Scrolled up off the live tail → freeze the newest lines into a history window. */
   private enterHistory(): void {
-    if (this.log.lineCount === 0) return
-    const w = this.log.tailWindow(HISTORY_WINDOW_BYTES)
-    this.histTop = w.startLine
-    this.histEnd = this.log.lineCount
-    this.histBody = w.text
+    const page = this.freezePage(this.recentHistory)
+    if (!page.log.lineCount && page.before == null) return
+    this.historyPages = [page]
+    this.pageIndex = 0
     this.histMode = 'history'
-    this.render()
+    this.showOlderWindow(page.log, page.log.lineCount)
   }
 
-  /** Load the window immediately above the current one (older). */
-  private historyOlder(): void {
-    if (this.histTop <= 0) return // already at the oldest retained line
-    const w = this.log.windowBefore(this.histTop, HISTORY_WINDOW_BYTES)
-    this.histEnd = this.histTop
+  private freezePage(page: HistoryPage) {
+    const log = new EventLog(Infinity)
+    for (const event of page.events) log.append(event)
+    return { log, before: page.before }
+  }
+
+  private showOlderWindow(log: EventLog, end: number): void {
+    const w = log.windowBefore(end, HISTORY_WINDOW_BYTES)
+    this.histEnd = end
     this.histTop = w.startLine
     this.histBody = w.text
     this.render()
   }
 
-  /** Load the window below the current one (newer); past the newest → back to live. */
-  private historyNewer(): void {
-    if (this.histEnd >= this.log.lineCount) {
-      this.enterLive()
-      return
+  private async historyOlder(): Promise<void> {
+    const page = this.historyPages[this.pageIndex]
+    if (!page) return
+    if (this.histTop > 0) return this.showOlderWindow(page.log, this.histTop)
+    let older = this.historyPages[this.pageIndex + 1]
+    if (!older) {
+      if (!this.sid || page.before == null || this.loadingPage === page.log) return
+      this.loadingPage = page.log
+      this.render()
+      try {
+        const result = await this.rc.getHistoryPage(this.sid, page.before)
+        if (this.state !== 'session' || this.histMode !== 'history' || this.historyPages[this.pageIndex] !== page || this.histTop > 0) return
+        const events = result.events.filter(e => e.sequenceNum != null && e.sequenceNum < page.before!)
+        if (!events.length) {
+          page.before = null
+          return
+        }
+        older = this.freezePage({ events, before: result.before != null && result.before < page.before ? result.before : null })
+        this.historyPages.push(older)
+      } catch (e) {
+        if (this.historyPages[this.pageIndex] === page) this.onActionError(e, 'history unavailable')
+        return
+      } finally {
+        if (this.loadingPage === page.log) this.loadingPage = null
+        this.render()
+      }
     }
-    const w = this.log.windowFrom(this.histEnd, HISTORY_WINDOW_BYTES)
+    this.pageIndex++
+    this.showOlderWindow(older.log, older.log.lineCount)
+  }
+
+  private historyNewer(): void {
+    let page = this.historyPages[this.pageIndex]
+    if (!page) return this.enterLive()
+    if (this.histEnd >= page.log.lineCount) {
+      if (!this.pageIndex) return this.enterLive()
+      page = this.historyPages[--this.pageIndex]
+      this.histEnd = 0
+    }
+    const w = page.log.windowFrom(this.histEnd, HISTORY_WINDOW_BYTES)
     this.histTop = this.histEnd
     this.histEnd = w.endLine
     this.histBody = w.text
@@ -1615,6 +1978,8 @@ class App {
   }
 
   private enterLive(): void {
+    this.historyPages = []
+    this.loadingPage = null
     this.histMode = 'live'
     this.histBody = ''
     // Scrolled back to now with a prompt waiting → that IS the current state
@@ -1629,8 +1994,7 @@ class App {
   /** Jump to the tail because we just gave the session work (a send / dictate /
    *  answer) — that's what to watch now, even if the wearer had scrolled back. */
   private goLiveSession(): void {
-    this.histMode = 'live'
-    this.histBody = ''
+    this.resetSessionView()
     this.go('session')
   }
 
@@ -1643,6 +2007,8 @@ class App {
    *  the session is running, simply sitting there if it's idle. Scrolling up
    *  drops into the frozen history windows either way. */
   private resetSessionView(): void {
+    this.historyPages = []
+    this.loadingPage = null
     this.histMode = 'live'
     this.histBody = ''
     this.histTop = 0
@@ -1732,7 +2098,8 @@ class App {
       return
     }
     if (this.submenuKind === 'command') {
-      this.fireSlashCommand(item.value) // owns its own navigation (confirm vs fire+watch)
+      this.go('info')
+      void this.loadInfo(item.value === 'usage' ? 'usage' : 'context')
       return
     }
     if (this.submenuKind === 'aside') {
@@ -1746,28 +2113,9 @@ class App {
     this.go('session')
   }
 
-  /** Fire a slash command from the Commands submenu. Sent as a plain `/name`
-   *  message — the worker runs it locally at zero cost. A `confirm` command
-   *  (heavy/destructive, e.g. /compact, /clear) lands on the confirm screen first
-   *  so a stray tap can't fire it; the rest send immediately and jump to the live
-   *  tail so the wearer watches the command's output land. */
-  private fireSlashCommand(name: string): void {
-    const cmd = SLASH_COMMANDS.find((c) => c.name === name)
-    if (!cmd) {
-      this.go('session')
-      return
-    }
-    const text = `/${cmd.name}`
-    if (cmd.confirm) {
-      this.confirmSend(text, 'compose') // cancel returns to the Compose menu, one level up
-      return
-    }
-    void this.send(text)
-    this.goLiveSession()
-  }
-
   // ── state transition + rendering ───────────────────────────────────────
   private go(state: State): void {
+    if (this.state === 'confirm' && state !== 'confirm') this.pendingSend = null
     // Coming (back) to the session view while a prompt waits presents the
     // prompt instead — it's the thing the session is blocked on, and the wearer
     // is no longer mid-menu / mid-dictation. A SNOOZED prompt is the exception:
@@ -1804,6 +2152,7 @@ class App {
   }
 
   private render(): void {
+    this.panel.setGlassesDraft(this.state === 'confirm' && this.pendingSend !== null)
     this.panel.setConnection({ bridge: this.connBridge, origin: this.origin, state: this.state })
     if (!this.glasses) return // panel-only mode
     this.glasses.render(this.layout())
@@ -1842,6 +2191,24 @@ class App {
         return this.permissionLayout()
       case 'question':
         return this.questionLayout()
+      case 'replyDetail': {
+        const text = hudSafe(this.promptReply?.text ?? '')
+        const head = clampBytes(text, DETAIL_BYTES, 'head')
+        const body = head === text ? text : `${head}
+${HUD.ELL} (reply continues)`
+        return { kind: 'scroll', header: 'Review reply', body, footer: 'tap = back' }
+      }
+      case 'reply': {
+        const r = this.promptReply
+        const action = r?.kind === 'rule' ? 'Allow for session' : r?.kind === 'deny' ? 'Deny with note' : 'Use answer'
+        const text = hudSafe(r?.text ?? '')
+        const head = fitHeader(text, 3)
+        const items = ['Back', action]
+        if (head.text !== text) items.push('Read reply')
+        return { kind: 'list', header: head.text, headerRows: head.rows, items, key: `reply:${r?.id}:${r?.index}:${r?.text}` }
+      }
+      case 'detail':
+        return this.detailLayout()
       case 'voice': {
         if (this.voiceStop) {
           const { reason, text } = this.voiceStop
@@ -1939,7 +2306,7 @@ class App {
         kind: 'scroll',
         header,
         body: this.histBody || '(no events)',
-        footer: `${attn}history ${HUD.SEP} down = live ${HUD.SEP} dbl = list`,
+        footer: this.loadingPage ? `loading earlier events${HUD.ELL}` : `${attn}history ${HUD.SEP} down = live ${HUD.SEP} dbl = list`,
       }
     }
     // The tail view is "live" while the session is running (auto-following) and
@@ -1949,46 +2316,81 @@ class App {
     // neither: what's on screen is as of when it dropped.
     const offline = this.streamDown || this.connBridge === 'down'
     const tailTag = offline ? `${HUD.ATTN} offline` : this.isRunning(s) ? `${HUD.RUN} live` : `${HUD.IDLE} latest`
+    // A failed action takes the whole footer for a moment: the strip is one
+    // line, and a waiting prompt's "needs you" is back when the note goes.
+    if (this.hudNote) return { kind: 'scroll', header, body: this.liveBody(), footer: `${HUD.ATTN} ${this.hudNote}` }
     return {
       kind: 'scroll',
       header,
       // The live tail is ROW-budgeted so it always fits the body with no
       // overflow — the firmware draws text top-aligned and never auto-scrolls,
       // so an overflowing tail would hide exactly the newest lines.
-      body: this.log.lineCount ? this.log.tailRows(LIVE_BODY_ROWS, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES) : '(no events yet)',
+      body: this.liveBody(),
       footer: `${attn}${tailTag} ${HUD.SEP} up = history ${HUD.SEP} tap = menu`,
     }
   }
 
-  /** Permission prompt as a native Allow/Deny list — so, like every other screen,
-   *  it has a no-commit escape: scroll to Allow or Deny and tap to decide, or
-   *  double-tap to set it aside and answer later. The tool + a clip of its input
-   *  ride in the header (the companion panel shows the full, unclipped input). */
-  private permissionLayout(): Layout {
+  private liveBody(): string {
+    return this.log.lineCount ? this.log.tailRows(LIVE_BODY_ROWS, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES) : '(no events yet)'
+  }
+
+  /** Permission prompt as a native list — so, like every other screen, it has
+   *  a no-commit escape: scroll to Allow or Deny and tap to decide, or
+   *  double-tap to set it aside and answer later. The tool and the start of
+   *  its input ride in the header, sized to hold them (as one line it cut a
+   *  long command off mid-word, with a scrollbar); Details shows all of it. */
+  private permissionLayout(): ListLayout {
     const p = this.permEvent?.permissionRequest
     const tool = p?.toolName ?? 'tool'
-    const raw = p?.input ? firstInput(p.input) : ''
-    const detail = raw ? ` ${HUD.SEP} ${clip(raw, 88, HUD.ELL)}` : ''
+    const name = `${HUD.ATTN} ${clip(tool, 22, HUD.ELL)}`
+    const lead = `${name} ${HUD.SEP} `
+    const raw = p?.input ? headerInput(p.input, lead) : ''
+    const head = fitHeader(raw ? `${lead}${raw}` : name, PERMISSION_HEADER_ROWS)
     return {
       kind: 'list',
-      header: `${HUD.ATTN} ${clip(tool, 22, HUD.ELL)}${detail}`,
-      items: ['Allow', 'Deny'],
+      header: head.text,
+      headerRows: head.rows,
+      items: ['Allow', 'Deny', `Details ${HUD.GO}`,
+        ...(this.voice?.available ? ['Deny with a note'] : []),
+        ...(p?.sessionRule && hudSafe(p.sessionRule) === p.sessionRule && /^[ -~]+$/.test(p.sessionRule) && fitsStripRow(p.sessionRule) ? ['Allow for session'] : [])],
+      // Each prompt is its own list, though every one reads Allow / Deny /
+      // Details: the next one is a rebuild (highlight back on Allow, the tap
+      // guard running again), never the last one's page with a new header.
+      key: this.permEvent?.requestId ?? '',
     }
   }
 
   /** Question dialog: the question in the header + its options as a native list.
-   *  Scroll to an option and tap to pick; the trailing `← Dismiss` row (or a
-   *  double-tap) cancels. Multi-question dialogs are answered one at a time. */
-  private questionLayout(): Layout {
+   *  Scroll to an option and tap to pick; a multi-select toggles its options
+   *  and has a Submit row. Details shows every option in full; the trailing
+   *  `← Dismiss` row cancels and a double-tap sets the question aside.
+   *  Multi-question dialogs are answered one at a time. */
+  private questionLayout(): ListLayout {
     const q = this.dialogQuestions[this.qIndex]
     const n = this.dialogQuestions.length
-    const prefix = n > 1 ? `(${this.qIndex + 1}/${n}) ` : ''
-    const head = (q?.question || q?.header || 'Question').trim()
-    const options = this.optionsFor(q)
+    const prefix = `${n > 1 ? `(${this.qIndex + 1}/${n}) ` : ''}${q?.multiSelect ? 'pick any: ' : ''}`
+    if (this.permEvent?.permissionRequest?.subtype === 'request_user_dialog') {
+      return { kind: 'list', header: 'Answer this dialog in Claude', items: ['Set aside'], key: this.permEvent.requestId ?? '' }
+    }
+    const head = fitHeader(`${HUD.ATTN} ${prefix}${(q?.question || q?.header || 'Question').trim()}`, QUESTION_HEADER_ROWS)
     return {
       kind: 'list',
-      header: `${HUD.ATTN} ${prefix}${clip(head, 84, HUD.ELL)}`,
-      items: [...options.map(optionLabel), `${HUD.BACK} Dismiss`],
+      header: head.text,
+      headerRows: head.rows,
+      items: this.questionRows().map((r) => r.text),
+      key: `${this.permEvent?.requestId ?? ''}:${this.qIndex}`, // see permissionLayout
+    }
+  }
+
+  /** The armed prompt in full, on a natively-scrolled body (openPromptDetail). */
+  private detailLayout(): Layout {
+    const ev = this.permEvent
+    const what = !ev ? 'Prompt' : isQuestionRequest(ev) ? 'Question' : clip(ev.permissionRequest?.toolName ?? 'tool', 30, HUD.ELL)
+    return {
+      kind: 'scroll',
+      header: `${HUD.ATTN} ${what} ${HUD.SEP} details`,
+      body: this.detailBody || '(nothing more)',
+      footer: 'tap = back',
     }
   }
 
@@ -2019,9 +2421,12 @@ class App {
         .filter(Boolean)
         .join(` ${HUD.SEP} `),
     )
-    if (s?.context) {
-      lines.push(`context ${s.context.percent}% ${HUD.SEP} ${tokens(s.context.usedTokens)} of ${tokens(s.context.maxTokens)}`)
-    }
+    const ctx = this.info?.context ?? s?.context
+    if (ctx?.percent != null && ctx.usedTokens != null && ctx.maxTokens != null) {
+      lines.push(`context ${ctx.percent}% ${HUD.SEP} ${tokens(ctx.usedTokens)} of ${tokens(ctx.maxTokens)}`)
+    } else lines.push('context usage unavailable')
+    for (const c of this.info?.context?.categories ?? []) lines.push(`${c.name} ${tokens(c.tokens)}`)
+    if (s?.rateLimit) lines.push(rateLimitLabel(s))
     if (s?.needsAction) lines.push('', `${HUD.ATTN} ${s.needsAction}`)
     else if (s?.summary) lines.push('', s.summary)
     if (this.tasks.length) {
@@ -2081,6 +2486,8 @@ class App {
     this.pollTimer = null
     this.closeStream()
     void this.voice?.cancel()
+    if (this.hudNoteTimer) clearTimeout(this.hudNoteTimer)
+    this.hudNoteTimer = null
   }
 }
 
@@ -2112,7 +2519,7 @@ function tokens(n: number): string {
 }
 /** The info screen's on-demand lines: plan usage windows + git changes. */
 function infoLines(info: SessionInfo | null, loading: boolean, error: string | null): string[] {
-  if (!info) return [loading ? 'plan + changes: loading...' : error ? `${HUD.ATTN} ${error}` : '']
+  if (!info) return [loading ? 'asking the worker...' : error ? `${HUD.ATTN} ${error}` : '']
   const lines: string[] = []
   const limits = info.usage?.limits ?? []
   if (limits.length) {
@@ -2152,6 +2559,39 @@ function workerError(e: unknown, what: string): string {
   }
   return (e as Error).message || 'Failed.'
 }
+/** One row of the question screen: what it shows, and what a tap on it does. */
+type QuestionRow =
+  | { kind: 'option'; text: string; label: string }
+  | { kind: 'submit' | 'details' | 'dismiss' | 'other' | 'later'; text: string }
+
+/** `text` clipped to what `maxRows` rows of a prompt's header strip hold, and
+ *  the rows that takes. Measured, not counted (`stripRows`): the font is
+ *  proportional and rows are lost to wrapping, so a char budget either cut a
+ *  header short above an empty row or let it spill into a scrollbar. */
+function fitHeader(text: string, maxRows: number): { text: string; rows: number } {
+  let fitted = clip(text, 80 * maxRows, HUD.ELL)
+  while (stripRows(fitted) > maxRows && fitted.length > 8) fitted = clip(fitted, fitted.length - 3, HUD.ELL)
+  return { text: fitted, rows: Math.min(maxRows, stripRows(fitted)) }
+}
+/** A tool's whole input for the details screen: the field the prompt's header
+ *  starts with first, then the rest, each under its name. */
+function inputDetail(input: Record<string, unknown> | null): string {
+  const fields = Object.entries(input ?? {}).filter(([, v]) => v != null && v !== '')
+  if (fields.length === 0) return '(no input)'
+  const lead = INPUT_KEYS.find((k) => fields.some(([name]) => name === k))
+  fields.sort(([a], [b]) => Number(b === lead) - Number(a === lead))
+  return fields.map(([name, v]) => `${name}: ${typeof v === 'string' ? v : JSON.stringify(v)}`).join('\n\n')
+}
+/** A question for the details screen: its text and each option's full description. */
+function questionDetail(questions: DialogQuestion[], index: number): string {
+  const q = questions[index]
+  if (!q) return '(no question)'
+  const lines = [q.question || q.header || 'Question']
+  if (q.multiSelect) lines.push('(pick any, then Submit)')
+  lines.push('')
+  for (const o of q.options) lines.push(`${HUD.SEP} ${o.label}${o.description ? `: ${o.description}` : ''}`)
+  return lines.join('\n')
+}
 /** A question option row: the label, plus a short description when there's room. */
 function optionLabel(o: DialogOption): string {
   const desc = o.description ? ` ${HUD.SEP} ${clip(o.description, 28, HUD.ELL)}` : ''
@@ -2164,25 +2604,42 @@ function promptGist(ev: RcEvent): string {
   return clip(q?.question || q?.header || p?.prompt || p?.toolName || 'a prompt', 48, HUD.ELL)
 }
 /**
- * The tail-most blocking control in `events` that nothing after it resolves.
- * An answered control_request is followed by its control_response (any
+ * The blocking controls in `events` that nothing after them resolves, oldest
+ * first. An answered control_request is followed by its control_response (any
  * controller's), a withdrawn one by the worker's cancel, and a finished turn
  * by its result — so whatever survives the scan is what the session is blocked
  * on right now (callers still cross-check the session's own blocked status).
+ * All of them, as the live stream queues them: a turn can wait on several at
+ * once, and until 1.10.0 only the newest was found — answer it, and the scan
+ * on the next open found nothing, with the session still blocked on the rest.
  */
-function findPendingControl(events: RcEvent[]): RcEvent | null {
-  let pending: RcEvent | null = null
+function findPendingControls(events: RcEvent[]): RcEvent[] {
+  const pending = new Map<string, RcEvent>()
   for (const ev of events) {
-    if (ev.isBlockingControl && ev.permissionRequest && ev.requestId) pending = ev
-    else if (settlesPrompt(ev) && ev.requestId && pending?.requestId === ev.requestId) pending = null
-    else if (ev.type === 'result' || ev.type === 'conversation_reset') pending = null
+    if (ev.isBlockingControl && ev.permissionRequest && ev.requestId) pending.set(ev.requestId, ev)
+    else if (settlesPrompt(ev) && ev.requestId) pending.delete(ev.requestId)
+    else if (!ev.parentToolUseId && (ev.type === 'result' || ev.type === 'conversation_reset')) pending.clear()
   }
-  return pending
+  return [...pending.values()]
 }
-function firstInput(input: Record<string, unknown>): string {
-  for (const key of ['command', 'file_path', 'path', 'pattern', 'url', 'description', 'prompt', 'query']) {
+/** The input fields that say what a tool call is, most telling first. */
+const INPUT_KEYS = ['command', 'file_path', 'path', 'notebook_path', 'pattern', 'url', 'plan', 'description', 'prompt', 'query']
+const PATH_KEYS = ['file_path', 'path', 'notebook_path']
+/**
+ * What a permission's header says after `lead` (the tool's name): the most
+ * telling input field. A path too long to finish the row keeps its END, from
+ * a directory boundary: the file is what is being asked about, not the folders
+ * above it.
+ */
+function headerInput(input: Record<string, unknown>, lead: string): string {
+  for (const key of INPUT_KEYS) {
     const v = input[key]
-    if (typeof v === 'string' && v) return v
+    if (typeof v !== 'string' || !v) continue
+    if (!PATH_KEYS.includes(key) || fitsStripRow(`${lead}${v}`)) return v
+    let end = v
+    while (end.length > 8 && !fitsStripRow(`${lead}${HUD.ELL}${end}`)) end = end.slice(4)
+    const cut = end.indexOf('/')
+    return `${HUD.ELL}${cut > 0 ? end.slice(cut) : end}`
   }
   for (const v of Object.values(input)) {
     if (typeof v === 'string' && v) return v
