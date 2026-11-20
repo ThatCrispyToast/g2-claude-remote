@@ -2,7 +2,7 @@
   "package_id": "com.thatcrispytoast.clauderemote",
   "edition": "202601",
   "name": "Claude Remote",
-  "version": "1.11.0",
+  "version": "1.11.1",
   "min_app_version": "2.2.10",
   "min_sdk_version": "0.0.16",
   "entrypoint": "index.html",
@@ -13,6 +13,7 @@
       "desc": "Talk to your Claude Remote bridge, and stream voice dictation to Deepgram.",
       "whitelist": [
         "*",
+        "https://claude.ai",
         "http://localhost:8790",
         "wss://api.deepgram.com",
         "https://api.deepgram.com"

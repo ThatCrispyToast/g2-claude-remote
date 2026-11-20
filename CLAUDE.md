@@ -91,6 +91,13 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   therefore rides `app.json`'s `"*"` network-whitelist entry (whether phones
   honor the wildcard is unverified on hardware — there is no per-host whitelist
   folding anymore).
+- **Every URL the bundle references must ALSO be whitelisted by name.** Even
+  Hub review scans the bundle and rejects a URL its whitelist doesn't list,
+  `"*"` notwithstanding — even a plain link the app never fetches (1.11.0 was
+  rejected 2026-11-20 for the panel's `https://claude.ai/code/…` session link).
+  Before a pack, list them: `grep -aohE "(https?|wss?)://[^\"'\` ]+" -r dist`.
+  The notice's GitHub URL (in a shell command) and the SVG namespace
+  `http://www.w3.org/2000/svg` were in that same bundle and weren't flagged.
 - **The simulator runs headlessly.** `@evenrealities/sim-linux-x64` is a
   GTK/WebKit binary: run under `xvfb-run` (on NixOS, put its libs on
   `NIX_LD_LIBRARY_PATH` via nix-ld) with `--automation-port 9898`, then drive it
