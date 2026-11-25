@@ -238,15 +238,6 @@ export function packToolChain(entries: string[]): string[] {
   return lines
 }
 
-/** Cost/turns suffix for a `result` line, e.g. ` · 5 turns · $0.12`, or ''. */
-function usageSuffix(e: RcEvent): string {
-  const u = e.usage
-  if (!u) return ''
-  const bits: string[] = []
-  if (u.numTurns != null) bits.push(`${u.numTurns} turns`)
-  if (u.costUsd != null) bits.push(`$${u.costUsd}`)
-  return bits.length ? ` ${HUD.SEP} ${bits.join(` ${HUD.SEP} `)}` : ''
-}
 
 /** The one-line question summary for the log (the full prompt lives on-screen). */
 function questionSummary(e: RcEvent): string {
@@ -306,18 +297,15 @@ export function renderEventParts(e: RcEvent): EventParts {
 
     case 'result': {
       const ok = !(e.usage?.isError ?? false) && e.subtype !== 'error' && !e.subtype?.startsWith('error')
-      const head = ok ? `${HUD.DONE} done` : `${HUD.DONE} ${e.subtype ?? 'error'}`
-      return { text: `${head}${usageSuffix(e)}`, tools: [] }
+      // Just the end of the turn: turns and cost are on the phone panel.
+      return { text: ok ? `${HUD.DONE} done` : `${HUD.DONE} ${e.subtype ?? 'error'}`, tools: [] }
     }
 
     case 'system': {
       // A worker re-posts init on every controller attach and every model / mode
-      // / effort change, so it reads as "settings now", not "session started"
-      // (that's all an older bridge, with no workerState, can say).
-      if (e.subtype === 'init') {
-        const line = e.workerState ? settingsLine(e.workerState) : `session started ${HUD.SEP} ${modelShort(e.model)}`
-        return { text: `${HUD.SYS} ${line}`, tools: [] }
-      }
+      // / effort change: a settings snapshot, which the session view's header
+      // already shows live, so it takes no line here.
+      if (e.subtype === 'init') return NOTHING
       const activity = systemActivity(e)
       if (activity) return { text: `${HUD.SYS} ${activity}`, tools: [] }
       if (e.subtype === 'compact_boundary') return { text: `${HUD.SYS} context compacted`, tools: [] }

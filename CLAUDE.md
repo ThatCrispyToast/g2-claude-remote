@@ -164,10 +164,12 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   page-flipping.
 - **The firmware renders text TOP-aligned and never auto-scrolls**, so an
   overflowing live tail hides exactly the newest lines. The tail
-  (`EventLog.tailRows`) is budgeted by estimated visual ROWS (`LIVE_BODY_ROWS` ×
-  `HUD_CHARS_PER_ROW`, wrapping counted) so it always fits — a byte budget alone
-  can't guarantee that. Every session opens on this tail (`● live` running /
-  `○ latest` idle); scroll-up enters history. A line that doesn't fit whole
+  (`EventLog.tailRows`) is budgeted by visual ROWS (`LIVE_BODY_ROWS`, each
+  line's wrapping measured with the font widths: `bodyRows`) so it always fits —
+  a byte budget alone can't guarantee that. A flat 40 chars per row left one or
+  two rows empty, since most lines hold about 60. Every session opens on this tail (`● live` running /
+  `○ latest` idle, `! waiting` on a prompt; the tag leads the header);
+  scroll-up enters history. A line that doesn't fit whole
   gives its END to the rows left, cut at a word and keeping its lead glyph
   (`...a broken link to the install page.`, `» ...ending here`). Until 1.10.0
   only the newest line did, so a finished turn showed `◇ done` under four empty
@@ -189,8 +191,11 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   prompt) closes it. The chain re-packs its block IN PLACE on each new tool, and
   only ever rewrites tail lines so frozen history-window indices stay valid.
 - **Workers persist a fresh `system/init` on EVERY controller attach AND every
-  model / mode / effort change — it's a settings snapshot, so render it as one
-  (`☉ opus-5-5 · max effort · bypass`, via `settingsLine`) and fold repeats.**
+  model / mode / effort change — it's a settings snapshot.** The panel renders
+  it as one (`◆ opus-5-5 · max effort · bypass`, via `settingsLine`) and folds
+  repeats; the HUD renders nothing for it, since the session view's header
+  shows the live settings (and a `result` is a bare `◇ done`, its turns and
+  cost left to the panel).
   Confirmed live (2026-08-21 and 2026-10-16, raw wire data): each claude.ai open
   of a session sends an `initialize` control_request (often twice), and the
   worker's reply mints one or two `system/init` events — same CLI `session_id`,
@@ -266,6 +271,25 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   and the empty list pin their title and gesture hint in the header / footer
   strips. As a single full-screen container (until 1.9.0) the error screen's
   divider rules wrapped and pushed `tap retry` below the fold.
+- **Most screens have an image strip on top** (`StripLayout` over a text
+  body, `StripListLayout` over a native list; `src/strip-image.ts`): the "CR"
+  mark and two boxes of two lines each, in a 13 px light canvas font, 38 px
+  tall, where a firmware-font text strip holds one line in 42. The session
+  view's body gets 8 rows instead of 6. `withStrip` (main.ts) converts the
+  list, menus and every header-and-footer screen; prompts keep their taller
+  text headers, and `promptTapOk` reads `layout()`, so they must stay `list`s.
+  - An image is at most 288 px wide, so the strip is drawn whole (text may
+    cross the seam) and cut into two halves; a half is sent only when its
+    pixels changed.
+  - Images are created empty in the rebuild and filled with
+    `updateImageRawData` as raw greys, one byte per pixel (the host converts
+    to 4-bit; black is off). PNG worked too, but its asynchronous encode
+    stalled updates for up to 4 s on the phone (measured 2026-11-23); raw
+    greys draw in 30-130 ms and send in about 0.2 s per half.
+  - A newer layout waiting in the queue stops a strip before its next image
+    send, so a transcript or status is never held up behind an image.
+  - Two failed image updates in a row switch `imageStrips` off for the run and
+    every screen falls back to its text header and footer.
 - **Exactly one `isEventCapture:1` container per page** (the scroll/tap target).
 - **Root-page exit MUST be `shutDownPageContainer(1)`** (the system exit-confirm
   dialog) — Even Hub review REJECTS a mode-0 immediate exit on the root page
@@ -414,7 +438,7 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   non-200 leaves the EventSource CLOSED — silently, before 1.9.0), and silence.
   It reopens from `lastSeq` up to `STREAM_MAX_RETRIES` times; after that the
   stream is `streamLost` and each poll the bridge answers tries once more, so
-  a long outage heals itself. Meanwhile the session footer reads `! offline`
+  a long outage heals itself. Meanwhile the session header reads `! offline`
   instead of `● live` (also as soon as a poll fails), and the list header says
   the same.
 - **`openStream()` closes any stream first, and `openSession` checks

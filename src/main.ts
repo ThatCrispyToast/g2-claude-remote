@@ -11,18 +11,19 @@
 // session list, live stream, sending, and steering all still work through the
 // panel — just without the glasses display, gestures, or mic.
 
-import { OsEventTypeList, waitForEvenAppBridge } from '@evenrealities/even_hub_sdk'
+import { ImuReportPace, OsEventTypeList, waitForEvenAppBridge } from '@evenrealities/even_hub_sdk'
 import type { EvenAppBridge, EvenHubEvent } from '@evenrealities/even_hub_sdk'
 
-import { APP_TITLE, APP_TITLE_SHORT, HISTORY_WINDOW_BYTES, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES, LIVE_BODY_ROWS, POLL_MS, SETTINGS_KEY, isSlashInput, currentBridge, isBridgeConfigured } from './config'
+import { APP_TITLE, APP_TITLE_SHORT, HISTORY_WINDOW_BYTES, LIVE_BODY_BYTES, LIVE_BODY_BYTES_STRIP, LIVE_BODY_ROWS, POLL_MS, SETTINGS_KEY, isSlashInput, currentBridge, isBridgeConfigured, BLANK_AFTER_CHOICES, displaySettings, saveDisplaySettings, type DisplaySettings, type HeadReading } from './config'
 import { markNoticeSeen, unseenNotices, type Notice } from './notices'
-import { GlassesDisplay, HUD, clampBytes, clip, fitsStripRow, hudSafe, liveTail, stripRows, type Layout, type ListLayout } from './glasses'
+import { GlassesDisplay, HUD, bodyRows, clampBytes, clip, fitsStripRow, hudSafe, liveTail, stripRows, type Layout, type ListLayout } from './glasses'
 import { HttpBridgeClient } from './rc/client'
 import { BridgeError } from './rc/types'
 import type {
   ActiveSession,
   AsideTurn,
   BackgroundTask,
+  ContextUsage,
   Decision,
   DialogAnswer,
   DialogOption,
@@ -71,6 +72,9 @@ type State =
   | 'info'
   | 'notice'
   | 'error'
+  | 'settings'
+  | 'settingPick'
+  | 'calibrate'
 
 const CLICK = OsEventTypeList.CLICK_EVENT // 0
 const SCROLL_UP = OsEventTypeList.SCROLL_TOP_EVENT // 1
@@ -200,6 +204,9 @@ class App {
   private interim = ''
   private promptReply: PromptReply | null = null
   private voicePurpose: VoicePurpose = 'send'
+  /** A reviewed message that a long press reopened for more dictation: the
+   *  new words are added after it. */
+  private voicePrefix = ''
   private voiceFrom: 'panel' | 'glasses' = 'glasses'
   private voiceStatus: VoiceStatus = 'connecting'
   // A glasses dictation that died (failVoice): the voice screen stays up,
@@ -273,6 +280,31 @@ class App {
   // The panel's toast was all there was, so a wearer who never looked at the
   // phone took a send that never left for one that had.
   private hudNote = ''
+  // ── display settings, blanking and head tilt wake ──
+  private settingKind: SettingKind = 'blank'
+  private settingItems: SubmenuItem[] = []
+  /** Calibration: 0 = waiting for the working position, 1 = for reading. */
+  private calStep = 0
+  private calRest: HeadReading | null = null
+  private calNote = ''
+  /** The latest motion-sensor reading, once reports are on. */
+  private imu: HeadReading | null = null
+  /** A notice lit on the otherwise blank screen, and when it came. */
+  private notice: { key: string; text: string; at: number } | null = null
+  /** Each session's worker status at the last poll, to tell when one finishes. */
+  private statusSeen = new Map<string, string>()
+  private imuOn = false
+  /** After a refused imuControl, no retry before this (performance.now()). */
+  private imuRetryAt = 0
+  private lastInputAt = performance.now()
+  private blanked = false
+  private headUp = false
+  private displayTimer: ReturnType<typeof setInterval> | null = null
+  /** The fade-out before blanking: 0 = none, else the step in FADE_DIM. */
+  private fadeStep = 0
+  private fadeTimer: ReturnType<typeof setTimeout> | null = null
+  /** The context use each session's strip shows (see stripSettings). */
+  private ctxShown = new Map<string, ContextUsage | null>()
   private hudNoteTimer: ReturnType<typeof setTimeout> | null = null
 
   // Release notices on the glasses (notices.ts): the unseen notices queued for
@@ -373,6 +405,8 @@ class App {
       await this.glasses.init(`${APP_TITLE}\n\nconnecting`)
       this.bridge.onEvenHubEvent((e) => this.onHubEvent(e))
       this.bridge.onLaunchSource?.(() => {})
+      this.displayTimer = setInterval(() => this.displayTick(), DISPLAY_TICK_MS)
+      this.syncImu()
       window.addEventListener('beforeunload', () => this.cleanup())
     }
 
@@ -543,6 +577,11 @@ class App {
     list.sort(
       (a, b) => Number(!!b.pinned) - Number(!!a.pinned) || a.title.localeCompare(b.title) || a.id.localeCompare(b.id),
     )
+    for (const s of list) {
+      const was = this.statusSeen.get(s.id)
+      if (was === 'running' && s.workerStatus !== 'running') this.notify(s.id, s.title, s.workerStatus === 'requires_action' ? 'needs you' : 'finished')
+      this.statusSeen.set(s.id, s.workerStatus)
+    }
     this.sessions = list
     // The firmware owns the list highlight now, so no cursor to clamp here.
     // Keep the open session's metadata fresh, and detect if it went inactive.
@@ -756,6 +795,7 @@ class App {
       if (this.recentHistory.before !== undefined) this.recentHistory.before = this.recentHistory.events[0]?.sequenceNum
     }
     this.noteEvent(ev)
+    if (ev.type === 'result' && !ev.parentToolUseId && this.session) this.notify(this.session.id, this.session.title, 'finished')
     this.panel.appendEvent(ev)
     // Prompt-resolution signals: an answer echoed back through the log (ours or
     // another controller's) retires that prompt, and so does the worker
@@ -1167,6 +1207,7 @@ class App {
   private presentPrompt(): void {
     const ev = this.permEvent
     if (!ev) return
+    if (this.session) this.notify(this.session.id, this.session.title, 'needs you')
     this.promptDeferred = false
     this.promptSnoozed = false // reopening it clears the "answer later" hold
     this.listSelectIndex = 0
@@ -1515,7 +1556,7 @@ class App {
     }
   }
 
-  private async startVoice(purpose: VoicePurpose, from: 'panel' | 'glasses'): Promise<void> {
+  private async startVoice(purpose: VoicePurpose, from: 'panel' | 'glasses', prefix = ''): Promise<void> {
     if (!this.voice?.available) {
       this.panel.setToast(currentSttSource() === 'bridge' ? 'Local dictation is not running on the bridge.' : 'Voice dictation needs a Deepgram key.')
       return
@@ -1523,6 +1564,7 @@ class App {
     if (purpose === 'send' || purpose === 'aside') this.promptReply = null
     this.voicePurpose = purpose
     this.voiceFrom = from
+    this.voicePrefix = prefix
     this.voiceStatus = 'connecting'
     // Words a stopped dictation still held (only the panel can start one over
     // the stopped screen): keep them, in the send box.
@@ -1563,6 +1605,7 @@ class App {
     const run = this.voiceRun
     if (this.finishingRun === run) return null
     this.finishingRun = run
+    if (this.state === 'voice') this.render() // "Finishing..." at once
     try {
       const text = await this.voice.stop()
       if (run !== this.voiceRun) return null
@@ -1590,9 +1633,10 @@ class App {
       else if (this.state === 'voice') this.go('session')
       return
     }
-    if (text) await this.send(text)
+    const full = this.withPrefix(text)
+    if (full) await this.send(full)
     if (this.state === 'voice') {
-      if (text) this.goLiveSession() // sent → watch it run
+      if (full) this.goLiveSession() // sent → watch it run
       else this.go('session')
     }
   }
@@ -1605,9 +1649,11 @@ class App {
     if (text === null) return // a finish already under way owns the result
     if (this.state !== 'voice') return // involuntarily left the voice screen meanwhile
     if (this.voicePurpose === 'other' || this.voicePurpose === 'deny') this.reviewPromptText(text)
-    else if (!text) this.go('session')
-    else if (this.voicePurpose === 'aside') void this.askAside(text, 'glasses') // read-only: no confirm
-    else this.confirmSend(text, 'session')
+    else if (this.voicePurpose === 'aside') {
+      if (text) void this.askAside(text, 'glasses') // read-only: no confirm
+      else this.go('session')
+    } else if (this.withPrefix(text)) this.confirmSend(this.withPrefix(text), 'session')
+    else this.go('session')
   }
 
   /** The dictation died (the captioner gave up, or the mic wouldn't open):
@@ -1629,7 +1675,7 @@ class App {
       this.leaveVoiceQuietly()
       return
     }
-    this.voiceStop = { reason: detail || 'Voice error.', text: this.voicePurpose === 'send' ? text : '' }
+    this.voiceStop = { reason: detail || 'Voice error.', text: this.voicePurpose === 'send' ? this.withPrefix(text) : '' }
     this.render()
   }
 
@@ -1654,8 +1700,11 @@ class App {
     if (this.state !== 'voice') return
     if (backgrounded) {
       if (this.promptReply) this.promptDeferred = true
+      if (this.voicePrefix) this.panel.appendDraft(this.voicePrefix) // the reviewed words aren't lost
       this.leaveVoiceQuietly()
     } else if (this.promptReply) this.closePromptDetail()
+    // Cancelling more dictation returns to the message as it was.
+    else if (this.voicePrefix) this.confirmSend(this.voicePrefix, 'session')
     else this.go('session')
   }
 
@@ -1717,7 +1766,10 @@ class App {
     // g2-live-captions handler, which is proven on real hardware.)
     const envelope = e.listEvent ?? e.textEvent ?? e.sysEvent
     if (!envelope) return
-    if (e.sysEvent?.imuData) return // an IMU frame, not a gesture (IMU is never enabled)
+    if (e.sysEvent?.imuData) {
+      this.onImu(e.sysEvent.imuData)
+      return
+    }
     // On native-list pages the firmware moves the highlight itself and reports
     // the selected row here (on both scroll and tap) — track it for onTap. When
     // the index is absent (protobuf drops index 0; some firmware omits it more
@@ -1735,6 +1787,13 @@ class App {
     // CLICK_EVENT is 0 and protobuf omits zero-value fields, so a tap arrives with
     // eventType === undefined → coalesce to CLICK.
     const code = envelope.eventType ?? CLICK
+    if (GESTURES.has(code)) {
+      // A gesture is input: it resets the idle clock. On a blank screen it
+      // only wakes it, so a blind tap can't act on a row nobody can see.
+      const wasBlank = this.blanked || this.fadeStep > 0
+      this.wake()
+      if (wasBlank) return
+    }
     switch (code) {
       case DOUBLE_CLICK:
         this.onDoubleTap()
@@ -1757,10 +1816,18 @@ class App {
         // open session is being read again.
         this.foreground = true
         this.markRead()
+        this.wake() // a screen that blanked before leaving lights on return
         this.render()
         return
       case CLICK:
         this.onTap()
+        return
+      case OsEventTypeList.LONG_PRESS_EVENT:
+        // A long press on a session starts dictating, as Compose → Dictate
+        // does; a tap finishes it as usual. Elsewhere it does nothing.
+        if (this.state === 'session' && this.voice?.available) void this.startVoice('send', 'glasses')
+        // On the review of a dictated message: dictate more onto it.
+        else if (this.state === 'confirm' && this.canDictateMore()) void this.startVoice('send', 'glasses', this.pendingSend?.text)
         return
       case SCROLL_UP:
         this.onScroll(-1)
@@ -1777,6 +1844,10 @@ class App {
   private onTap(): void {
     switch (this.state) {
       case 'list': {
+        if (this.listSelectIndex === this.sessions.length) {
+          this.openSettings()
+          break
+        }
         const s = this.sessions[this.listSelectIndex]
         if (s) void this.openSession(s.id)
         break
@@ -1788,6 +1859,15 @@ class App {
         break
       case 'compose':
         this.fireCompose()
+        break
+      case 'settings':
+        this.fireSettings()
+        break
+      case 'settingPick':
+        this.fireSettingPick()
+        break
+      case 'calibrate':
+        this.recordCalibration()
         break
       case 'submenu':
         this.fireSubmenu()
@@ -1852,6 +1932,14 @@ class App {
         break
       case 'compose':
         this.go('session')
+        break
+      case 'settings':
+        this.listSelectIndex = 0
+        this.go('list')
+        break
+      case 'settingPick':
+      case 'calibrate':
+        this.openSettings()
         break
       case 'submenu':
         this.go('compose')
@@ -2118,6 +2206,239 @@ class App {
     this.go('session')
   }
 
+  // ── settings: the glasses display ──────────────────────────────────────
+  private settingsRows(): string[] {
+    const d = displaySettings()
+    return [
+      `Blank after ${HUD.SEP} ${blankLabel(d.blankAfterS, d.lookWake && d.lookCal !== null)}`,
+      `Wake on head tilt ${HUD.SEP} ${d.lookWake && d.lookCal ? tiltLabel(pitchDeg(d.lookCal.read) - pitchDeg(d.lookCal.rest)) : 'off'}`,
+      `Session notifications ${HUD.SEP} ${d.notifyDone ? 'on' : 'off'}`,
+      `${HUD.BACK} Back`,
+    ]
+  }
+
+  private openSettings(): void {
+    this.listSelectIndex = 0
+    this.go('settings')
+    this.syncImu()
+  }
+
+  private fireSettings(): void {
+    switch (this.listSelectIndex) {
+      case 0:
+        return this.openSettingPick('blank')
+      case 1:
+        return this.openSettingPick('lookWake')
+      case 2:
+        return this.openSettingPick('notify')
+      default:
+        this.listSelectIndex = 0
+        this.go('list')
+    }
+  }
+
+  private openSettingPick(kind: SettingKind): void {
+    const d = displaySettings()
+    const pick = (label: string, value: string, current: boolean): SubmenuItem => ({
+      label: `${current ? `${HUD.CUR} ` : '  '}${label}`,
+      value,
+      current,
+    })
+    const look = d.lookWake && d.lookCal !== null
+    this.settingKind = kind
+    this.settingItems =
+      kind === 'blank'
+        ? BLANK_AFTER_CHOICES.map((v) => pick(blankLabel(v, look), String(v), v === d.blankAfterS))
+        : kind === 'lookWake'
+          ? [pick(look ? 'Set up again' : 'On (set up)', 'on', look), pick('Off', 'off', !look)]
+          : [pick('On', 'on', d.notifyDone), pick('Off', 'off', !d.notifyDone)]
+    this.settingItems.push({ label: `${HUD.BACK} Back`, value: '', current: false })
+    this.listSelectIndex = 0
+    this.go('settingPick')
+  }
+
+  private fireSettingPick(): void {
+    const item = this.settingItems[this.listSelectIndex]
+    if (item && item.value !== '') {
+      // Head tilt wake is turned on by setting it up, which saves it on.
+      if (this.settingKind === 'lookWake' && item.value === 'on') return this.startCalibration()
+      const patch: Partial<DisplaySettings> =
+        this.settingKind === 'blank'
+          ? { blankAfterS: Number(item.value) }
+          : this.settingKind === 'lookWake'
+            ? { lookWake: false }
+            : { notifyDone: item.value === 'on' }
+      saveDisplaySettings(patch)
+      void this.persistSettings()
+    }
+    this.openSettings()
+  }
+
+  // ── head tilt wake setup: the normal position, then the waking one ─────
+  private startCalibration(): void {
+    this.calStep = 0
+    this.calRest = null
+    this.calNote = ''
+    this.go('calibrate')
+    this.syncImu()
+  }
+
+  private calibrateLayout(): Layout {
+    const step =
+      this.calStep === 0
+        ? 'Hold your head in its normal position, then tap.'
+        : 'Tilt your head to where the screen should turn on, then tap.'
+    const v = this.imu
+    const now = !v
+      ? 'Waiting for the motion sensor...'
+      : this.calRest
+        ? `Now: ${tiltLabel(pitchDeg(v))} ${HUD.SEP} ${tiltLabel(pitchDeg(v) - pitchDeg(this.calRest))} from normal`
+        : `Now: ${tiltLabel(pitchDeg(v))}`
+    return {
+      kind: 'scroll',
+      header: `Set up head tilt wake ${HUD.SEP} ${this.calStep + 1} of 2`,
+      body: [step, now, this.calNote].filter(Boolean).join('\n\n'),
+      footer: `tap = record ${HUD.SEP} dbl = cancel`,
+    }
+  }
+
+  private recordCalibration(): void {
+    const v = this.imu
+    if (!v) {
+      this.calNote = 'No motion readings yet. Wait a moment and tap again.'
+      return this.render()
+    }
+    if (this.calStep === 0) {
+      this.calRest = v
+      this.calStep = 1
+      this.calNote = ''
+      return this.render()
+    }
+    const rest = this.calRest!
+    if (angleDeg(rest, v) < MIN_CAL_DEG) {
+      this.calNote = 'That is too close to the normal position. Tilt further and tap again.'
+      return this.render()
+    }
+    saveDisplaySettings({ lookCal: { rest, read: v }, lookWake: true })
+    void this.persistSettings()
+    this.headUp = true // the head is in the waking position right now
+    this.openSettings()
+  }
+
+  // ── blanking, head tilt wake and the done mark ─────────────────────────
+  /** Motion reports run while head tilt wake can use them, or setup needs
+   *  them. */
+  private syncImu(): void {
+    const d = displaySettings()
+    const want = (d.lookWake && d.lookCal !== null) || this.state === 'calibrate'
+    if (!this.bridge || want === this.imuOn || performance.now() < this.imuRetryAt) return
+    this.imuOn = want
+    if (!want) this.headUp = false
+    void this.bridge.imuControl(want, IMU_PACE).catch((err) => {
+      console.error('[display] imuControl failed:', err)
+      this.imuOn = !want
+      this.imuRetryAt = performance.now() + IMU_RETRY_MS
+    })
+  }
+
+  private calRenderAt = 0
+  private onImu(data: { x?: number; y?: number; z?: number }): void {
+    const v: HeadReading = [data.x ?? 0, data.y ?? 0, data.z ?? 0]
+    const first = this.imu === null
+    this.imu = v
+    if (this.state === 'calibrate') {
+      // The live angle on the setup screen, a few times a second.
+      if (first || performance.now() - this.calRenderAt >= CAL_RENDER_MS) {
+        this.calRenderAt = performance.now()
+        this.render()
+      }
+      return
+    }
+    const d = displaySettings()
+    if (!d.lookWake || !d.lookCal) return
+    const at = lookPosition(v, d.lookCal)
+    // Two thresholds, so a head held between them doesn't flicker.
+    const up = this.headUp ? at > LOOK_DOWN_AT : at >= LOOK_UP_AT
+    if (up === this.headUp) return
+    this.headUp = up
+    if (up) this.wake()
+    else this.lastInputAt = performance.now() // the idle clock starts on looking away
+  }
+
+  /** Input, or the wearer looking: restart the idle clock, and light a
+   *  blank screen. */
+  private wake(): void {
+    this.lastInputAt = performance.now()
+    if (this.fadeStep > 0) {
+      this.stopFade()
+      this.render()
+    }
+    if (!this.blanked) return
+    this.blanked = false
+    this.notice = null
+    this.render()
+  }
+
+  /** A session finished its turn or waits on a prompt. On a blank screen,
+   *  with Session notifications on: a small "! name" in the corner, which hides
+   *  again after the idle delay (30 s at most); a tap or tilt shows the
+   *  screen as it was. On a lit screen it counts as activity only for the
+   *  open session, so another session finishing doesn't relight a fade. */
+  private notify(sid: string, title: string, what: 'finished' | 'needs you'): void {
+    if (!this.blanked) {
+      if (sid === this.sid) this.wake() // stops a fade under way too
+      return
+    }
+    const key = `${sid}:${what}`
+    if (!displaySettings().notifyDone || this.notice?.key === key) return
+    // Just "!" and the session's name: which one wants a look.
+    this.notice = { key, text: `${HUD.ATTN} ${title}`, at: performance.now() }
+    this.render()
+  }
+
+  /** Blank the screen once it has been idle long enough, unless the head is
+   *  up or the screen is one the wearer is busy on. Without an idle delay,
+   *  head tilt wake blanks shortly after the head goes back. Only ever
+   *  blanks: waking is wake()'s, on input or looking up. */
+  private displayTick(): void {
+    const d = displaySettings()
+    this.syncImu()
+    const lookWake = d.lookWake && d.lookCal !== null
+    const idleMs = d.blankAfterS > 0 ? d.blankAfterS * 1000 : lookWake ? LOOK_GRACE_MS : Infinity
+    if (this.blanked) {
+      // A notice hides after the same delay the screen blanks after.
+      if (this.notice && performance.now() - this.notice.at >= Math.min(idleMs, NOTICE_MAX_MS)) {
+        this.notice = null
+        this.render()
+      }
+      return
+    }
+    // Nothing blanks until blanking or head tilt wake is turned on. The wear
+    // sensor isn't used: the SDK reports isWearing false whenever a status
+    // update leaves the field out, so a false can't be trusted.
+    if (idleMs === Infinity) return
+    const idle = performance.now() - this.lastInputAt >= idleMs
+    if (KEEP_LIT.has(this.state) || (lookWake && this.headUp) || !idle) return
+    if (this.fadeStep === 0) this.fadeOut()
+  }
+
+  /** Dim the screen a step at a time, then blank it. Waking at any point
+   *  stops it at once. */
+  private fadeOut(): void {
+    this.fadeStep += 1
+    if (this.fadeStep >= FADE_DIM.length) {
+      this.stopFade()
+      this.blanked = true
+    } else this.fadeTimer = setTimeout(() => this.fadeOut(), FADE_STEP_MS)
+    this.render()
+  }
+
+  private stopFade(): void {
+    if (this.fadeTimer) clearTimeout(this.fadeTimer)
+    this.fadeTimer = null
+    this.fadeStep = 0
+  }
+
   // ── state transition + rendering ───────────────────────────────────────
   private go(state: State): void {
     if (this.state === 'confirm' && state !== 'confirm') this.pendingSend = null
@@ -2160,21 +2481,79 @@ class App {
     this.panel.setGlassesDraft(this.state === 'confirm' && this.pendingSend !== null)
     this.panel.setConnection({ bridge: this.connBridge, origin: this.origin, state: this.state })
     if (!this.glasses) return // panel-only mode
-    this.glasses.render(this.layout())
+    const blank: Layout = this.notice ? { kind: 'notice', text: this.notice.text } : { kind: 'text', content: '' }
+    if (this.blanked) this.glasses.render(blank)
+    else this.glasses.render(this.withStrip(this.layout()), FADE_DIM[this.fadeStep])
+  }
+
+  /** The dictation screen's footer: the stream's state and what a tap does
+   *  now. */
+  private voiceFooter(): string {
+    if (this.finishingRun !== null) return `${HUD.IDLE} Finishing${HUD.ELL}`
+    if (this.voiceStatus === 'listening') return `${HUD.RUN} Listening ${HUD.SEP} tap = done ${HUD.SEP} dbl = cancel`
+    // Whatever the stream reports: connecting, reconnecting, or a bridge still
+    // downloading its dictation model.
+    const word = this.voiceStatus.charAt(0).toUpperCase() + this.voiceStatus.slice(1)
+    return `${HUD.IDLE} ${word}${HUD.ELL} ${HUD.SEP} tap = done ${HUD.SEP} dbl = cancel`
+  }
+
+  /** The screen with the image strip on top, where the glasses take images:
+   *  the session list and menus get their own strip lines, and any other
+   *  header-and-footer screen takes its header as the title and its footer's
+   *  gestures as the right-hand box. Prompts keep their taller text headers
+   *  (and promptTapOk reads layout(), so they must stay `list`s). */
+  private withStrip(l: Layout): Layout {
+    if (!this.glasses?.imageStrips) return l
+    const hints = (parts: string[]): [string, string] => [parts[0] ?? '', parts.slice(1).join(` ${HUD.SEP} `)]
+    const title = this.session?.title ?? ''
+    if (l.kind === 'list') {
+      const strip = (status: [string, string], gestures: string[]): Layout => ({
+        kind: 'stripList',
+        status,
+        settings: hints(gestures),
+        fitSettings: true,
+        items: l.items,
+        key: l.key,
+      })
+      if (this.state === 'list') {
+        const count = this.sessions.length ? `${this.sessions.length} active` : 'none active'
+        return strip(['Sessions', this.connBridge === 'down' ? `${HUD.ATTN} offline` : count], ['tap open', 'dbl exit'])
+      }
+      if (this.state === 'settings') return strip(['Settings', 'Glasses display'], ['tap change', 'dbl back'])
+      if (this.state === 'settingPick') return strip(['Settings', SETTING_TITLE[this.settingKind]], ['tap pick', 'dbl back'])
+      if (this.state === 'compose') return strip([title, 'Compose'], ['tap pick', 'dbl back'])
+      if (this.state === 'submenu') return strip([title, SUBMENU_TITLE[this.submenuKind]], ['tap pick', 'dbl back'])
+      return l
+    }
+    if (l.kind === 'scroll' && this.state === 'voice' && !this.voiceStop) {
+      // Dictation: the strip holds still (no image sends while talking), and
+      // the state the next tap depends on is a text footer, which updates in
+      // tens of milliseconds.
+      return {
+        kind: 'strip',
+        status: [this.voicePurpose === 'aside' ? 'Ask aside' : 'Dictation', title],
+        settings: ['', ''],
+        fitSettings: true,
+        body: l.body,
+        footer: this.voiceFooter(),
+      }
+    }
+    if (l.kind === 'scroll' && (this.state === 'confirm' || this.state === 'voice')) {
+      // The rest of the dictation flow (review before sending, a stopped
+      // dictation) keeps its actions in the same footer box.
+      return { kind: 'strip', status: [l.header, title], settings: ['', ''], fitSettings: true, body: l.body, footer: l.footer }
+    }
+    if (l.kind === 'scroll') {
+      const gestures = l.footer.split(` ${HUD.SEP} `).map((p) => p.replace('dbl-tap', 'dbl').replace(/\s*=\s*/, ' '))
+      return { kind: 'strip', status: [l.header, title], settings: hints(gestures), fitSettings: true, body: l.body }
+    }
+    return l
   }
 
   /** The current screen as a native layout the GlassesDisplay draws + diffs. */
   private layout(): Layout {
     switch (this.state) {
       case 'list':
-        if (this.sessions.length === 0) {
-          return {
-            kind: 'scroll',
-            header: `${APP_TITLE} ${HUD.SEP} sessions`,
-            body: this.connBridge === 'down' ? 'The bridge stopped answering.' : 'No active sessions.',
-            footer: 'dbl-tap = exit',
-          }
-        }
         return {
           kind: 'list',
           // The header is its own container, so going offline (the bridge
@@ -2192,6 +2571,12 @@ class App {
         }
       case 'session':
         return this.sessionLayout()
+      case 'settings':
+        return { kind: 'list', header: `Settings ${HUD.SEP} tap change ${HUD.SEP} dbl back`, items: this.settingsRows() }
+      case 'settingPick':
+        return { kind: 'list', header: `${SETTING_TITLE[this.settingKind]} ${HUD.SEP} tap pick ${HUD.SEP} dbl back`, items: this.settingItems.map((i) => i.label), key: `setting:${this.settingKind}` }
+      case 'calibrate':
+        return this.calibrateLayout()
       case 'permission':
         return this.permissionLayout()
       case 'question':
@@ -2237,7 +2622,7 @@ ${HUD.ELL} (reply continues)`
             this.voicePurpose === 'aside'
               ? `${up ? HUD.RUN : HUD.IDLE} Ask aside ${HUD.SEP} ${word}`
               : `${up ? HUD.RUN : HUD.IDLE} ${word[0].toUpperCase()}${word.slice(1)}`,
-          body: this.interim ? liveTail(this.interim) : '(speak now)',
+          body: this.withPrefix(this.interim) ? liveTail(this.withPrefix(this.interim)) : '(speak now)',
           footer: `tap = done ${HUD.SEP} dbl = cancel`,
         }
       }
@@ -2275,24 +2660,51 @@ ${HUD.ELL} (reply continues)`
   }
 
   private listRows(): string[] {
-    // `*` marks a pin (claude.ai's own word for one is "starred").
-    return this.sessions.map(
-      (s) => `${dot(s.workerStatus)} ${s.pinned ? '* ' : ''}${clip(s.title, 32, HUD.ELL)} ${HUD.SEP} ${short(s.workerStatus)}`,
-    )
+    // `*` marks a pin (claude.ai's own word for one is "starred"). Settings is
+    // the last row, so the list always has it, sessions or none.
+    return [
+      ...this.sessions.map(
+        (s) => `${dot(s.workerStatus)} ${s.pinned ? '* ' : ''}${clip(s.title, 32, HUD.ELL)} ${HUD.SEP} ${short(s.workerStatus)}`,
+      ),
+      SETTINGS_ROW,
+    ]
   }
 
-  /** The session header: dot, title, then the live settings — model, effort,
-   *  a non-default mode, and context use once it passes CTX_WARN_PCT. The title
-   *  gets whatever room the tail leaves on the one-line strip. */
-  private sessionHeader(): string {
+  /** The session's live settings: model, effort, a non-default mode, and
+   *  context use once it passes CTX_WARN_PCT. */
+  private sessionSettings(): string {
     const s = this.session
     const mode = this.currentMode()
     const ctx = s?.context && s.context.percent >= CTX_WARN_PCT ? `ctx ${s.context.percent}%` : ''
-    const tail = [modelShort(this.worker?.model ?? s?.model), this.currentEffort() ?? '', mode === 'default' ? '' : modeShort(mode), ctx]
+    return [modelShort(this.worker?.model ?? s?.model), this.currentEffort() ?? '', mode === 'default' ? '' : modeShort(mode), ctx]
       .filter(Boolean)
       .join(` ${HUD.SEP} `)
-    const room = Math.max(10, HEADER_CHARS - tail.length - 5)
-    return `${dot(s?.workerStatus)} ${clip(s?.title ?? 'session', room, HUD.ELL)} ${HUD.SEP} ${tail}`
+  }
+
+  /** The strip's settings box: model, effort and a non-default mode, then
+   *  context use. The context shown is refreshed when a turn ends (or the
+   *  session is first shown), not while one runs, so the image isn't re-sent
+   *  for every turn's token count. */
+  private stripSettings(): [string, string] {
+    const s = this.session
+    const mode = this.currentMode()
+    const line = [modelShort(this.worker?.model ?? s?.model), this.currentEffort() ?? '', mode === 'default' ? '' : modeShort(mode)]
+      .filter(Boolean)
+      .join(` ${HUD.SEP} `)
+    if (s && (!this.isRunning(s) || !this.ctxShown.has(s.id))) this.ctxShown.set(s.id, s.context)
+    const c = s ? this.ctxShown.get(s.id) : null
+    return [line, c ? `ctx ${c.percent}% ${HUD.SEP} ${tokens(c.usedTokens)}/${tokens(c.maxTokens)}` : '']
+  }
+
+  /** The session header strip: a status (`tag`, else the worker's dot), title,
+   *  then the settings. The title gets whatever room the rest leaves on the
+   *  one-line strip. */
+  private sessionHeader(tag?: string): string {
+    const s = this.session
+    const lead = tag ?? dot(s?.workerStatus)
+    const tail = this.sessionSettings()
+    const room = Math.max(10, HEADER_CHARS - tail.length - lead.length - 4)
+    return `${lead} ${clip(s?.title ?? 'session', room, HUD.ELL)} ${HUD.SEP} ${tail}`
   }
 
   /** The footer's lead-in while a deferred prompt waits: a gentle nag from the
@@ -2301,26 +2713,43 @@ ${HUD.ELL} (reply continues)`
     return this.promptDeferred ? `${HUD.ATTN} needs you ${HUD.SEP} ` : ''
   }
 
-  /** Session view: fixed header + firmware-scrolled body + fixed footer. */
+  /** Session view: a two-line image strip over the firmware-scrolled body, or,
+   *  where the glasses can't take images, a header and footer text strip. */
   private sessionLayout(): Layout {
     const s = this.session
-    const header = this.sessionHeader()
     const attn = this.attnPrefix()
+    const tag = this.sessionTag()
+    if (this.glasses?.imageStrips) {
+      const title = s?.title ?? 'session'
+      const dictate = this.voice?.available ? `long dictate ${HUD.SEP} ` : ''
+      const settings = this.stripSettings()
+      if (this.histMode === 'history') {
+        return {
+          kind: 'strip',
+          status: [`history ${HUD.SEP} ${title}`, this.loadingPage ? `loading earlier events${HUD.ELL}` : `${attn}down live ${HUD.SEP} dbl list`],
+          settings,
+          body: this.histBody || '(no events)',
+        }
+      }
+      return {
+        kind: 'strip',
+        status: [
+          `${tag} ${HUD.SEP} ${title}`,
+          this.hudNote ? `${HUD.ATTN} ${this.hudNote}` : `${attn}up history ${HUD.SEP} tap menu ${HUD.SEP} ${dictate}dbl list`,
+        ],
+        settings,
+        body: this.liveBody(),
+      }
+    }
     if (this.histMode === 'history') {
       return {
         kind: 'scroll',
-        header,
+        header: this.sessionHeader(),
         body: this.histBody || '(no events)',
         footer: this.loadingPage ? `loading earlier events${HUD.ELL}` : `${attn}history ${HUD.SEP} down = live ${HUD.SEP} dbl = list`,
       }
     }
-    // The tail view is "live" while the session is running (auto-following) and
-    // just "latest" when idle — same view, honest label. With the stream down,
-    // or the bridge not answering the poll (which shows sooner: the browser
-    // spends a while redialling a stream before it reports one lost), it is
-    // neither: what's on screen is as of when it dropped.
-    const offline = this.streamDown || this.connBridge === 'down'
-    const tailTag = offline ? `${HUD.ATTN} offline` : this.isRunning(s) ? `${HUD.RUN} live` : `${HUD.IDLE} latest`
+    const header = this.sessionHeader(tag)
     // A failed action takes the whole footer for a moment: the strip is one
     // line, and a waiting prompt's "needs you" is back when the note goes.
     if (this.hudNote) return { kind: 'scroll', header, body: this.liveBody(), footer: `${HUD.ATTN} ${this.hudNote}` }
@@ -2331,12 +2760,30 @@ ${HUD.ELL} (reply continues)`
       // overflow — the firmware draws text top-aligned and never auto-scrolls,
       // so an overflowing tail would hide exactly the newest lines.
       body: this.liveBody(),
-      footer: `${attn}${tailTag} ${HUD.SEP} up = history ${HUD.SEP} tap = menu`,
+      // A waiting prompt's "! needs you" leaves no room for the dictate hint.
+      footer: `${attn}up = history ${HUD.SEP} tap = menu${!attn && this.voice?.available ? ` ${HUD.SEP} long = dictate` : ''}`,
     }
   }
 
+  /** The live view's status: "live" while the session is running
+   *  (auto-following), "latest" when idle, "waiting" on a prompt. With the
+   *  stream down, or the bridge not answering the poll (which shows sooner: the
+   *  browser spends a while redialling a stream before it reports one lost), it
+   *  is none of those: what's on screen is as of when it dropped. */
+  private sessionTag(): string {
+    const s = this.session
+    if (this.streamDown || this.connBridge === 'down') return `${HUD.ATTN} offline`
+    if (this.isRunning(s)) return `${HUD.RUN} live`
+    if (s?.workerStatus === 'requires_action') return `${HUD.ATTN} waiting`
+    return `${HUD.IDLE} latest`
+  }
+
   private liveBody(): string {
-    return this.log.lineCount ? this.log.tailRows(LIVE_BODY_ROWS, HUD_CHARS_PER_ROW, LIVE_BODY_BYTES) : '(no events yet)'
+    if (!this.log.lineCount) return '(no events yet)'
+    // The image strip leaves the body 48 px taller: two more rows.
+    return this.glasses?.imageStrips
+      ? this.log.tailRows(LIVE_BODY_ROWS + 2, bodyRows, LIVE_BODY_BYTES_STRIP)
+      : this.log.tailRows(LIVE_BODY_ROWS, bodyRows, LIVE_BODY_BYTES)
   }
 
   /** Permission prompt as a native list — so, like every other screen, it has
@@ -2457,8 +2904,19 @@ ${HUD.ELL} (reply continues)`
       kind: 'scroll',
       header: `${HUD.SEND} Send this message?`,
       body: this.pendingSend?.text || '(empty)',
-      footer: `tap = send ${HUD.SEP} dbl = cancel`,
+      footer: `${HUD.SEND} tap = send ${HUD.SEP} ${this.canDictateMore() ? `long = dictate ${HUD.SEP} ` : ''}dbl = cancel`,
     }
+  }
+
+  /** A dictated message under review (not a canned one) can take more
+   *  dictation. */
+  private canDictateMore(): boolean {
+    return this.pendingSend?.back === 'session' && !!this.voice?.available
+  }
+
+  /** `text` after the words a long press reopened, if any. */
+  private withPrefix(text: string): string {
+    return [this.voicePrefix, text].filter(Boolean).join(' ')
   }
 
   /** The one-time release-notice interstitial: title + body (+ command) on a
@@ -2493,7 +2951,76 @@ ${HUD.ELL} (reply continues)`
     void this.voice?.cancel()
     if (this.hudNoteTimer) clearTimeout(this.hudNoteTimer)
     this.hudNoteTimer = null
+    if (this.displayTimer) clearInterval(this.displayTimer)
+    this.displayTimer = null
+    this.stopFade()
+    if (this.imuOn) void this.bridge?.imuControl(false).catch(() => {})
   }
+}
+
+// ── display settings ───────────────────────────────────────────────────────
+type SettingKind = 'blank' | 'lookWake' | 'notify'
+const SETTING_TITLE: Record<SettingKind, string> = { blank: 'Blank after', lookWake: 'Wake on head tilt', notify: 'Session notifications' }
+const SETTINGS_ROW = `${HUD.SYS} Settings`
+/** Gestures: input that resets the idle clock and wakes a blank screen. */
+const GESTURES = new Set<number>([CLICK, DOUBLE_CLICK, SCROLL_UP, SCROLL_DOWN, OsEventTypeList.LONG_PRESS_EVENT])
+/** Screens the wearer is busy on, which never blank by idling. */
+const KEEP_LIT = new Set<State>(['voice', 'confirm', 'permission', 'question', 'reply', 'replyDetail', 'calibrate'])
+const DISPLAY_TICK_MS = 1000
+/** The fade-out's brightness at each step (index 0 = not fading), and the
+ *  time between steps. */
+const FADE_DIM = [1, 0.66, 0.4, 0.2]
+const FADE_STEP_MS = 1000
+/** A notice never stays lit longer than this, whatever the idle delay. */
+const NOTICE_MAX_MS = 30_000
+/** With head tilt wake and no idle delay: how long after tilting back. */
+const LOOK_GRACE_MS = 5000
+/** Where the head is between the normal (0) and waking (1) positions when
+ *  the screen wakes, and when it counts as back again. */
+const LOOK_UP_AT = 0.6
+const LOOK_DOWN_AT = 0.35
+/** The waking position must be at least this far from the normal one. */
+const MIN_CAL_DEG = 8
+const IMU_PACE = ImuReportPace.P200
+const IMU_RETRY_MS = 30_000
+const CAL_RENDER_MS = 300
+
+/** How far the head is tilted up (positive) or down, in degrees, from a
+ *  reading. On the G2 the sensor's first axis follows the nod: about -0.6 g
+ *  looking 38 degrees down, near 0 looking straight ahead (measured
+ *  2026-11-23). Only for display: waking uses lookPosition, which needs no
+ *  axis. */
+function pitchDeg(v: number[]): number {
+  const n = Math.hypot(v[0], v[1], v[2])
+  return n ? (Math.asin(Math.max(-1, Math.min(1, v[0] / n))) * 180) / Math.PI : 0
+}
+
+function tiltLabel(deg: number): string {
+  const r = Math.round(deg)
+  return r === 0 ? 'level' : `${Math.abs(r)}° ${r > 0 ? 'up' : 'down'}`
+}
+
+/** With head tilt wake on, "off" still blanks shortly after looking away. */
+function blankLabel(s: number, lookWake: boolean): string {
+  return s === 0 ? (lookWake ? 'when looking away' : 'off') : s < 60 ? `${s} s` : `${s / 60} min`
+}
+
+/** The angle between two sensor readings, in degrees. */
+function angleDeg(a: number[], b: number[]): number {
+  const dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+  const n = Math.hypot(a[0], a[1], a[2]) * Math.hypot(b[0], b[1], b[2])
+  return n ? (Math.acos(Math.max(-1, Math.min(1, dot / n))) * 180) / Math.PI : 0
+}
+
+/** Where `v` sits between the calibrated normal position (0) and waking
+ *  position (1), measured along the line between them; past the waking
+ *  position is above 1, further from it than normal is below 0. The readings
+ *  are directions of gravity, so no axis needs to be known. */
+function lookPosition(v: number[], cal: { rest: number[]; read: number[] }): number {
+  const d = [0, 1, 2].map((i) => cal.read[i] - cal.rest[i])
+  const len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+  if (!len2) return 0
+  return ((v[0] - cal.rest[0]) * d[0] + (v[1] - cal.rest[1]) * d[1] + (v[2] - cal.rest[2]) * d[2]) / len2
 }
 
 // ── small pure helpers ─────────────────────────────────────────────────────

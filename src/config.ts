@@ -30,6 +30,42 @@ export interface RuntimeSettings {
   /** Ids of baked release notices already dismissed on this device (notices.ts).
    *  Rides the same blob so the main.ts SDK-store mirror persists it for free. */
   seenNotices?: string[]
+  /** The glasses' display settings, chosen in Settings on the glasses. */
+  display?: Partial<DisplaySettings>
+}
+
+/** A head position: the motion sensor's gravity reading, in g. */
+export type HeadReading = [number, number, number]
+
+/** When the glasses screen blanks and what wakes it. */
+export interface DisplaySettings {
+  /** Seconds without input before the screen blanks; 0 = never. */
+  blankAfterS: number
+  /** Blank while the head is in its normal position, and wake on tilting it
+   *  to the waking one (up or down). Needs `lookCal`. */
+  lookWake: boolean
+  /** The head's normal position and the position that wakes the screen,
+   *  recorded in Settings. */
+  lookCal: { rest: HeadReading; read: HeadReading } | null
+  /** While the screen is blank, show "!" when a turn finishes or a prompt
+   *  waits. */
+  notifyDone: boolean
+}
+export const BLANK_AFTER_CHOICES = [0, 15, 30, 60, 120, 300]
+const DISPLAY_DEFAULTS: DisplaySettings = { blankAfterS: 0, lookWake: false, lookCal: null, notifyDone: true }
+
+/** The display settings saved on this device, over the defaults. A
+ *  calibration in an older shape is dropped. */
+export function displaySettings(): DisplaySettings {
+  const d = { ...DISPLAY_DEFAULTS, ...(loadRuntimeSettings().display ?? {}) }
+  if (d.lookCal && !(Array.isArray(d.lookCal.rest) && Array.isArray(d.lookCal.read))) d.lookCal = null
+  return d
+}
+
+/** Save display settings over the stored ones. The caller then mirrors the
+ *  blob to the SDK store (main.ts persistSettings). */
+export function saveDisplaySettings(patch: Partial<DisplaySettings>): void {
+  saveRuntimeSettings({ ...loadRuntimeSettings(), display: { ...displaySettings(), ...patch } })
 }
 
 /** The settings saved from the panel, or {} when absent/unreadable. */
@@ -62,6 +98,10 @@ export function saveRuntimeSettings(s: RuntimeSettings): void {
     const seen = s.seenNotices ?? loadRuntimeSettings().seenNotices
     const ids = (Array.isArray(seen) ? seen : []).filter((v) => typeof v === 'string' && v).slice(0, 50)
     if (ids.length > 0) clean.seenNotices = ids
+    // Display settings come from the glasses, not the Settings card: carried
+    // forward like the notice ids when the caller doesn't pass them.
+    const display = s.display ?? loadRuntimeSettings().display
+    if (display && typeof display === 'object') clean.display = display
     if (Object.keys(clean).length === 0) window.localStorage?.removeItem(SETTINGS_KEY)
     else window.localStorage?.setItem(SETTINGS_KEY, JSON.stringify(clean))
   } catch {
@@ -153,10 +193,14 @@ export const HISTORY_LIMIT = numEnv(env.VITE_HISTORY_LIMIT, 200)
  * It must ALWAYS fit the body height with no overflow — the firmware renders
  * text top-aligned and never scrolls to the bottom by itself, so an overflowing
  * live tail hides exactly the newest lines. The tail is therefore budgeted by
- * estimated visual ROWS (LIVE_BODY_ROWS × HUD_CHARS_PER_ROW, wrapping counted)
- * with this as the additional byte ceiling.
+ * visual ROWS (LIVE_BODY_ROWS, each line's wrapping measured with the firmware
+ * font's widths: `bodyRows`) with this as the additional byte ceiling. It also
+ * sizes the dictation screen's tail (`liveTail`).
  */
 export const LIVE_BODY_BYTES = numEnv(env.VITE_LIVE_BODY_BYTES, 320)
+/** The live body's byte ceiling under the image strip: its 8 rows hold about
+ *  500 characters, so full rows reach the row limit first. */
+export const LIVE_BODY_BYTES_STRIP = 640
 /** How many rendered text rows the live body can show without overflowing its
  *  220px band. Conservative — a row too few beats hiding the newest line. */
 export const LIVE_BODY_ROWS = numEnv(env.VITE_LIVE_ROWS, 6)
