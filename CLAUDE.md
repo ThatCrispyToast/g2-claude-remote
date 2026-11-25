@@ -191,11 +191,8 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   prompt) closes it. The chain re-packs its block IN PLACE on each new tool, and
   only ever rewrites tail lines so frozen history-window indices stay valid.
 - **Workers persist a fresh `system/init` on EVERY controller attach AND every
-  model / mode / effort change — it's a settings snapshot.** The panel renders
-  it as one (`◆ opus-5-5 · max effort · bypass`, via `settingsLine`) and folds
-  repeats; the HUD renders nothing for it, since the session view's header
-  shows the live settings (and a `result` is a bare `◇ done`, its turns and
-  cost left to the panel).
+  model / mode / effort change — it's a settings snapshot, so render it as one
+  (`☉ opus-5-5 · max effort · bypass`, via `settingsLine`) and fold repeats.**
   Confirmed live (2026-08-21 and 2026-10-16, raw wire data): each claude.ai open
   of a session sends an `initialize` control_request (often twice), and the
   worker's reply mints one or two `system/init` events — same CLI `session_id`,
@@ -267,9 +264,9 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   someone moves it, so it is as stable as a title. Compose → Pin / Unpin and
   the panel's button set it through `POST …/pin`; both show only when the
   bridge reports `pinned` (0.5.0+).
-- **Message screens are `scroll` layouts, not one text block.** Setup, error,
-  and the empty list pin their title and gesture hint in the header / footer
-  strips. As a single full-screen container (until 1.9.0) the error screen's
+- **Message screens are `scroll` layouts, not one text block.** Setup and error
+  screens pin their title and gesture hint in the header and footer strips.
+  The session list includes Settings even when empty. As a single full-screen container (until 1.9.0) the error screen's
   divider rules wrapped and pushed `tap retry` below the fold.
 - **Most screens have an image strip on top** (`StripLayout` over a text
   body, `StripListLayout` over a native list; `src/strip-image.ts`): the "CR"
@@ -288,7 +285,7 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
     greys draw in 30-130 ms and send in about 0.2 s per half.
   - A newer layout waiting in the queue stops a strip before its next image
     send, so a transcript or status is never held up behind an image.
-  - Two failed image updates in a row switch `imageStrips` off for the run and
+  - Two failed image layouts in a row switch `imageStrips` off for the run and
     every screen falls back to its text header and footer.
 - **Exactly one `isEventCapture:1` container per page** (the scroll/tap target).
 - **Root-page exit MUST be `shutDownPageContainer(1)`** (the system exit-confirm
@@ -301,7 +298,7 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   on hardware via a beta build.
 - **Gesture events are messy:** they arrive as `listEvent` OR `textEvent` OR
   `sysEvent` — coalesce all three. `CLICK_EVENT` is `0`, which protobuf drops,
-  so a tap arrives as `eventType === undefined`. IMU frames are ignored.
+  so a tap arrives as `eventType === undefined`. Route IMU frames only to tilt wake and calibration.
 
 ## Blocking prompts
 
@@ -636,8 +633,11 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   `wordlist.py`, default 5 ≈ 52 bits) and persists it to
   `~/.config/claude-remote/bridge-token`; `--open` is the only unauthenticated
   mode. A user-set token is used verbatim.
-- **Deepgram key** lives in `.env.local` or the Settings card; voice
-  auto-disables when blank.
+- **Dictation source** is chosen in the Settings card. Deepgram needs a key
+  from the card or the dev environment. Bridge dictation needs the optional
+  `local-stt` dependency and `whoami.local_stt`. Numbered audio and finish
+  requests replay their last acknowledgement. A failed finish preserves the
+  visible transcript for review. Closing a session retires its dictation run.
 - **Dictation language** is the Settings card's `sttLanguage` (any Deepgram
   code; `multi` = mixed-language speech), else `STT_LANGUAGE` — the build
   default `en`, which is also the field's placeholder (see Layering).

@@ -21,17 +21,26 @@ routes answer 501.
 from __future__ import annotations
 
 import gc
+import hashlib
+import math
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import secrets
 import threading
 import time
 from typing import Optional
 
+from .config import config_value
+
 SAMPLE_RATE = 16000
 BYTES_PER_S = SAMPLE_RATE * 2
 
-IDLE_UNLOAD_S = float(os.environ.get("RC_BRIDGE_STT_IDLE_S", "300"))
+try:
+    IDLE_UNLOAD_S = float(config_value("RC_BRIDGE_STT_IDLE_S", "300"))
+    if not math.isfinite(IDLE_UNLOAD_S) or IDLE_UNLOAD_S < 0:
+        raise ValueError
+except ValueError:
+    IDLE_UNLOAD_S = 300.0
 # Uncommitted audio past this is committed, cut at its quietest point within
 # the last CUT_WINDOW_S, so a word is not split in two.
 COMMIT_S = 20.0
@@ -50,6 +59,11 @@ LEAD_S = 0.3
 ABANDON_S = 600.0
 # The largest single post accepted (60 s of audio).
 MAX_POST_BYTES = 60 * BYTES_PER_S
+
+# Includes short-lived acknowledgements of finished dictations. When full,
+# evict the oldest such receipt before refusing another live mic.
+MAX_DICTATIONS = 32
+
 
 class _Mlx:
     """Whisper through mlx-whisper, on an Apple Silicon GPU."""
@@ -156,7 +170,7 @@ def _pick_backend() -> tuple[Optional[object], Optional[str]]:
     import platform
     import sys
 
-    wanted = os.environ.get("RC_BRIDGE_STT_BACKEND", "").strip().lower()
+    wanted = config_value("RC_BRIDGE_STT_BACKEND").strip().lower()
     apple = sys.platform == "darwin" and platform.machine() == "arm64"
     order = [_Mlx, _FasterWhisper] if apple else [_FasterWhisper, _Mlx]
     if wanted in ("mlx", "mlx-whisper"):
@@ -180,7 +194,7 @@ else:
     _BACKEND, _IMPORT_ERROR = _pick_backend()
 
 BACKEND = getattr(_BACKEND, "name", "")
-MODEL = os.environ.get("RC_BRIDGE_STT_MODEL") or getattr(_BACKEND, "default_model", "")
+MODEL = config_value("RC_BRIDGE_STT_MODEL") or getattr(_BACKEND, "default_model", "")
 
 NOT_INSTALLED = (
     "Local dictation is not installed on this bridge. Run it with the local-stt extra, "
@@ -196,10 +210,23 @@ class UnknownDictation(Exception):
     pass
 
 
+class DictationConflict(Exception):
+    pass
+
+
+class DictationsBusy(Exception):
+    pass
+
+
 class _Dictation:
-    def __init__(self, language: Optional[str]):
+    def __init__(self, language: Optional[str], warmup: Future):
+        self.warmup = warmup
         self.language = language
-        self.pcm = bytearray()  # audio not yet committed
+        self.pcm = b""  # audio not yet committed
+        self.next_seq = 0
+        self.last_request: Optional[tuple[str, bytes]] = None
+        self.last_reply: dict = {}
+        self.finished = False
         self.lock = threading.Lock()
         self.touched = time.monotonic()
 
@@ -213,7 +240,7 @@ _last_use = 0.0
 # downloads is dropped (dictation starts once it is done), audio sent while it
 # loads from disk (a second or two) is kept.
 _model_state = "idle"
-_model_error = ""
+_warmup: Optional[Future] = None
 _device_said = False  # where the model runs, printed once
 _dictations: dict[str, _Dictation] = {}
 _dictations_lock = threading.Lock()
@@ -291,30 +318,33 @@ def model_state() -> str:
 
 
 def _load() -> None:
-    global _last_use, _model_state, _model_error, _device_said
-    if _BACKEND.loaded():
+    global _last_use, _model_state, _device_said
+    if _model_state == "downloading":
+        print(f"  Local dictation: downloading {MODEL} (first use; this can take a few minutes)", flush=True)
+    try:
+        _BACKEND.load(MODEL)
+    except Exception as exc:
+        print(f"  Local dictation: could not load {MODEL}: {exc!r}", flush=True)
+        with _dictations_lock:
+            _model_state = "failed"
+        raise RuntimeError("The dictation model could not load. Check the bridge log.") from exc
+    if not _device_said:
+        print(f"  Local dictation: {MODEL} runs on {_BACKEND.device}", flush=True)
+        _device_said = True
+    with _dictations_lock:
+        _last_use = time.monotonic()
         _model_state = "ready"
-    else:
-        if _model_state == "downloading":
-            print(f"  Local dictation: downloading {MODEL} (first use; this can take a few minutes)", flush=True)
-        try:
-            _BACKEND.load(MODEL)
-            _model_state = "ready"
-            if not _device_said:
-                print(f"  Local dictation: {MODEL} runs on {_BACKEND.device}", flush=True)
-                _device_said = True
-        except Exception as exc:  # noqa: BLE001 — reported to the app on its next post
-            _model_state, _model_error = "failed", repr(exc)
-            print(f"  Local dictation: could not load {MODEL}: {exc!r}", flush=True)
-    _last_use = time.monotonic()
 
 
 def _unload_if_idle() -> None:
     global _model_state
-    if not _BACKEND.loaded() or time.monotonic() - _last_use < IDLE_UNLOAD_S:
-        return
-    _BACKEND.unload()
-    _model_state = "idle"
+    with _dictations_lock:
+        if _model_state != "ready" or time.monotonic() - _last_use < IDLE_UNLOAD_S:
+            return
+        if any(not d.finished for d in _dictations.values()):
+            return
+        _BACKEND.unload()
+        _model_state = "idle"
 
 
 def _reap() -> None:
@@ -322,8 +352,9 @@ def _reap() -> None:
         time.sleep(30)
         now = time.monotonic()
         with _dictations_lock:
-            for did in [d for d, x in _dictations.items() if now - x.touched > ABANDON_S]:
-                del _dictations[did]
+            for did, d in list(_dictations.items()):
+                if now - d.touched > ABANDON_S and not d.lock.locked():
+                    del _dictations[did]
         try:
             _worker.submit(_unload_if_idle).result()
         except Exception:  # noqa: BLE001 — never let the reaper die
@@ -331,74 +362,87 @@ def _reap() -> None:
 
 
 def start(language: Optional[str]) -> str:
-    """Open a dictation and load the model in the background, so it is ready
-    by the time the first audio arrives (or say it is downloading: see
-    model_state)."""
-    global _reaper, _model_state
+    """Open a mic and share a single warmup across concurrent dictations."""
+    global _reaper, _model_state, _warmup
     did = secrets.token_hex(8)
-    if _model_state in ("idle", "failed"):
-        _model_state = "loading" if _BACKEND.loaded() or _BACKEND.cached(MODEL) else "downloading"
     with _dictations_lock:
-        _dictations[did] = _Dictation(_language(language))
+        if len(_dictations) >= MAX_DICTATIONS:
+            finished = [key for key, d in _dictations.items() if d.finished]
+            if not finished:
+                raise DictationsBusy("Too many open dictations. Try again in a moment.")
+            del _dictations[min(finished, key=lambda key: _dictations[key].touched)]
+        if _model_state in ("idle", "failed"):
+            _model_state = "loading" if _BACKEND.cached(MODEL) else "downloading"
+            _warmup = _worker.submit(_load)
+        _dictations[did] = _Dictation(_language(language), _warmup)
         if _reaper is None:
             _reaper = threading.Thread(target=_reap, name="stt-reaper", daemon=True)
             _reaper.start()
-    _worker.submit(_load)
     return did
 
 
-def _get(did: str) -> _Dictation:
+def _recognize(d: _Dictation, pcm: bytes, finish: bool) -> tuple[bytes, list[str], str]:
+    """Work from an immutable snapshot; a failed inference leaves the last
+    acknowledged bytes and text intact for an exact retry."""
+    if _model_state == "downloading" and not d.warmup.done():
+        # The app discards microphone frames during a first download and polls with
+        # empty audio. A stop in that state has nothing to flush.
+        if pcm:
+            raise DictationConflict("Wait for the dictation model to download before recording.")
+        return b"", [], ""
+    d.warmup.result()  # includes a cached load or its failure, also during finish
+    audio = d.pcm + pcm
+    if _is_silent(audio):
+        tail = b"" if finish else audio[-int(LEAD_S * BYTES_PER_S):]
+        return tail, [], ""
+    if finish or _trailing_silence_s(audio) >= PAUSE_S:
+        text = _transcribe(audio, d.language)
+        return b"", [text] if text else [], ""
+    finals = []
+    if len(audio) > COMMIT_S * BYTES_PER_S:
+        cut = _cut_point(audio)
+        text = _transcribe(audio[:cut], d.language)
+        if text:
+            finals.append(text)
+        audio = audio[cut:]
+    return audio, finals, _transcribe(audio, d.language)
+
+
+def process(did: str, action: str, seq: int, pcm: bytes) -> dict:
+    """Apply the next numbered post, or replay its acknowledgement. One post
+    at a time per mic means only the latest reply (including finish) is needed."""
+    global _last_use
     with _dictations_lock:
         d = _dictations.get(did)
-    if d is None:
-        raise UnknownDictation(did)
-    d.touched = time.monotonic()
-    return d
-
-
-def feed(did: str, pcm: bytes) -> dict:
-    """Append audio; return newly committed text (`final`) and the current
-    reading of what is not committed yet (`interim`)."""
-    d = _get(did)
-    if _model_state == "failed":
-        raise RuntimeError(f"the dictation model could not load: {_model_error}")
+        if d is None:
+            raise UnknownDictation(did)
+        d.touched = time.monotonic()
     with d.lock:
-        if _model_state == "downloading":
-            d.pcm.clear()
-            return {"final": [], "interim": "", "model": _model_state}
-        d.pcm.extend(pcm)
-        finals: list[str] = []
-        if _is_silent(d.pcm):
-            del d.pcm[: max(0, len(d.pcm) - int(LEAD_S * BYTES_PER_S)) // 2 * 2]
-            return {"final": finals, "interim": "", "model": _model_state}
-        if _model_state != "ready":
-            # Loading: kept, and transcribed once the model is up.
-            return {"final": finals, "interim": "", "model": _model_state}
-        if _trailing_silence_s(d.pcm) >= PAUSE_S:
-            text = _transcribe(d.pcm, d.language)
-            d.pcm.clear()
-            return {"final": [text] if text else [], "interim": "", "model": _model_state}
-        if len(d.pcm) > COMMIT_S * BYTES_PER_S:
-            cut = _cut_point(d.pcm)
-            text = _transcribe(d.pcm[:cut], d.language)
-            del d.pcm[:cut]
-            if text:
-                finals.append(text)
-        return {"final": finals, "interim": _transcribe(d.pcm, d.language), "model": _model_state}
-
-
-def finish(did: str, pcm: bytes) -> dict:
-    """Append the last audio, commit everything and close the dictation."""
-    d = _get(did)
-    with d.lock:
-        d.pcm.extend(pcm)
-        # Before the model is up there is nothing to transcribe with.
-        text = _transcribe(d.pcm, d.language) if _model_state == "ready" else ""
-        d.pcm.clear()
-    cancel(did)
-    return {"final": [text] if text else [], "interim": "", "model": _model_state}
+        # A duplicate may have waited for an earlier inference while a cancel
+        # removed this mic. Drop it before replay or another model pass.
+        with _dictations_lock:
+            if _dictations.get(did) is not d:
+                raise UnknownDictation(did)
+        request = (action, hashlib.sha256(pcm).digest())
+        if seq == d.next_seq - 1 and request == d.last_request:
+            return d.last_reply
+        if seq != d.next_seq or d.finished:
+            raise DictationConflict("Dictation sequence or audio does not match the expected request.")
+        finished = action == "finish"
+        pending, finals, interim = _recognize(d, pcm, finished)
+        reply = {"seq": seq, "final": finals, "interim": interim, "model": model_state()}
+        with _dictations_lock:
+            if _dictations.get(did) is not d:  # cancelled while inference was in flight
+                raise UnknownDictation(did)
+            d.pcm, d.last_request, d.last_reply = pending, request, reply
+            d.next_seq += 1
+            d.finished = finished
+            d.touched = _last_use = time.monotonic()
+        return reply
 
 
 def cancel(did: str) -> None:
+    global _last_use
     with _dictations_lock:
-        _dictations.pop(did, None)
+        if _dictations.pop(did, None) is not None:
+            _last_use = time.monotonic()

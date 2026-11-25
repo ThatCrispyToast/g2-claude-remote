@@ -2,7 +2,7 @@
 //
 // On a keyboard-less device, speech is the only way to compose a free-form
 // message. This is a thin orchestrator over a captioner (Deepgram's LiveCaptioner
-// with a key, else the bridge's BridgeCaptioner): it opens the glasses mic
+// or the bridge's BridgeCaptioner): it opens the glasses mic
 // (`bridge.audioControl(true)`), streams the mic's PCM frames to it, accumulates
 // the committed (final) transcript, and surfaces the live interim so the wearer
 // sees words land as they speak. `stop()` returns the
@@ -18,16 +18,6 @@ import { LiveCaptioner, type CaptionerHandlers, type CaptionerStatus } from '../
 import { BridgeCaptioner } from '../stt/bridge'
 
 export type VoiceStatus = 'idle' | 'connecting' | 'downloading model' | 'listening' | 'reconnecting' | 'error'
-
-/** A mic call is a BLE round trip, and a close whose reply never comes must not
- *  wedge stop()/cancel() — nor the finish waiting on them. Past this they carry
- *  on as if it landed; the `current` token makes a late reply harmless. */
-const MIC_CLOSE_TIMEOUT_MS = 4000
-
-/** Wait for `p` (and swallow its rejection), but never longer than `ms`. */
-function settleWithin(p: Promise<unknown>, ms: number): Promise<unknown> {
-  return Promise.race([p, new Promise((r) => setTimeout(r, ms))])
-}
 
 export interface VoiceHandlers {
   /** The best transcript so far (finals + latest interim), on every change. */
@@ -52,185 +42,149 @@ function toVoiceStatus(s: CaptionerStatus): VoiceStatus {
   }
 }
 
+
+interface DictationRun {
+  handlers: VoiceHandlers
+  captioner?: LiveCaptioner | BridgeCaptioner
+  finals: string
+  interim: string
+  finishing: boolean
+  lastPcmAt: number
+  watchdog?: number
+}
+
+const MIC_TIMEOUT_MS = 4000
+
 export class VoiceDictation {
-  private captioner: LiveCaptioner | BridgeCaptioner | null = null
-  private handlers: VoiceHandlers | null = null
-  /** Set synchronously across start()'s awaits to reject re-entrant starts. */
-  private starting = false
-  /** The dictation allowed to run, as an identity token: start() sets a fresh
-   *  one, stop() and cancel() clear it. Each re-checks it after its mic round
-   *  trip, so whichever call lost a race backs off: a start() called off while
-   *  the mic opened, or a stop()/cancel() overtaken by a newer start(). */
-  private current: object | null = null
-  /** Committed segments joined with spaces — the durable part of the transcript. */
-  private finals = ''
-  /** The current volatile hypothesis (cleared each time a window commits). */
-  private interim = ''
-  /** performance.now() of the last PCM frame — drives the mic watchdog. */
-  private lastPcmAt = 0
-  private micWatchdog: number | null = null
+  private run: DictationRun | null = null
+  private micQueue: Promise<void> = Promise.resolve()
+  private micWanted = false
 
   constructor(private readonly bridge: EvenAppBridge) {}
 
-  /** True when the chosen transcriber is usable (a Deepgram key, or a bridge
-   *  that transcribes) — otherwise dictation is a no-op. Read live so a Settings-card change applies without a reload. */
   get available(): boolean {
     return voiceEnabled()
   }
 
-  /**
-   * Open the mic and start dictating. Interims stream through `handlers.onInterim`
-   * and lifecycle through `handlers.onStatus`. If voice isn't available (no
-   * usable transcriber) this reports `'error'` and does nothing else.
-   */
   async start(handlers: VoiceHandlers): Promise<void> {
-    this.handlers = handlers
+    if (this.run) return
     if (!this.available) {
-      handlers.onStatus('error')
+      handlers.onStatus('error', 'Dictation is unavailable.')
       return
     }
-    // Re-entry guard: ignore a second start() while one is connecting or a
-    // session is already live, so we never orphan a captioner or leak a watchdog.
-    if (this.starting || this.captioner) return
-    this.starting = true
-    const run = {}
-    this.current = run
-    // Fresh session — discard any transcript from a previous run.
-    this.finals = ''
-    this.interim = ''
+    const run: DictationRun = { handlers, finals: '', interim: '', finishing: false, lastPcmAt: performance.now() }
+    this.run = run
     handlers.onStatus('connecting')
-
     try {
-      await this.bridge.audioControl(true)
-    } catch (err) {
-      if (this.current !== run) return // called off meanwhile — nothing to report
-      console.error('[voice] failed to open mic:', err)
-      this.starting = false
-      this.current = null
-      handlers.onStatus('error', 'Could not open the glasses mic.')
-      return
-    }
-    // Called off while the mic was opening: the stop() or cancel() wins, so
-    // close the mic just opened rather than stream behind an idle UI — unless
-    // a newer start() owns it by now.
-    if (this.current !== run) {
-      if (this.current === null) {
-        void this.bridge.audioControl(false).catch((err) => {
-          console.error('[voice] failed to close mic:', err)
-        })
+      await this.micControl(true)
+      if (this.run !== run || run.finishing) return
+
+      const emit = () => handlers.onInterim(this.transcript)
+      const callbacks: CaptionerHandlers = {
+        onFinal: text => {
+          if (this.run !== run) return
+          run.finals = run.finals ? run.finals + ' ' + text : text
+          run.interim = ''
+          emit()
+        },
+        onInterim: text => {
+          if (this.run !== run) return
+          run.interim = text
+          emit()
+        },
+        onStatus: s => {
+          if (this.run === run) handlers.onStatus(toVoiceStatus(s))
+        },
+        onFatal: reason => {
+          if (this.run === run) handlers.onStatus('error', reason)
+        },
       }
-      return
+      run.captioner = currentSttSource() === 'bridge'
+        ? new BridgeCaptioner(callbacks)
+        : new LiveCaptioner(currentDeepgramKey(), callbacks)
+      run.lastPcmAt = performance.now()
+      run.watchdog = window.setInterval(() => {
+        if (performance.now() - run.lastPcmAt < MIC_SILENCE_TIMEOUT_MS) return
+        run.lastPcmAt = performance.now()
+        void this.micControl(true).catch(err => console.warn('[voice] mic reopen failed:', err))
+      }, 2000)
+    } catch (err) {
+      if (this.run === run && !run.finishing) handlers.onStatus('error', (err as Error).message)
     }
-
-    this.lastPcmAt = performance.now()
-    const captionerHandlers: CaptionerHandlers = {
-      onFinal: (text) => {
-        this.finals = this.finals ? `${this.finals} ${text}` : text
-        this.interim = ''
-        this.emitInterim()
-      },
-      onInterim: (text) => {
-        this.interim = text
-        this.emitInterim()
-      },
-      onStatus: (s) => {
-        this.handlers?.onStatus(toVoiceStatus(s))
-      },
-      onFatal: (message) => {
-        console.error('[voice] dictation fatal:', message)
-        this.handlers?.onStatus('error', message)
-      },
-    }
-    // The transcriber chosen in the Settings card.
-    this.captioner =
-      currentSttSource() === 'bridge'
-        ? new BridgeCaptioner(captionerHandlers)
-        : new LiveCaptioner(currentDeepgramKey(), captionerHandlers)
-
-    // Watchdog: the mic sometimes closes silently on the glasses. If no PCM has
-    // arrived for a while, ask the bridge to reopen it (best effort).
-    this.micWatchdog = window.setInterval(() => {
-      if (performance.now() - this.lastPcmAt < MIC_SILENCE_TIMEOUT_MS) return
-      this.lastPcmAt = performance.now() // avoid hammering audioControl every tick
-      void this.bridge.audioControl(true).catch((err) => {
-        console.error('[voice] mic reopen failed:', err)
-      })
-    }, 2000)
-    this.starting = false
   }
 
-  /**
-   * Feed one mic frame (PCM s16le) from main.ts's onEvenHubEvent handler. No-op
-   * when not dictating.
-   */
   pushPcm(pcm: Uint8Array): void {
-    if (!this.captioner) return
-    this.lastPcmAt = performance.now()
-    this.captioner.feed(pcm)
+    if (!this.run?.captioner) return
+    this.run.lastPcmAt = performance.now()
+    this.run.captioner.feed(pcm)
   }
 
-  /**
-   * Stop dictating: close the mic, flush Deepgram's remaining finals, and return
-   * the finished transcript (trimmed). Safe to call when not started.
-   */
-  async stop(): Promise<string> {
-    this.current = null
-    this.starting = false
-    this.clearWatchdog()
-    await settleWithin(
-      this.bridge.audioControl(false).catch((err) => {
-        console.error('[voice] failed to close mic:', err)
-      }),
-      MIC_CLOSE_TIMEOUT_MS,
-    )
-    // Overtaken by a newer start(): the stream is its own. A live captioner
-    // holds new starts off, so this needs one already gone — nothing was
-    // running, or another stop()/cancel() took it (and returns its text).
-    if (this.current !== null) return ''
-    const captioner = this.captioner
-    this.captioner = null
-    if (captioner) await captioner.stop()
-    const text = this.transcript.trim()
-    this.handlers?.onStatus('idle')
-    this.finals = ''
-    this.interim = ''
-    return text
-  }
-
-  /** Stop dictating and throw the transcript away (cancel path). */
-  async cancel(): Promise<void> {
-    this.current = null
-    this.starting = false
-    this.clearWatchdog()
-    await settleWithin(
-      this.bridge.audioControl(false).catch((err) => {
-        console.error('[voice] failed to close mic:', err)
-      }),
-      MIC_CLOSE_TIMEOUT_MS,
-    )
-    if (this.current !== null) return // overtaken by a newer start() (see stop())
-    const captioner = this.captioner
-    this.captioner = null
-    captioner?.close()
-    this.finals = ''
-    this.interim = ''
-    this.handlers?.onStatus('idle')
-  }
-
-  /** The current best transcript: committed finals plus the latest interim. */
   get transcript(): string {
-    if (!this.interim) return this.finals
-    return this.finals ? `${this.finals} ${this.interim}` : this.interim
+    const run = this.run
+    return run ? [run.finals, run.interim].filter(Boolean).join(' ') : ''
   }
 
-  private emitInterim(): void {
-    this.handlers?.onInterim(this.transcript)
-  }
-
-  private clearWatchdog(): void {
-    if (this.micWatchdog !== null) {
-      clearInterval(this.micWatchdog)
-      this.micWatchdog = null
+  /** Finals may still arrive while stopping. Only this run may consume them. */
+  async stop(): Promise<string> {
+    const run = this.run
+    if (!run || run.finishing) return ''
+    run.finishing = true
+    clearInterval(run.watchdog)
+    try {
+      await this.closeMic()
+      if (this.run !== run) return ''
+      await run.captioner?.stop()
+      return this.run === run ? this.transcript.trim() : ''
+    } finally {
+      if (this.run === run) {
+        this.run = null
+        run.handlers.onStatus('idle')
+      }
     }
+  }
+
+  /** Retire callbacks synchronously, including a final request still in flight. */
+  async cancel(): Promise<void> {
+    const run = this.run
+    if (!run) return
+    this.run = null
+    clearInterval(run.watchdog)
+    run.captioner?.close()
+    run.handlers.onStatus('idle')
+    if (!run.finishing) await this.closeMic()
+  }
+
+  private closeMic(): Promise<void> {
+    return this.micControl(false).catch(err => console.warn('[voice] mic close failed:', err))
+  }
+
+  /** Serialize close/open across runs. A missing BLE reply must release the queue. */
+  private micControl(open: boolean): Promise<void> {
+    this.micWanted = open
+    const call = this.micQueue.then(async () => {
+      let expired = false
+      const native = this.bridge.audioControl(open).then(() => {
+        // A timed-out command may still reach the glasses after a newer one.
+        if (expired && this.micWanted !== open) {
+          void this.micControl(this.micWanted).catch(err => console.warn('[voice] mic recovery failed:', err))
+        }
+      })
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          native,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              expired = true
+              reject(new Error('The glasses mic did not answer in time.'))
+            }, MIC_TIMEOUT_MS)
+          }),
+        ])
+      } finally {
+        clearTimeout(timer)
+      }
+    })
+    this.micQueue = call.catch(() => {})
+    return call
   }
 }

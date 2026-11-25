@@ -212,6 +212,7 @@ export class Panel {
   private draftQuestions: DialogQuestion[] | null = null
   private historyBefore: number | null = null
   private historyRevision = 0
+  private drafts = new Map<string, string>()
   private currentSid: string | null = null
   // The open session as last pushed, its live worker settings, background
   // tasks, and the on-demand info — the header meta and the session card are
@@ -715,6 +716,10 @@ ${settingsHtml}
   // ── Header / connection ─────────────────────────────────────────────────
   setConnection(info: { bridge: 'ok' | 'down' | 'connecting'; whoami?: WhoAmI; origin: string; state: string }): void {
     // Only the connect check carries whoami; keep its answer for the redraws.
+    if (info.bridge !== 'ok' && this.bridgeStt !== null) {
+      this.bridgeStt = null
+      this.renderDictHint()
+    }
     if (info.whoami) {
       this.bridgeStt = info.whoami.local_stt === true
       this.renderDictHint()
@@ -758,9 +763,9 @@ ${settingsHtml}
     el.hidden = this.cardSource !== 'bridge'
     if (el.hidden) return
     if (this.bridgeStt) {
-      el.textContent = 'Local dictation is ready on the bridge. It transcribes English.'
+      el.textContent = 'Local dictation is available. The default model transcribes English.'
     } else if (this.bridgeStt === false) {
-      el.append('The bridge has no local dictation yet. Restart it with:')
+      el.append('Restart the bridge with this command, then save Settings to reconnect.')
       const cmd = document.createElement('code')
       cmd.className = 'notice-cmd dict-cmd'
       cmd.textContent = LOCAL_STT_COMMAND
@@ -905,7 +910,13 @@ ${settingsHtml}
   // ── Detail view (reveal / header / control-enable) ────────────────────────
   setActiveSession(session: ActiveSession | null): void {
     this.setHistoryBefore(null)
-    this.currentSid = session?.id ?? null
+    const nextSid = session?.id ?? null
+    if (this.sendInput && nextSid !== this.currentSid) {
+      if (this.currentSid && this.sendInput.value) this.drafts.set(this.currentSid, this.sendInput.value)
+      this.sendInput.value = nextSid ? this.drafts.get(nextSid) ?? '' : ''
+      if (nextSid) this.drafts.delete(nextSid)
+    }
+    this.currentSid = nextSid
     if (this.claudeLink) {
       if (session) this.claudeLink.href = `https://claude.ai/code/${encodeURIComponent(session.id)}`
       else this.claudeLink.removeAttribute('href')

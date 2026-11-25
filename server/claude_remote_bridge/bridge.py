@@ -100,18 +100,14 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__, stt
+from .config import FILE_VALUES, REPO_ROOT, config_value
 from .wordlist import WORDS
-
-# In a repo checkout this file lives at server/claude_remote_bridge/bridge.py,
-# so parents[2] is the repo root (where .env.local and ../claude-rc-api live).
-# In an installed wheel those paths simply don't exist and are skipped.
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 try:
     from claude_rc.client import APIError, RemoteControlClient
 except ModuleNotFoundError:
     # Not installed — fall back to a checkout next to the repo (../claude-rc-api).
-    _sibling = _REPO_ROOT.parent / "claude-rc-api"
+    _sibling = REPO_ROOT.parent / "claude-rc-api"
     if (_sibling / "claude_rc").is_dir():
         sys.path.insert(0, str(_sibling))
     try:
@@ -148,34 +144,6 @@ from claude_rc.credentials import CredentialsError, load_credentials, load_org_u
 
 
 # --- config ----------------------------------------------------------------
-def _env_file() -> dict[str, str]:
-    """KEY=VALUE pairs from `.env.local` (the app's config file), so one file
-    can configure both sides. Looked for in the CWD first, then the repo
-    checkout this module sits in. Comments/blanks skipped, quotes stripped."""
-    out: dict[str, str] = {}
-    for candidate in (Path.cwd() / ".env.local", _REPO_ROOT / ".env.local"):
-        try:
-            text = candidate.read_text()
-        except OSError:
-            continue
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            out[key.strip()] = value.split(" #", 1)[0].strip().strip("'\"")
-        break
-    return out
-
-
-_ENV_FILE = _env_file()
-
-
-def _cfg(key: str, default: str = "") -> str:
-    """A config value: the process env wins, then `.env.local`, then `default`."""
-    return os.environ.get(key) or _ENV_FILE.get(key) or default
-
-
 # Set by main() before serve(); module-level so the request handlers see them.
 HOST = "0.0.0.0"
 PORT = 8790
@@ -602,6 +570,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self._cors()
         self.end_headers()
         self.wfile.write(body)
@@ -636,36 +606,56 @@ class _Handler(BaseHTTPRequestHandler):
     def _stt(self, path: str) -> None:
         """`/api/stt/start` takes JSON; `…/audio`, `…/finish` and `…/cancel`
         take raw PCM (s16le, 16 kHz, mono)."""
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > stt.MAX_POST_BYTES:
-            self.close_connection = True  # the body is left unread
-            return self._json({"error": "audio post too large", "status": 413}, status=413)
-        raw = self.rfile.read(length) if length else b""
+        # Close on any early rejection: unread bytes cannot start the next
+        # request on this HTTP/1.1 connection.
+        def reject(status: int, message: str) -> None:
+            self.close_connection = True
+            self._json({"error": message, "status": status}, status=status)
+
         if not self._authed():
-            return self._unauth()
+            return reject(401, "unauthorized")
         if not stt.available():
-            return self._json({"error": stt.NOT_INSTALLED, "status": 501}, status=501)
+            return reject(501, stt.NOT_INSTALLED)
+        match = _R_STT.fullmatch(path)
+        if path != "/api/stt/start" and not match:
+            return reject(404, "not found")
+
+        lengths = self.headers.get_all("Content-Length", ["0"])
+        if self.headers.get("Transfer-Encoding") or len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,12}", lengths[0]):
+            return reject(400, "invalid Content-Length")
+        length = int(lengths[0])
+        if length > stt.MAX_POST_BYTES:
+            return reject(413, "audio post too large")
+        action = match["action"] if match else "start"
+        if action in ("audio", "finish"):
+            values = self._query().get("seq", [])
+            if len(values) != 1 or not re.fullmatch(r"[0-9]{1,12}", values[0]):
+                return reject(400, "a numbered audio request is required")
+            if length % 2:
+                return reject(400, "audio must contain whole s16le samples")
+
         try:
-            if path == "/api/stt/start":
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                return reject(400, "incomplete request body")
+            if action == "start":
                 try:
                     data = json.loads(raw or b"{}")
-                except json.JSONDecodeError:
-                    data = {}
+                except (ValueError, UnicodeError):
+                    return reject(400, "invalid dictation settings")
                 language = data.get("language") if isinstance(data, dict) else None
                 did = stt.start(language if isinstance(language, str) else None)
-                return self._json({"id": did, "model": stt.model_state()})
-            m = _R_STT.match(path)
-            if not m:
-                return self._json({"error": "not found", "status": 404}, status=404)
-            did, action = m["did"], m["action"]
-            if action == "audio":
-                return self._json(stt.feed(did, raw))
-            if action == "finish":
-                return self._json(stt.finish(did, raw))
-            stt.cancel(did)
-            return self._json({"ok": True})
+                return self._json({"id": did, "model": stt.model_state(), "protocol": 1})
+            if action == "cancel":
+                stt.cancel(match["did"])
+                return self._json({"ok": True})
+            return self._json(stt.process(match["did"], action, int(values[0]), raw))
         except stt.UnknownDictation:
             self._json({"error": "dictation not found (the bridge may have restarted)", "status": 404}, status=404)
+        except stt.DictationConflict as exc:
+            self._json({"error": str(exc), "status": 409}, status=409)
+        except stt.DictationsBusy as exc:
+            self._json({"error": str(exc), "status": 429}, status=429)
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:  # noqa: BLE001
@@ -1083,7 +1073,7 @@ _MIN_TOKEN_WORDS = 3
 
 def _token_word_count() -> int:
     try:
-        n = int(_cfg("RC_BRIDGE_TOKEN_WORDS", str(_DEFAULT_TOKEN_WORDS)))
+        n = int(config_value("RC_BRIDGE_TOKEN_WORDS", str(_DEFAULT_TOKEN_WORDS)))
     except ValueError:
         n = _DEFAULT_TOKEN_WORDS
     return max(_MIN_TOKEN_WORDS, n)
@@ -1111,7 +1101,7 @@ def _resolve_token(cli_token: Optional[str], open_mode: bool) -> tuple[str, str]
         return cli_token, "from --token"
     if os.environ.get("RC_BRIDGE_TOKEN"):
         return os.environ["RC_BRIDGE_TOKEN"], "from $RC_BRIDGE_TOKEN"
-    file_token = _ENV_FILE.get("RC_BRIDGE_TOKEN") or _ENV_FILE.get("VITE_BRIDGE_TOKEN")
+    file_token = FILE_VALUES.get("RC_BRIDGE_TOKEN") or FILE_VALUES.get("VITE_BRIDGE_TOKEN")
     if file_token:
         return file_token, "from .env.local"
     store = _token_store()
@@ -1237,13 +1227,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args(argv)
 
-    HOST = args.host or _cfg("RC_BRIDGE_HOST", "0.0.0.0")
+    HOST = args.host or config_value("RC_BRIDGE_HOST", "0.0.0.0")
     try:
-        PORT = args.port or int(_cfg("RC_BRIDGE_PORT", "8790"))
+        PORT = args.port or int(config_value("RC_BRIDGE_PORT", "8790"))
     except ValueError:
         PORT = 8790
     TOKEN, token_note = _resolve_token(args.token, args.open)
-    VERBOSE = args.verbose or _cfg("RC_BRIDGE_VERBOSE") not in ("", "0", "false", "no")
+    VERBOSE = args.verbose or config_value("RC_BRIDGE_VERBOSE") not in ("", "0", "false", "no")
     serve(token_note)
 
 

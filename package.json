@@ -1,12 +1,13 @@
 {
   "name": "claude-remote",
   "private": true,
-  "version": "1.11.1",
+  "version": "1.12.0",
   "repository": "github:ThatCrispyToast/g2-claude-remote",
   "description": "Monitor and steer Claude Code Remote Control sessions from Even Realities G2 glasses",
   "license": "MIT",
   "type": "module",
   "scripts": {
+    "test": "node --test scripts/tests/*.test.mjs",
     "dev": "vite",
     "bridge": "python3 server/rc_bridge.py",
     "bridge:uv": "uv run --project ../claude-rc-api python server/rc_bridge.py",

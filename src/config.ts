@@ -52,14 +52,20 @@ export interface DisplaySettings {
   notifyDone: boolean
 }
 export const BLANK_AFTER_CHOICES = [0, 15, 30, 60, 120, 300]
-const DISPLAY_DEFAULTS: DisplaySettings = { blankAfterS: 0, lookWake: false, lookCal: null, notifyDone: true }
 
 /** The display settings saved on this device, over the defaults. A
  *  calibration in an older shape is dropped. */
 export function displaySettings(): DisplaySettings {
-  const d = { ...DISPLAY_DEFAULTS, ...(loadRuntimeSettings().display ?? {}) }
-  if (d.lookCal && !(Array.isArray(d.lookCal.rest) && Array.isArray(d.lookCal.read))) d.lookCal = null
-  return d
+  const d = loadRuntimeSettings().display ?? {}
+  const reading = (v: unknown): v is HeadReading =>
+    Array.isArray(v) && v.length === 3 && v.every(Number.isFinite) && Math.hypot(...v) > 0
+  const cal = d.lookCal
+  return {
+    blankAfterS: typeof d.blankAfterS === 'number' && BLANK_AFTER_CHOICES.includes(d.blankAfterS) ? d.blankAfterS : 0,
+    lookWake: d.lookWake === true,
+    lookCal: cal && reading(cal.rest) && reading(cal.read) ? cal : null,
+    notifyDone: d.notifyDone !== false,
+  }
 }
 
 /** Save display settings over the stored ones. The caller then mirrors the

@@ -36,14 +36,12 @@ Settings. English is the default; choose a
 or `multi` for mixed-language speech. Characters outside Latin-1 may not display
 on the glasses, but messages send intact.
 
-Or choose **Bridge** under Dictation in Settings, and the bridge transcribes
-dictation itself with Whisper (`small.en`, English only, about 1 GB of memory
-while loaded, freed after 5 idle minutes). It runs on macOS, Linux and Windows:
-on the GPU on Apple Silicon (`mlx-whisper`), and elsewhere (`faster-whisper`) on
-an NVIDIA GPU when CUDA and cuDNN are installed, or on the CPU otherwise. The
-first dictation downloads the model, about 500 MB; the glasses show "Downloading
-model" until it's ready, and dictation starts then. Start the bridge with the
-`local-stt` extra:
+For local dictation, start bridge 0.8.0 or later with the `local-stt` extra,
+then choose **Bridge** under Dictation in the phone’s Settings card. Whisper
+transcribes the audio on your bridge host. The default model transcribes
+English, downloads about 500 MB on first use, and uses roughly 1 GB while
+loaded. Wait for **Listening** before speaking. Apple Silicon uses its GPU.
+Other hosts use an NVIDIA GPU when CUDA and cuDNN are available, or their CPU.
 
 ```bash
 uvx --from "claude-remote-bridge[local-stt] @ git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge
@@ -57,11 +55,11 @@ uvx --from "claude-remote-bridge[local-stt] @ git+https://github.com/ThatCrispyT
   context and plan usage, and model, mode, or effort changes.
 - **Double-tap** to go back, cancel dictation, or set a prompt aside. Reopen
   deferred prompts from Compose.
-- **Long press** on session output to start dictating; tap when done. On the
-  review before sending, a long press dictates more onto the message.
-- **Settings**, the last row of the session list: blank the screen after a
-  delay, wake it by tilting your head, and show a notice when a session
-  finishes or waits on you.
+- **Long press** on session output to start dictating. Tap to review, long press
+  to add more words, then tap the confirmation to send.
+- Open **Settings** in the last row of the session list to set an idle timeout,
+  calibrate tilt-to-wake, or show a notification on the blank screen. Longer
+  session lists have **Next page** and **Previous page** controls.
 - **Prompts** list Allow and Deny, or a question's options. Details shows the
   whole command or question before you answer. A pick-any question marks each
   option you tap. Submit sends the selection. Type an Other answer on the phone

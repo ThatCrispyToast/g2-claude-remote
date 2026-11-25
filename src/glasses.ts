@@ -90,7 +90,7 @@ const MAX_HEADER_ROWS = 3
 // 20 are dropped; item text is clamped by UTF-8 BYTES (a 64-char row holding
 // multi-byte HUD glyphs would blow a byte-measured firmware buffer even though
 // its char count looks fine — same trap as the text-container caps below).
-const MAX_LIST_ITEMS = 20
+export const MAX_LIST_ITEMS = 20
 const MAX_ITEM_BYTES = 63
 // The firmware validates a text container by its UTF-8 BYTE length, not its
 // character count. The documented caps are ~1000 bytes for a (re)build and ~2000
@@ -162,8 +162,9 @@ export interface ListLayout {
 export class GlassesDisplay {
   private started = false
   private busy = false
-  private pending: Layout | null = null
-  private pendingDim = 1
+  private pending: { layout: Layout; dim: number; draft?: object } | null = null
+  private paintedDraft?: object
+  private draftPaintedAt = 0
   /** The brightness the page being applied is drawn at (see render). */
   private dim = 1
   /** The text containers' brightness level now (0-4; 4 after any rebuild). */
@@ -188,6 +189,12 @@ export class GlassesDisplay {
    *  selection highlight to row 0 then, so the owner must resync any tracked
    *  index or a later row-0 tap (whose index protobuf drops) fires a stale row. */
   onListRebuild: (() => void) | null = null
+  /** The newest requested layout has reached the device. */
+  onPainted: (() => void) | null = null
+  /** Recompute the current layout with native text geometry. */
+  onImageFallback: (() => void) | null = null
+  /** Distinguish a missing or refusing host from a slow startup that can still land. */
+  unavailable = false
 
   constructor(private readonly bridge: EvenAppBridge) {}
 
@@ -223,18 +230,20 @@ export class GlassesDisplay {
       .createStartUpPageContainer(
         new CreateStartUpPageContainer({ containerTotalNum: 1, textObject: [textBox(BODY_ID, 'display', content, full())] }),
       )
-      .then((r) => {
-        // The startup page can be created once per launch. A page reloaded
-        // without a relaunch (the dev server reloading it) gets `invalid` and
-        // finds the old page still up: carry on, and rebuild over it.
+      .then(async (r) => {
         if (r === StartUpPageCreateResult.invalid) {
-          console.warn('[glasses] startup page already exists (page reloaded?) — rebuilding over it')
-          this.started = true
-          this.invalidate()
-          void this.pump()
-          return true
-        }
-        if (r !== StartUpPageCreateResult.success) {
+          // A WebView reload leaves the previous page alive. The same result is
+          // possible without a host: verify once, using the known-valid startup
+          // layout, before letting the render pump issue any more calls.
+          const ok = await this.bridge.rebuildPageContainer(new RebuildPageContainer({
+            containerTotalNum: 1, textObject: [textBox(BODY_ID, 'display', content, full())],
+          }))
+          if (!ok) {
+            this.unavailable = true
+            return false
+          }
+        } else if (r !== StartUpPageCreateResult.success) {
+          this.unavailable = true
           console.warn(`[glasses] createStartUpPageContainer failed (result ${r}) — nothing will render`)
           return false
         }
@@ -245,6 +254,7 @@ export class GlassesDisplay {
         return true
       })
       .catch((err) => {
+        this.unavailable = true
         console.error('[glasses] createStartUpPageContainer failed:', err)
         return false
       })
@@ -257,18 +267,23 @@ export class GlassesDisplay {
    *  overlap). `dim` below 1 draws it fainter, for a fade-out: text
    *  containers take the nearest of their five brightness levels, the strip
    *  images their greys scaled; native lists and borders have no brightness. */
-  render(layout: Layout, dim = 1): void {
-    this.pending = layout
-    this.pendingDim = dim
+  render(layout: Layout, dim = 1, draft?: object): void {
+    if (draft !== this.paintedDraft) this.paintedDraft = undefined
+    this.pending = { layout, dim, draft }
     void this.pump()
+  }
+
+  /** Has this exact draft been continuously visible long enough to act on? */
+  showsDraft(draft: object, guardMs: number): boolean {
+    return this.paintedDraft === draft && performance.now() - this.draftPaintedAt >= guardMs
   }
 
   private async pump(): Promise<void> {
     if (!this.started || this.busy || !this.pending) return
     this.busy = true
-    const layout = this.pending
+    const { layout, dim, draft } = this.pending
     this.pending = null
-    this.dim = this.pendingDim
+    this.dim = dim
     try {
       // Brightening (a wake during a fade) is immediate: the text, which
       // takes tens of milliseconds, comes back to full before the strip
@@ -276,7 +291,15 @@ export class GlassesDisplay {
       if (Math.round(this.dim * 4) > this.curTextLevel) await this.applyTextDim()
       await this.apply(layout)
       await this.applyTextDim()
+      if (this.kind && !this.pending) {
+        if (draft && draft !== this.paintedDraft) {
+          this.paintedDraft = draft
+          this.draftPaintedAt = performance.now()
+        }
+        this.onPainted?.()
+      }
     } catch (err) {
+      this.invalidate()
       console.error('[glasses] render failed:', err)
     } finally {
       this.busy = false
@@ -294,7 +317,7 @@ export class GlassesDisplay {
         return this.applyScroll(layout.header, layout.body, layout.footer)
       case 'strip':
         return this.noImages
-          ? this.applyScroll(`${layout.status[0]} ${HUD.SEP} ${layout.settings[0]}`, layout.body, layout.status[1])
+          ? this.applyScroll(`${layout.status[0]} ${HUD.SEP} ${layout.settings[0]}`, layout.body, layout.footer ?? layout.status[1])
           : this.applyStrip(layout)
       case 'notice':
         return this.noImages ? this.applyText(layout.text) : this.applyNotice(layout.text)
@@ -316,13 +339,21 @@ export class GlassesDisplay {
           new ImageContainerProperty({ xPosition: 0, yPosition: 0, width: STRIP_IMG_W, height: NOTICE_H, containerID: IMG_L_ID, containerName: 'imgl' }),
         ],
       })
-      if (!ok) return
+      if (!ok) return this.imageFailed()
       this.kind = 'notice'
       this.curImg = {}
       this.curStrip = ''
     }
     if (this.curStrip === text) return
-    if (await this.sendImage(IMG_L_ID, 'imgl', noticeGreys(text))) this.curStrip = text
+    try {
+      if (await this.sendImage(IMG_L_ID, 'imgl', noticeGreys(text))) {
+        this.curStrip = text
+        this.imageFailures = 0
+      }
+    } catch (err) {
+      console.error('[glasses] notice draw failed:', err)
+      this.imageFailed()
+    }
   }
 
   // ── text ───────────────────────────────────────────────────────────────
@@ -449,7 +480,7 @@ export class GlassesDisplay {
         ],
         imageObject: [imageBox(IMG_L_ID, 'imgl', 0), imageBox(IMG_R_ID, 'imgr', STRIP_IMG_W)],
       })
-      if (!ok) return
+      if (!ok) return this.imageFailed()
       this.kind = 'strip'
       this.curHasFooter = withFooter
       this.curBody = b
@@ -499,7 +530,7 @@ export class GlassesDisplay {
         ],
         imageObject: [imageBox(IMG_L_ID, 'imgl', 0), imageBox(IMG_R_ID, 'imgr', STRIP_IMG_W)],
       })
-      if (!ok) return
+      if (!ok) return this.imageFailed()
       this.kind = 'stripList'
       this.curItemsSig = sig
       this.curItems = items
@@ -555,6 +586,7 @@ export class GlassesDisplay {
       this.curImg[id] = halves[i]
     }
     this.curStrip = sig
+    this.imageFailures = 0 // both halves landed
   }
 
   /** Send one drawn strip half. A failure invalidates the page; repeated
@@ -568,22 +600,20 @@ export class GlassesDisplay {
     } catch (err) {
       console.error(`[glasses] image strip ${name} failed:`, err)
     }
-    if (result !== null && ImageRawDataUpdateResult.isSuccess(result)) {
-      this.imageFailures = 0
-      return true
-    }
+    if (result !== null && ImageRawDataUpdateResult.isSuccess(result)) return true
     console.warn(`[glasses] updateImageRawData(${name}) failed (${result ?? 'timed out'})`)
     this.imageFailed()
     return false
   }
 
   private imageFailed(): void {
+    this.invalidate()
     this.imageFailures += 1
     if (this.imageFailures >= IMAGE_FAILURES_MAX) {
       console.warn('[glasses] image strips off for this run; using text strips')
       this.noImages = true
+      this.onImageFallback?.()
     }
-    this.invalidate()
   }
 
   // ── low-level bridge calls ─────────────────────────────────────────────
@@ -593,6 +623,7 @@ export class GlassesDisplay {
   // the page from scratch — without this, one dropped write desyncs the mirror
   // from the glass and every later diff "already matches", freezing the HUD.
   private async rebuild(config: ConstructorParameters<typeof RebuildPageContainer>[0]): Promise<boolean> {
+    this.invalidate() // no tap can use the old row map while the page is being replaced
     const ok = await this.timed(this.bridge.rebuildPageContainer(new RebuildPageContainer(config)))
     // A `false` here means the firmware validated the page away (usually an
     // oversize container) and the screen silently kept its old contents.
@@ -614,11 +645,17 @@ export class GlassesDisplay {
 
   /** Race a bridge write against BRIDGE_CALL_TIMEOUT_MS (null = timed out). */
   private timed<T>(p: Promise<T>): Promise<T | null> {
-    return Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), BRIDGE_CALL_TIMEOUT_MS))])
+    let timer: ReturnType<typeof setTimeout>
+    const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), BRIDGE_CALL_TIMEOUT_MS) })
+    return Promise.race([p, timeout]).catch((err) => {
+      console.warn('[glasses] bridge call failed:', err)
+      return null
+    }).finally(() => clearTimeout(timer))
   }
 
   /** Forget what's on screen so the next render rebuilds the page from scratch. */
   private invalidate(): void {
+    this.paintedDraft = undefined
     this.kind = null
     this.curText = ''
     this.curHeader = ''
@@ -648,9 +685,14 @@ export class GlassesDisplay {
 function listPlan(layout: ListLayout): { items: string[]; rows: number; sig: string } {
   const items = (layout.items.length ? layout.items : ['(none)'])
     .slice(0, MAX_LIST_ITEMS)
-    .map((i) => clampBytes(i.replace(/\s+/g, ' '), MAX_ITEM_BYTES, 'head'))
+    .map(listItemText)
   const rows = Math.max(1, Math.min(Math.trunc(layout.headerRows ?? 1) || 1, MAX_HEADER_ROWS))
   return { items, rows, sig: [rows, layout.key ?? '', ...items].join('\n') }
+}
+
+/** The item name the native list can store and echo back with a tap. */
+export function listItemText(label: string): string {
+  return clampBytes(label.replace(/\s+/g, ' '), MAX_ITEM_BYTES, 'head')
 }
 
 // ─── container geometry helpers ──────────────────────────────────────────────
