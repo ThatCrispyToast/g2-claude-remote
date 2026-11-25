@@ -49,6 +49,13 @@ With claude-rc-api 0.7.1+, permission prompts can also offer a session rule.
 The bridge confirms the worker still offers that exact rule before sending it.
 Persistent host permission settings stay under the terminal user's control.
 
+The bridge can transcribe dictation itself (the `local-stt` extra:
+`mlx-whisper` on Apple Silicon, `faster-whisper` elsewhere, which tries an
+NVIDIA GPU and falls back to the CPU): `POST
+/api/stt/start`, then raw PCM to `…/<id>/audio` and `…/<id>/finish`. Each reply
+carries the interim text and any text committed at a pause. `GET /api/whoami`
+reports `local_stt`, which the app's Bridge dictation option checks.
+
 Also works with `pip install "git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server"`
 then `claude-remote-bridge`, or from a repo checkout via `python3 server/rc_bridge.py`.
 
@@ -68,6 +75,11 @@ Environment variables `RC_BRIDGE_HOST` / `RC_BRIDGE_PORT` / `RC_BRIDGE_TOKEN` /
 or repo checkout (`VITE_BRIDGE_TOKEN` doubles as the token, so the app repo's
 config file configures both sides). `RC_BRIDGE_TOKEN_WORDS` sets how many words
 a *generated* passphrase has (default 5 ≈ 52 bits; floored at 3).
+For local dictation (the `local-stt` extra), `RC_BRIDGE_STT_MODEL` picks the
+Whisper model (default `mlx-community/whisper-small.en-mlx` with MLX,
+`small.en` with faster-whisper), `RC_BRIDGE_STT_BACKEND` (`mlx` or
+`faster-whisper`) overrides which one runs, and `RC_BRIDGE_STT_IDLE_S` sets how
+long an unused model stays loaded (default 300).
 
 ## What it does
 

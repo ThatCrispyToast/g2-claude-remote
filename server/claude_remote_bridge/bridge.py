@@ -99,7 +99,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
-from . import __version__
+from . import __version__, stt
 from .wordlist import WORDS
 
 # In a repo checkout this file lives at server/claude_remote_bridge/bridge.py,
@@ -221,6 +221,7 @@ _R_EFFORT = re.compile(rf"^/api/sessions/{_SID}/effort$")
 _R_ARCHIVE = re.compile(rf"^/api/sessions/{_SID}/archive$")
 _R_READ = re.compile(rf"^/api/sessions/{_SID}/read$")
 _R_PIN = re.compile(rf"^/api/sessions/{_SID}/pin$")
+_R_STT = re.compile(r"^/api/stt/(?P<did>[0-9a-f]{16})/(?P<action>audio|finish|cancel)$")
 
 
 class SessionInactive(Exception):
@@ -631,6 +632,45 @@ class _Handler(BaseHTTPRequestHandler):
             raise SessionInactive(sid)
         return s
 
+    # -- local dictation ---------------------------------------------------
+    def _stt(self, path: str) -> None:
+        """`/api/stt/start` takes JSON; `…/audio`, `…/finish` and `…/cancel`
+        take raw PCM (s16le, 16 kHz, mono)."""
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > stt.MAX_POST_BYTES:
+            self.close_connection = True  # the body is left unread
+            return self._json({"error": "audio post too large", "status": 413}, status=413)
+        raw = self.rfile.read(length) if length else b""
+        if not self._authed():
+            return self._unauth()
+        if not stt.available():
+            return self._json({"error": stt.NOT_INSTALLED, "status": 501}, status=501)
+        try:
+            if path == "/api/stt/start":
+                try:
+                    data = json.loads(raw or b"{}")
+                except json.JSONDecodeError:
+                    data = {}
+                language = data.get("language") if isinstance(data, dict) else None
+                did = stt.start(language if isinstance(language, str) else None)
+                return self._json({"id": did, "model": stt.model_state()})
+            m = _R_STT.match(path)
+            if not m:
+                return self._json({"error": "not found", "status": 404}, status=404)
+            did, action = m["did"], m["action"]
+            if action == "audio":
+                return self._json(stt.feed(did, raw))
+            if action == "finish":
+                return self._json(stt.finish(did, raw))
+            stt.cancel(did)
+            return self._json({"ok": True})
+        except stt.UnknownDictation:
+            self._json({"error": "dictation not found (the bridge may have restarted)", "status": 404}, status=404)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:  # noqa: BLE001
+            self._error(exc)
+
     # -- OPTIONS (CORS preflight) ------------------------------------------
     def do_OPTIONS(self) -> None:
         self.send_response(204)
@@ -676,6 +716,8 @@ class _Handler(BaseHTTPRequestHandler):
     # -- POST --------------------------------------------------------------
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path.startswith("/api/stt/"):
+            return self._stt(path)
         body = self._body()  # always drain the body (keep-alive correctness)
         if not self._authed():
             return self._unauth()
@@ -888,10 +930,11 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             creds = load_credentials()
         except CredentialsError as exc:
-            return {"logged_in": False, "error": str(exc)}
+            return {"logged_in": False, "error": str(exc), "local_stt": stt.available()}
         org = load_org_uuid()
         return {
             "logged_in": True,
+            "local_stt": stt.available(),
             "expired": creds.is_expired(),
             "scopes": creds.scopes,
             "subscription": creds.subscription_type,
@@ -1159,6 +1202,8 @@ def serve(token_note: str) -> None:
         )
     print()
     print(f"  You might need to open port {PORT} in this host's firewall.")
+    if stt.available():
+        print(f"  Local dictation: {stt.MODEL} via {stt.BACKEND} (choose Bridge under Dictation in the app)")
     print()
     # The pairing banner must reach the terminal even when stdout is a pipe or
     # a log file (uvx | tee, systemd) — block buffering would sit on it forever.

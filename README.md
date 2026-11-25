@@ -30,11 +30,24 @@ Keep the bridge on a private LAN or Tailscale network. Anyone with the token can
 read and control every remote-control session of the logged-in account.
 See [bridge documentation](server/README.md) for options and updates.
 
-Optional dictation requires a [Deepgram key](https://console.deepgram.com) in
+Optional dictation uses a [Deepgram key](https://console.deepgram.com) in
 Settings. English is the default; choose a
 [language code](https://developers.deepgram.com/docs/models-languages-overview)
 or `multi` for mixed-language speech. Characters outside Latin-1 may not display
 on the glasses, but messages send intact.
+
+Or choose **Bridge** under Dictation in Settings, and the bridge transcribes
+dictation itself with Whisper (`small.en`, English only, about 1 GB of memory
+while loaded, freed after 5 idle minutes). It runs on macOS, Linux and Windows:
+on the GPU on Apple Silicon (`mlx-whisper`), and elsewhere (`faster-whisper`) on
+an NVIDIA GPU when CUDA and cuDNN are installed, or on the CPU otherwise. The
+first dictation downloads the model, about 500 MB; the glasses show "Downloading
+model" until it's ready, and dictation starts then. Start the bridge with the
+`local-stt` extra:
+
+```bash
+uvx --from "claude-remote-bridge[local-stt] @ git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge
+```
 
 ## Controls
 
