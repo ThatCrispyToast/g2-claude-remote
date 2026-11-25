@@ -37,7 +37,7 @@ or `multi` for mixed-language speech. Characters outside Latin-1 may not display
 on the glasses, but messages send intact.
 
 For local dictation, start bridge 0.8.0 or later with the `local-stt` extra,
-then choose **Bridge** under Dictation in the phone’s Settings card. Whisper
+then choose **Bridge** under Dictation in the phone’s Settings screen. Whisper
 transcribes the audio on your bridge host. The default model transcribes
 English, downloads about 500 MB on first use, and uses roughly 1 GB while
 loaded. Wait for **Listening** before speaking. Apple Silicon uses its GPU.
