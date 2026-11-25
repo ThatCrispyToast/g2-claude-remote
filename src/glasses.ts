@@ -167,6 +167,16 @@ export class GlassesDisplay {
         new CreateStartUpPageContainer({ containerTotalNum: 1, textObject: [textBox(BODY_ID, 'display', content, full())] }),
       )
       .then((r) => {
+        // The startup page can be created once per launch. A page reloaded
+        // without a relaunch (the dev server reloading it) gets `invalid` and
+        // finds the old page still up: carry on, and rebuild over it.
+        if (r === StartUpPageCreateResult.invalid) {
+          console.warn('[glasses] startup page already exists (page reloaded?) — rebuilding over it')
+          this.started = true
+          this.invalidate()
+          void this.pump()
+          return true
+        }
         if (r !== StartUpPageCreateResult.success) {
           console.warn(`[glasses] createStartUpPageContainer failed (result ${r}) — nothing will render`)
           return false
