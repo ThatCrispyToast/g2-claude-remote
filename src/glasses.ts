@@ -31,6 +31,9 @@
 
 import {
   CreateStartUpPageContainer,
+  ImageContainerProperty,
+  ImageRawDataUpdate,
+  ImageRawDataUpdateResult,
   ListContainerProperty,
   ListItemContainerProperty,
   RebuildPageContainer,
@@ -40,6 +43,7 @@ import {
 } from '@evenrealities/even_hub_sdk'
 import type { EvenAppBridge } from '@evenrealities/even_hub_sdk'
 import { LIVE_BODY_BYTES } from './config'
+import { NOTICE_H, STRIP_IMG_H, STRIP_IMG_W, noticeGreys, stripHalves, type StripLines } from './strip-image'
 
 // ─── Firmware-supported glyph vocabulary ─────────────────────────────────────
 // The G2 firmware ships a single LVGL font. It has ASCII, Latin-1 (U+00A1–00FF),
@@ -100,12 +104,49 @@ const BODY_BYTE_CAP = 980
 const BODY_ID = 1
 const HDR_ID = 2
 const FTR_ID = 3
+// Between the image strip and the body: the gap between the strip's boxes.
+const STRIP_GAP = 4
+const IMG_L_ID = 4
+const IMG_R_ID = 5
+// Image strips fall back to text strips after this many failed image updates
+// in a row, for the rest of the run.
+const IMAGE_FAILURES_MAX = 2
 
 export type Layout =
   | { kind: 'text'; content: string }
   | ListLayout
   | { kind: 'scroll'; header: string; body: string; footer: string }
+  | StripLayout
+  | StripListLayout
+  /** A small boxed notice in the top-left corner of an otherwise blank
+   *  screen. */
+  | { kind: 'notice'; text: string }
 
+/** A firmware-scrolled body under a two-line strip drawn as two images (see
+ *  strip-image.ts): `status` and `settings` are its boxes' lines. Where images
+ *  fail, it is shown as a `scroll` layout instead (`imageStrips` turns false). */
+export interface StripLayout {
+  kind: 'strip'
+  status: StripLines
+  settings: StripLines
+  /** Size the settings box to its text rather than the fixed width. */
+  fitSettings?: boolean
+  body: string
+  /** A boxed text line under the body, for state that must show at once (a
+   *  text update takes tens of milliseconds, a strip image hundreds). */
+  footer?: string
+}
+
+/** A native list under the image strip; `key` as in ListLayout. Where images
+ *  fail, it is shown as a `list` layout instead. */
+export interface StripListLayout {
+  kind: 'stripList'
+  status: StripLines
+  settings: StripLines
+  fitSettings?: boolean
+  items: string[]
+  key?: string
+}
 /** A native list under a header strip. `headerRows` makes the strip taller
  *  (default one line). `key` names what the list IS: a different key rebuilds
  *  the page even when the rows read the same, so one prompt's Allow / Deny is
@@ -122,6 +163,11 @@ export class GlassesDisplay {
   private started = false
   private busy = false
   private pending: Layout | null = null
+  private pendingDim = 1
+  /** The brightness the page being applied is drawn at (see render). */
+  private dim = 1
+  /** The text containers' brightness level now (0-4; 4 after any rebuild). */
+  private curTextLevel = 4
 
   // What is currently on screen, per container, so we can diff and upgrade only
   // what changed. `kind` gates whether a change is an upgrade or a full rebuild.
@@ -132,6 +178,11 @@ export class GlassesDisplay {
   private curFooter = '' // 'scroll' footer
   private curItemsSig = '' // 'list' items signature
   private curItems: string[] = [] // 'list' items as applied (clamped), for tap resolution
+  private curStrip = '' // 'strip' lines as drawn
+  private curHasFooter = false // a 'strip' page with a footer box
+  private curImg: Record<number, Uint8Array> = {} // 'strip' image halves as applied, by container id
+  private imageFailures = 0
+  private noImages = false
 
   /** Fired after every full (re)build of a native list — the firmware resets its
    *  selection highlight to row 0 then, so the owner must resync any tracked
@@ -139,6 +190,12 @@ export class GlassesDisplay {
   onListRebuild: (() => void) | null = null
 
   constructor(private readonly bridge: EvenAppBridge) {}
+
+  /** Whether `strip` layouts are drawn as images. False once image updates
+   *  have failed, after which they show as text strips (a shorter body). */
+  get imageStrips(): boolean {
+    return !this.noImages
+  }
 
   /** The item labels of the native list currently on the glasses, exactly as
    *  applied (clamped) — what listEvent.currentSelectItemName echoes back. */
@@ -151,7 +208,7 @@ export class GlassesDisplay {
    *  over BLE, and after one that failed — so a caller can tell a tap on this
    *  list from a tap on whatever is still under the wearer's finger. */
   showsList(layout: ListLayout): boolean {
-    return this.kind === 'list' && this.curItemsSig === listPlan(layout).sig
+    return (this.kind === 'list' || this.kind === 'stripList') && this.curItemsSig === listPlan(layout).sig
   }
 
   /** Create the initial page (a text screen). Call once before anything else —
@@ -186,9 +243,13 @@ export class GlassesDisplay {
     return ok === true
   }
 
-  /** Queue a screen. Coalesced (only the latest wins) and serialized (no BLE overlap). */
-  render(layout: Layout): void {
+  /** Queue a screen. Coalesced (only the latest wins) and serialized (no BLE
+   *  overlap). `dim` below 1 draws it fainter, for a fade-out: text
+   *  containers take the nearest of their five brightness levels, the strip
+   *  images their greys scaled; native lists and borders have no brightness. */
+  render(layout: Layout, dim = 1): void {
     this.pending = layout
+    this.pendingDim = dim
     void this.pump()
   }
 
@@ -197,8 +258,14 @@ export class GlassesDisplay {
     this.busy = true
     const layout = this.pending
     this.pending = null
+    this.dim = this.pendingDim
     try {
+      // Brightening (a wake during a fade) is immediate: the text, which
+      // takes tens of milliseconds, comes back to full before the strip
+      // images, which take hundreds. Dimming goes after the layout.
+      if (Math.round(this.dim * 4) > this.curTextLevel) await this.applyTextDim()
       await this.apply(layout)
+      await this.applyTextDim()
     } catch (err) {
       console.error('[glasses] render failed:', err)
     } finally {
@@ -215,7 +282,37 @@ export class GlassesDisplay {
         return this.applyList(layout)
       case 'scroll':
         return this.applyScroll(layout.header, layout.body, layout.footer)
+      case 'strip':
+        return this.noImages
+          ? this.applyScroll(`${layout.status[0]} ${HUD.SEP} ${layout.settings[0]}`, layout.body, layout.status[1])
+          : this.applyStrip(layout)
+      case 'notice':
+        return this.noImages ? this.applyText(layout.text) : this.applyNotice(layout.text)
+      case 'stripList':
+        return this.noImages
+          ? this.applyList({ kind: 'list', header: `${layout.status[0]} ${HUD.SEP} ${layout.settings.join(` ${HUD.SEP} `)}`, items: layout.items, key: layout.key })
+          : this.applyStripList(layout)
     }
+  }
+
+  // ── notice (a small boxed line over a blank screen) ───────────────────
+  private async applyNotice(text: string): Promise<void> {
+    if (this.kind !== 'notice') {
+      // An empty text box below the notice takes the input.
+      const ok = await this.rebuild({
+        containerTotalNum: 2,
+        textObject: [textBox(BODY_ID, 'body', '', { x: 0, y: NOTICE_H + STRIP_GAP, w: W, h: H - NOTICE_H - STRIP_GAP }, { capture: 1 })],
+        imageObject: [
+          new ImageContainerProperty({ xPosition: 0, yPosition: 0, width: STRIP_IMG_W, height: NOTICE_H, containerID: IMG_L_ID, containerName: 'imgl' }),
+        ],
+      })
+      if (!ok) return
+      this.kind = 'notice'
+      this.curImg = {}
+      this.curStrip = ''
+    }
+    if (this.curStrip === text) return
+    if (await this.sendImage(IMG_L_ID, 'imgl', noticeGreys(text))) this.curStrip = text
   }
 
   // ── text ───────────────────────────────────────────────────────────────
@@ -325,6 +422,160 @@ export class GlassesDisplay {
     }
   }
 
+  // ── strip (image strip + firmware-scrolled body) ───────────────────────
+  private async applyStrip(layout: StripLayout): Promise<void> {
+    const b = clampBytes(layout.body, BODY_BYTE_CAP, 'tail')
+    const footer = layout.footer?.slice(0, 200)
+    const withFooter = footer !== undefined
+    if (this.kind !== 'strip' || withFooter !== this.curHasFooter) {
+      // Image containers are created empty and filled by updateImageRawData.
+      const bodyY = STRIP_IMG_H + STRIP_GAP
+      const bodyH = H - bodyY - (withFooter ? STRIP_H + STRIP_GAP : 0)
+      const ok = await this.rebuild({
+        containerTotalNum: withFooter ? 4 : 3,
+        textObject: [
+          textBox(BODY_ID, 'body', b, { x: 0, y: bodyY, w: W, h: bodyH, pad: 8 }, { capture: 1, frame: true }),
+          ...(withFooter ? [textBox(FTR_ID, 'ftr', footer, { x: 0, y: H - STRIP_H, w: W, h: STRIP_H, pad: 6 }, { capture: 0, frame: true })] : []),
+        ],
+        imageObject: [imageBox(IMG_L_ID, 'imgl', 0), imageBox(IMG_R_ID, 'imgr', STRIP_IMG_W)],
+      })
+      if (!ok) return
+      this.kind = 'strip'
+      this.curHasFooter = withFooter
+      this.curBody = b
+      this.curFooter = footer ?? ''
+      this.curImg = {}
+      this.curStrip = ''
+    } else {
+      // The footer first: it holds the state the wearer acts on.
+      if (withFooter && footer !== this.curFooter) {
+        if (await this.upgrade(FTR_ID, 'ftr', footer)) this.curFooter = footer
+      }
+      if (b !== this.curBody) {
+        if (await this.upgrade(BODY_ID, 'body', b)) this.curBody = b
+      }
+    }
+    // The body goes first, so text lands before the slower image sends.
+    await this.paintStrip(layout.status, layout.settings, layout.fitSettings)
+  }
+
+  // ── stripList (image strip + native list) ──────────────────────────────
+  private async applyStripList(layout: StripListLayout): Promise<void> {
+    const { items, sig } = listPlan({ kind: 'list', header: '', items: layout.items, key: layout.key })
+    if (this.kind !== 'stripList' || sig !== this.curItemsSig) {
+      // Items can't be mutated in place, and a rebuild blanks the images.
+      const ok = await this.rebuild({
+        containerTotalNum: 3,
+        listObject: [
+          new ListContainerProperty({
+            xPosition: 0,
+            yPosition: STRIP_IMG_H + STRIP_GAP,
+            width: W,
+            height: H - STRIP_IMG_H - STRIP_GAP,
+            containerID: BODY_ID,
+            containerName: 'list',
+            isEventCapture: 1,
+            borderWidth: FRAME.width,
+            borderColor: FRAME.color,
+            borderRadius: FRAME.radius,
+            paddingLength: 6,
+            itemContainer: new ListItemContainerProperty({
+              itemCount: items.length,
+              itemWidth: 0,
+              isItemSelectBorderEn: 1,
+              itemName: items,
+            }),
+          }),
+        ],
+        imageObject: [imageBox(IMG_L_ID, 'imgl', 0), imageBox(IMG_R_ID, 'imgr', STRIP_IMG_W)],
+      })
+      if (!ok) return
+      this.kind = 'stripList'
+      this.curItemsSig = sig
+      this.curItems = items
+      this.curBody = ''
+      this.curImg = {}
+      this.curStrip = ''
+      this.onListRebuild?.() // firmware highlight is back at row 0 now
+    }
+    await this.paintStrip(layout.status, layout.settings, layout.fitSettings)
+  }
+
+  /** Bring the page's text containers to the brightness `dim` asks for. */
+  private async applyTextDim(): Promise<void> {
+    const level = Math.round(this.dim * 4)
+    if (level === this.curTextLevel) return
+    const boxes: [number, string, string][] =
+      this.kind === 'scroll'
+        ? [[HDR_ID, 'hdr', this.curHeader], [BODY_ID, 'body', this.curBody], [FTR_ID, 'ftr', this.curFooter]]
+        : this.kind === 'list'
+          ? [[HDR_ID, 'hdr', this.curHeader]]
+          : this.kind === 'text'
+            ? [[BODY_ID, 'display', this.curText]]
+            : this.kind === 'strip'
+              ? [[BODY_ID, 'body', this.curBody], ...(this.curHasFooter ? [[FTR_ID, 'ftr', this.curFooter] as [number, string, string]] : [])]
+              : []
+    for (const [id, name, content] of boxes) {
+      if (!(await this.upgrade(id, name, content, level))) return
+    }
+    this.curTextLevel = level
+  }
+
+  /** Draw the strip and send the halves whose pixels changed. Both are drawn
+   *  before either is sent, so two halves land back to back. A newer layout
+   *  waiting in the queue stops it before a send: text is never held up
+   *  behind an image, and that layout repaints the strip. */
+  private async paintStrip(status: StripLines, settings: StripLines, fitSettings = false): Promise<void> {
+    const sig = [...status, ...settings, fitSettings, this.dim].join('\n')
+    if (sig === this.curStrip) return
+    let halves: [Uint8Array, Uint8Array]
+    try {
+      halves = await stripHalves(status, settings, fitSettings, this.dim)
+    } catch (err) {
+      console.error('[glasses] image strip draw failed:', err)
+      this.imageFailed()
+      return
+    }
+    for (const [i, id, name] of [[0, IMG_L_ID, 'imgl'], [1, IMG_R_ID, 'imgr']] as const) {
+      if (sameBytes(this.curImg[id], halves[i])) continue
+      // Text waiting behind this (a transcript, a status) goes first; the
+      // strip is repainted when that layout applies.
+      if (this.pending) return
+      if (!(await this.sendImage(id, name, halves[i]))) return
+      this.curImg[id] = halves[i]
+    }
+    this.curStrip = sig
+  }
+
+  /** Send one drawn strip half. A failure invalidates the page; repeated
+   *  failures switch strips to text for the rest of the run. */
+  private async sendImage(id: number, name: string, greys: Uint8Array): Promise<boolean> {
+    let result: ImageRawDataUpdateResult | null = null
+    try {
+      result = await this.timed(
+        this.bridge.updateImageRawData(new ImageRawDataUpdate({ containerID: id, containerName: name, imageData: Array.from(greys) })),
+      )
+    } catch (err) {
+      console.error(`[glasses] image strip ${name} failed:`, err)
+    }
+    if (result !== null && ImageRawDataUpdateResult.isSuccess(result)) {
+      this.imageFailures = 0
+      return true
+    }
+    console.warn(`[glasses] updateImageRawData(${name}) failed (${result ?? 'timed out'})`)
+    this.imageFailed()
+    return false
+  }
+
+  private imageFailed(): void {
+    this.imageFailures += 1
+    if (this.imageFailures >= IMAGE_FAILURES_MAX) {
+      console.warn('[glasses] image strips off for this run; using text strips')
+      this.noImages = true
+    }
+    this.invalidate()
+  }
+
   // ── low-level bridge calls ─────────────────────────────────────────────
   // Both return whether the write was APPLIED; the callers commit their state
   // mirror only then. On a rejection or a timed-out bridge promise the mirror is
@@ -338,12 +589,12 @@ export class GlassesDisplay {
     if (ok !== true) {
       console.warn('[glasses] rebuildPageContainer rejected/timed out — layout not applied')
       this.invalidate()
-    }
+    } else this.curTextLevel = 4 // a rebuilt page's text is at the default brightness
     return ok === true
   }
 
-  private async upgrade(containerID: number, containerName: string, content: string): Promise<boolean> {
-    const ok = await this.timed(this.bridge.textContainerUpgrade(new TextContainerUpgrade({ containerID, containerName, content })))
+  private async upgrade(containerID: number, containerName: string, content: string, textColor?: number): Promise<boolean> {
+    const ok = await this.timed(this.bridge.textContainerUpgrade(new TextContainerUpgrade({ containerID, containerName, content, textColor })))
     if (ok !== true) {
       console.warn(`[glasses] textContainerUpgrade(${containerName}) rejected/timed out — content not applied`)
       this.invalidate()
@@ -352,7 +603,7 @@ export class GlassesDisplay {
   }
 
   /** Race a bridge write against BRIDGE_CALL_TIMEOUT_MS (null = timed out). */
-  private timed(p: Promise<boolean>): Promise<boolean | null> {
+  private timed<T>(p: Promise<T>): Promise<T | null> {
     return Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), BRIDGE_CALL_TIMEOUT_MS))])
   }
 
@@ -365,6 +616,8 @@ export class GlassesDisplay {
     this.curFooter = ''
     this.curItemsSig = ''
     this.curItems = []
+    this.curImg = {}
+    this.curStrip = ''
   }
 
   /** Tear down the glasses page (exit the app). 0 = exit immediately;
@@ -401,6 +654,14 @@ const strip = (y: number, h: number): Box => ({ x: 0, y, w: W, h, pad: 6 })
 // header above and the footer below, so the three bands never blur together.
 // (borderColor is a 0–15 gray; 0 is invisible, 15 white — 8 reads as a hairline.)
 export const FRAME = { width: 1, color: 8, radius: 8 } as const
+
+function sameBytes(a: Uint8Array | undefined, b: Uint8Array): boolean {
+  return a !== undefined && a.length === b.length && a.every((v, i) => v === b[i])
+}
+
+function imageBox(id: number, name: string, x: number): ImageContainerProperty {
+  return new ImageContainerProperty({ xPosition: x, yPosition: 0, width: STRIP_IMG_W, height: STRIP_IMG_H, containerID: id, containerName: name })
+}
 
 function textBox(
   id: number,
@@ -511,6 +772,9 @@ const DEFAULT_ADVANCE = 12
 /** What one row of a header / footer strip holds: its 564 px inside the
  *  padding, less a margin for the measuring. */
 const STRIP_TEXT_PX = 552
+/** What one row of the session body holds: its 560 px inside the padding,
+ *  less the same margin. */
+const BODY_TEXT_PX = 548
 
 /** The width of `s` in the firmware font, in px. */
 export function textWidth(s: string): number {
@@ -519,24 +783,29 @@ export function textWidth(s: string): number {
   return px
 }
 
-/** The rows `text` takes in a header strip. Wrapped at spaces only, where the
- *  firmware may also break after punctuation, so this never counts too few; a
- *  word wider than a row is broken across rows. */
-export function stripRows(text: string): number {
+/** The rows `text` takes in a header strip (or rows `rowPx` wide). Wrapped at
+ *  spaces only, where the firmware may also break after punctuation, so this
+ *  never counts too few; a word wider than a row is broken across rows. */
+export function stripRows(text: string, rowPx = STRIP_TEXT_PX): number {
   let rows = 1
   let used = 0
   for (const word of text.split(' ')) {
     const px = textWidth(word)
     const need = used ? px + textWidth(' ') : px
-    if (used + need <= STRIP_TEXT_PX) {
+    if (used + need <= rowPx) {
       used += need
       continue
     }
     if (used) rows++ // the word starts a new row…
-    rows += Math.floor(Math.max(0, px - 1) / STRIP_TEXT_PX) // …and may fill more than one
-    used = px ? ((px - 1) % STRIP_TEXT_PX) + 1 : 0
+    rows += Math.floor(Math.max(0, px - 1) / rowPx) // …and may fill more than one
+    used = px ? ((px - 1) % rowPx) + 1 : 0
   }
   return rows
+}
+
+/** The rows one line of `text` takes in the session body. */
+export function bodyRows(text: string): number {
+  return stripRows(text, BODY_TEXT_PX)
 }
 
 /** Whether `text` fits on one row of a header strip. */

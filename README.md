@@ -44,6 +44,11 @@ on the glasses, but messages send intact.
   context and plan usage, and model, mode, or effort changes.
 - **Double-tap** to go back, cancel dictation, or set a prompt aside. Reopen
   deferred prompts from Compose.
+- **Long press** on session output to start dictating; tap when done. On the
+  review before sending, a long press dictates more onto the message.
+- **Settings**, the last row of the session list: blank the screen after a
+  delay, wake it by tilting your head, and show a notice when a session
+  finishes or waits on you.
 - **Prompts** list Allow and Deny, or a question's options. Details shows the
   whole command or question before you answer. A pick-any question marks each
   option you tap. Submit sends the selection. Type an Other answer on the phone

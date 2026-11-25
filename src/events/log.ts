@@ -163,17 +163,17 @@ export class EventLog {
    * rows empty: a finished turn showed its `done` line and none of the answer
    * above it.)
    */
-  tailRows(maxRows: number, charsPerRow: number, maxBytes: number): string {
+  tailRows(maxRows: number, rowsOf: (line: string) => number, maxBytes: number): string {
     const out: string[] = []
     let rows = 0
     let bytes = 0
     for (let i = this.lines.length - 1; i >= 0; i--) {
       const line = this.lines[i]
       if (!line) continue // inter-event spacer
-      const cost = Math.max(1, Math.ceil(line.length / charsPerRow))
+      const cost = rowsOf(line)
       const size = byteLen(line) + (out.length > 0 ? 1 : 0)
       if (rows + cost > maxRows || bytes + size > maxBytes) {
-        const end = clippedEnd(line, (maxRows - rows) * charsPerRow, maxBytes - bytes - 1)
+        const end = clippedEnd(line, maxRows - rows, maxBytes - bytes - 1, rowsOf)
         if (end) out.push(end)
         break
       }
@@ -235,12 +235,15 @@ export class EventLog {
  * whole word when one begins soon enough, never on half a surrogate pair, and
  * keeps the line's lead glyph (`» ...the last of it`).
  */
-function clippedEnd(line: string, chars: number, bytes: number): string {
+function clippedEnd(line: string, rows: number, bytes: number, rowsOf: (line: string) => number): string {
   const lead = LEADS.find((g) => line.startsWith(`${g} `))
   const head = lead ? `${lead} ${HUD.ELL}` : HUD.ELL
   const room = bytes - byteLen(head)
-  if (chars <= head.length || room <= 0) return ''
-  let end = clampBytes(line.slice(head.length - chars), room, 'tail')
+  if (rows <= 0 || room <= 0) return ''
+  // No row holds more than ~140 of the narrowest glyph; start there and drop
+  // from the front until the clipped end fits the rows left.
+  let end = clampBytes(line.slice(-rows * 140), room, 'tail')
+  while (end && rowsOf(`${head}${end}`) > rows) end = end.slice(Math.max(1, Math.floor(end.length / 50)))
   const first = end.charCodeAt(0)
   if (first >= 0xdc00 && first <= 0xdfff) end = end.slice(1) // the back half of a pair
   const word = end.indexOf(' ') + 1
