@@ -30,7 +30,7 @@ import type {
   WorkerState,
 } from './rc/types'
 import type { Notice } from './notices'
-import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS, isSlashInput, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, STT_LANGUAGE, isSttLanguage, loadRuntimeSettings, saveRuntimeSettings, type RuntimeSettings } from './config'
+import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS, isSlashInput, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, STT_LANGUAGE, isSttLanguage, loadRuntimeSettings, saveRuntimeSettings, type RuntimeSettings, type SttSource } from './config'
 import { cleanUserEcho, isQuestionRequest, settingsLine, workerNotes, rateLimitLabel, systemActivity } from './events/format'
 
 /** A side question on show: asking (answer + error null), answered, or failed. */
@@ -162,6 +162,10 @@ function formatInput(input: Record<string, unknown> | null): string {
   }
 }
 
+/** Starts the bridge with local dictation (its `local-stt` extra). */
+const LOCAL_STT_COMMAND =
+  'uvx --from "claude-remote-bridge[local-stt] @ git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge'
+
 export class Panel {
   // ── DOM refs, filled in by mount(); null until then. ──────────────────────
   private connChip: HTMLDivElement | null = null
@@ -264,10 +268,18 @@ export class Panel {
             <input id="setBridgeToken" class="set-input" type="password" autocapitalize="off"
               placeholder="${BRIDGE_TOKEN ? '(using built-in token)' : '(none set)'}" />
           </label>
+          <div class="field">
+            <span class="field-label">Dictation</span>
+            <div class="stt-source" role="radiogroup" aria-label="Dictation">
+              <button type="button" class="btn" role="radio" data-source="deepgram">Deepgram</button>
+              <button type="button" class="btn" role="radio" data-source="bridge">Bridge</button>
+            </div>
+          </div>
+          <div id="dictHint" class="settings-hint" hidden></div>
           <label class="field">
-            <span class="field-label">Deepgram API key (optional, for voice)</span>
+            <span class="field-label">Deepgram API key</span>
             <input id="setDeepgramKey" class="set-input" type="password" autocapitalize="off"
-              placeholder="${DEEPGRAM_API_KEY ? '(using built-in key)' : '(voice disabled)'}" />
+              placeholder="${DEEPGRAM_API_KEY ? '(using built-in key)' : '(none set)'}" />
           </label>
           <label class="field">
             <span class="field-label">Dictation language (Deepgram code: en, de, fr, multi…)</span>
@@ -501,7 +513,11 @@ ${settingsHtml}
       if (token) token.value = s.bridgeToken ?? ''
       if (dg) dg.value = s.deepgramApiKey ?? ''
       if (lang) lang.value = s.sttLanguage ?? ''
+      this.pickSource(s.sttSource === 'bridge' ? 'bridge' : 'deepgram')
     }
+    root.querySelectorAll<HTMLButtonElement>('.stt-source [data-source]').forEach((b) =>
+      b.addEventListener('click', () => this.pickSource(b.dataset.source === 'bridge' ? 'bridge' : 'deepgram')),
+    )
     this.toggleSettings = () => {
       if (!card) return
       if (card.hidden) fill(loadRuntimeSettings())
@@ -523,6 +539,7 @@ ${settingsHtml}
         bridgeToken: token?.value ?? '',
         deepgramApiKey: dg?.value ?? '',
         sttLanguage: language,
+        sttSource: this.cardSource,
       })
       if (card) card.hidden = true
       this.cb.onApplySettings()
@@ -697,6 +714,11 @@ ${settingsHtml}
 
   // ── Header / connection ─────────────────────────────────────────────────
   setConnection(info: { bridge: 'ok' | 'down' | 'connecting'; whoami?: WhoAmI; origin: string; state: string }): void {
+    // Only the connect check carries whoami; keep its answer for the redraws.
+    if (info.whoami) {
+      this.bridgeStt = info.whoami.local_stt === true
+      this.renderDictHint()
+    }
     if (this.connChip) {
       this.connChip.className = `chip-conn ${info.bridge}`
       const login = info.whoami && !info.whoami.logged_in ? ' · logged out' : ''
@@ -704,6 +726,48 @@ ${settingsHtml}
       this.connChip.title = `${info.origin} · ${info.state}`
     }
     if (this.originEl) this.originEl.textContent = info.origin
+  }
+
+  /** Whether the connected bridge transcribes dictation, once known. */
+  private bridgeStt: boolean | null = null
+  /** The transcriber picked in the open Settings card (saved on Save). */
+  private cardSource: SttSource = 'deepgram'
+
+  /** Pick a transcriber in the Settings card: mark it, and enable the
+   *  Deepgram fields only for Deepgram. */
+  private pickSource(source: SttSource): void {
+    this.cardSource = source
+    document.querySelectorAll<HTMLButtonElement>('.stt-source [data-source]').forEach((b) => {
+      const on = b.dataset.source === source
+      b.classList.toggle('primary', on)
+      b.setAttribute('aria-checked', String(on))
+    })
+    for (const id of ['setDeepgramKey', 'setSttLanguage']) {
+      const input = document.getElementById(id) as HTMLInputElement | null
+      if (input) input.disabled = source === 'bridge'
+    }
+    this.renderDictHint()
+  }
+
+  /** Under the transcriber choice, for "Bridge": whether the bridge's
+   *  host has local dictation, and how to turn it on if not. */
+  private renderDictHint(): void {
+    const el = document.getElementById('dictHint')
+    if (!el) return
+    el.replaceChildren()
+    el.hidden = this.cardSource !== 'bridge'
+    if (el.hidden) return
+    if (this.bridgeStt) {
+      el.textContent = 'Local dictation is ready on the bridge. It transcribes English.'
+    } else if (this.bridgeStt === false) {
+      el.append('The bridge has no local dictation yet. Restart it with:')
+      const cmd = document.createElement('code')
+      cmd.className = 'notice-cmd dict-cmd'
+      cmd.textContent = LOCAL_STT_COMMAND
+      el.append(cmd)
+    } else {
+      el.textContent = 'Connect to the bridge to check whether it has local dictation.'
+    }
   }
 
   /** main.ts has restored the saved settings from the App-side store (or found
@@ -1568,6 +1632,10 @@ function injectStyles(): void {
     .notice-body { font-size: 13px; font-weight: 400; color: var(--tc-2nd); line-height: 1.45; }
     .notice.important .notice-body { color: var(--tc-1st); }
     /* Copy-ready command: 8% fill, tap selects the whole line for copying. */
+    .dict-cmd { display: block; margin-top: 6px; }
+    .stt-source { display: flex; gap: 6px; }
+    .stt-source .btn { flex: 1; }
+    .set-input:disabled { opacity: .45; }
     .notice-cmd { font: 400 12px/1.5 var(--mono); letter-spacing: 0; color: var(--tc-1st);
       background: var(--sc-2nd); border-radius: var(--r-in); padding: 8px 10px;
       word-break: break-all; user-select: all; -webkit-user-select: all; }

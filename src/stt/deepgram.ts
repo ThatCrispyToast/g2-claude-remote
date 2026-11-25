@@ -24,7 +24,8 @@ import {
   currentSttLanguage,
 } from '../config'
 
-export type CaptionerStatus = 'connecting' | 'live' | 'reconnecting' | 'stopped'
+/** `downloading model`: the bridge is fetching its dictation model (first use). */
+export type CaptionerStatus = 'connecting' | 'downloading model' | 'live' | 'reconnecting' | 'stopped'
 
 export interface CaptionerHandlers {
   /** A finalized caption segment — append it to the transcript. */

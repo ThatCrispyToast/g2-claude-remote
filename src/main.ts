@@ -50,6 +50,7 @@ import {
   type SubmenuKind,
 } from './input/compose'
 import { VoiceDictation, type VoiceStatus } from './input/voice'
+import { currentSttSource, setBridgeDictation } from './config'
 import { Panel, type AsideView } from './ui'
 
 type State =
@@ -386,6 +387,7 @@ class App {
     try {
       const who = await this.rc.whoami()
       this.connBridge = 'ok'
+      setBridgeDictation(who.local_stt === true)
       this.panel.setConnection({ bridge: 'ok', whoami: who, origin: this.origin, state: this.state })
       if (!who.logged_in) {
         return this.fail(`Not logged in to Claude on the box.\n${who.error ?? ''}`)
@@ -1515,7 +1517,7 @@ class App {
 
   private async startVoice(purpose: VoicePurpose, from: 'panel' | 'glasses'): Promise<void> {
     if (!this.voice?.available) {
-      this.panel.setToast('Voice dictation needs a Deepgram key.')
+      this.panel.setToast(currentSttSource() === 'bridge' ? 'Local dictation is not running on the bridge.' : 'Voice dictation needs a Deepgram key.')
       return
     }
     if (purpose === 'send' || purpose === 'aside') this.promptReply = null
@@ -1541,6 +1543,9 @@ class App {
         // 'idle' only passes through on the way out (a stop, or just before an
         // error), so it never reaches the header.
         else if (s !== 'idle' && s !== this.voiceStatus) {
+          if (s === 'downloading model') {
+            this.panel.setToast('First use: the bridge is downloading the dictation model. Dictation starts once it is ready, which can take a few minutes.', 8000)
+          }
           this.voiceStatus = s
           if (this.state === 'voice') this.render()
         }

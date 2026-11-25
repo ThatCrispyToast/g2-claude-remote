@@ -21,6 +21,13 @@ dependencies = [
     "claude-rc-api @ git+https://github.com/ThatCrispyToast/claude-rc-api",
 ]
 
+[project.optional-dependencies]
+# Dictation transcribed on the bridge host: MLX on Apple Silicon, CTranslate2 elsewhere.
+local-stt = [
+    "mlx-whisper>=0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "faster-whisper>=1.1; sys_platform != 'darwin' or platform_machine != 'arm64'",
+]
+
 [project.urls]
 Repository = "https://github.com/ThatCrispyToast/g2-claude-remote"
 Issues = "https://github.com/ThatCrispyToast/g2-claude-remote/issues"

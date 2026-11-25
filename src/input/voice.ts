@@ -1,10 +1,11 @@
 // Voice dictation — the keyboard-free text-input path for the G2.
 //
 // On a keyboard-less device, speech is the only way to compose a free-form
-// message. This is a thin orchestrator over the Deepgram LiveCaptioner: it opens
-// the glasses mic (`bridge.audioControl(true)`), streams the mic's PCM frames to
-// Deepgram, accumulates the committed (final) transcript, and surfaces the live
-// interim so the wearer sees words land as they speak. `stop()` returns the
+// message. This is a thin orchestrator over a captioner (Deepgram's LiveCaptioner
+// with a key, else the bridge's BridgeCaptioner): it opens the glasses mic
+// (`bridge.audioControl(true)`), streams the mic's PCM frames to it, accumulates
+// the committed (final) transcript, and surfaces the live interim so the wearer
+// sees words land as they speak. `stop()` returns the
 // finished transcript, which main.ts hands to the bridge as a message.
 //
 // main.ts owns the single `bridge.onEvenHubEvent` subscription and forwards each
@@ -12,10 +13,11 @@
 // to bridge events itself.
 
 import type { EvenAppBridge } from '@evenrealities/even_hub_sdk'
-import { MIC_SILENCE_TIMEOUT_MS, voiceEnabled, currentDeepgramKey } from '../config'
-import { LiveCaptioner, type CaptionerStatus } from '../stt/deepgram'
+import { MIC_SILENCE_TIMEOUT_MS, voiceEnabled, currentDeepgramKey, currentSttSource } from '../config'
+import { LiveCaptioner, type CaptionerHandlers, type CaptionerStatus } from '../stt/deepgram'
+import { BridgeCaptioner } from '../stt/bridge'
 
-export type VoiceStatus = 'idle' | 'connecting' | 'listening' | 'reconnecting' | 'error'
+export type VoiceStatus = 'idle' | 'connecting' | 'downloading model' | 'listening' | 'reconnecting' | 'error'
 
 /** A mic call is a BLE round trip, and a close whose reply never comes must not
  *  wedge stop()/cancel() — nor the finish waiting on them. Past this they carry
@@ -39,6 +41,8 @@ function toVoiceStatus(s: CaptionerStatus): VoiceStatus {
   switch (s) {
     case 'connecting':
       return 'connecting'
+    case 'downloading model':
+      return 'downloading model'
     case 'live':
       return 'listening'
     case 'reconnecting':
@@ -49,7 +53,7 @@ function toVoiceStatus(s: CaptionerStatus): VoiceStatus {
 }
 
 export class VoiceDictation {
-  private captioner: LiveCaptioner | null = null
+  private captioner: LiveCaptioner | BridgeCaptioner | null = null
   private handlers: VoiceHandlers | null = null
   /** Set synchronously across start()'s awaits to reject re-entrant starts. */
   private starting = false
@@ -68,8 +72,8 @@ export class VoiceDictation {
 
   constructor(private readonly bridge: EvenAppBridge) {}
 
-  /** True when Deepgram is configured — otherwise dictation is a no-op. Read live
-   *  so a key entered in the Settings card enables voice without a reload. */
+  /** True when the chosen transcriber is usable (a Deepgram key, or a bridge
+   *  that transcribes) — otherwise dictation is a no-op. Read live so a Settings-card change applies without a reload. */
   get available(): boolean {
     return voiceEnabled()
   }
@@ -77,7 +81,7 @@ export class VoiceDictation {
   /**
    * Open the mic and start dictating. Interims stream through `handlers.onInterim`
    * and lifecycle through `handlers.onStatus`. If voice isn't available (no
-   * Deepgram key) this reports `'error'` and does nothing else.
+   * usable transcriber) this reports `'error'` and does nothing else.
    */
   async start(handlers: VoiceHandlers): Promise<void> {
     this.handlers = handlers
@@ -119,7 +123,7 @@ export class VoiceDictation {
     }
 
     this.lastPcmAt = performance.now()
-    this.captioner = new LiveCaptioner(currentDeepgramKey(), {
+    const captionerHandlers: CaptionerHandlers = {
       onFinal: (text) => {
         this.finals = this.finals ? `${this.finals} ${text}` : text
         this.interim = ''
@@ -133,10 +137,15 @@ export class VoiceDictation {
         this.handlers?.onStatus(toVoiceStatus(s))
       },
       onFatal: (message) => {
-        console.error('[voice] deepgram fatal:', message)
+        console.error('[voice] dictation fatal:', message)
         this.handlers?.onStatus('error', message)
       },
-    })
+    }
+    // The transcriber chosen in the Settings card.
+    this.captioner =
+      currentSttSource() === 'bridge'
+        ? new BridgeCaptioner(captionerHandlers)
+        : new LiveCaptioner(currentDeepgramKey(), captionerHandlers)
 
     // Watchdog: the mic sometimes closes silently on the glasses. If no PCM has
     // arrived for a while, ask the bridge to reopen it (best effort).

@@ -234,6 +234,8 @@ export interface WhoAmI {
   org_uuid_present?: boolean
   token_len?: number
   error?: string
+  /** The bridge can transcribe dictation itself (its `local-stt` extra). */
+  local_stt?: boolean
 }
 
 /** A typed bridge error (`{error, status}`); status 409 = session not active. */

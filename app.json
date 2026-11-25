@@ -10,7 +10,7 @@
     { "name": "g2-microphone", "desc": "Dictate messages to a Claude session by voice from the glasses mic." },
     {
       "name": "network",
-      "desc": "Talk to your Claude Remote bridge, and stream voice dictation to Deepgram.",
+      "desc": "Talk to your Claude Remote bridge (which can transcribe dictation), and stream voice dictation to Deepgram.",
       "whitelist": [
         "*",
         "https://claude.ai",

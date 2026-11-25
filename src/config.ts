@@ -24,6 +24,9 @@ export interface RuntimeSettings {
   /** Deepgram language code for dictation (`en`, `de`, `multi`, …). Unset = the
    *  build default (see `STT_LANGUAGE`). */
   sttLanguage?: string
+  /** Where dictation is transcribed: Deepgram (unset, the default) or the
+   *  bridge's host (its `local-stt` extra). */
+  sttSource?: SttSource
   /** Ids of baked release notices already dismissed on this device (notices.ts).
    *  Rides the same blob so the main.ts SDK-store mirror persists it for free. */
   seenNotices?: string[]
@@ -51,6 +54,7 @@ export function saveRuntimeSettings(s: RuntimeSettings): void {
     if (s.bridgeToken?.trim()) clean.bridgeToken = s.bridgeToken.trim()
     if (s.deepgramApiKey?.trim()) clean.deepgramApiKey = s.deepgramApiKey.trim()
     if (s.sttLanguage?.trim()) clean.sttLanguage = s.sttLanguage.trim()
+    if (s.sttSource === 'bridge') clean.sttSource = 'bridge'
     // Seen-notice ids are NOT connection settings: the Settings card's Save and
     // Reset pass only their own fields, and neither may resurrect notices the
     // wearer already dismissed — so when the caller doesn't provide the list
@@ -285,14 +289,26 @@ export function currentSttLanguage(): string {
 export function isSttLanguage(code: string): boolean {
   return /^(multi|[a-z]{2,3}(-[a-z0-9]{2,8})*)$/i.test(code)
 }
-/** Master switch for voice dictation (also needs the Deepgram key). */
+/** Master switch for voice dictation. */
 const VOICE_MASTER = boolEnv(env.VITE_VOICE_ENABLED, true)
-/** Live voice availability: the master switch plus a Deepgram key entered in the
- *  Settings card (so adding a key enables voice without a reload). Always ask
- *  this — there is no load-time snapshot, because a key saved in the Settings
- *  card must enable voice without a reload. */
+export type SttSource = 'deepgram' | 'bridge'
+/** Where dictation is transcribed RIGHT NOW (re-reads saved settings). */
+export function currentSttSource(): SttSource {
+  return loadRuntimeSettings().sttSource === 'bridge' ? 'bridge' : 'deepgram'
+}
+/** Whether the connected bridge transcribes dictation (its whoami's
+ *  `local_stt`), set on every (re)connect. */
+let bridgeDictation = false
+export function setBridgeDictation(on: boolean): void {
+  bridgeDictation = on
+}
+/** Live voice availability: the master switch plus the chosen transcriber
+ *  being usable, a Deepgram key or a bridge that transcribes. Read live, so a
+ *  Settings-card change, or a reconnect to another bridge, applies without a
+ *  reload. */
 export function voiceEnabled(): boolean {
-  return VOICE_MASTER && currentDeepgramKey().length > 0
+  if (!VOICE_MASTER) return false
+  return currentSttSource() === 'bridge' ? bridgeDictation : currentDeepgramKey().length > 0
 }
 
 /** G2 mic format is fixed: PCM signed-16 little-endian, mono, 16 kHz. */
