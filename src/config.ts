@@ -97,15 +97,16 @@ export function saveRuntimeSettings(s: RuntimeSettings): void {
     if (s.deepgramApiKey?.trim()) clean.deepgramApiKey = s.deepgramApiKey.trim()
     if (s.sttLanguage?.trim()) clean.sttLanguage = s.sttLanguage.trim()
     if (s.sttSource === 'bridge') clean.sttSource = 'bridge'
-    // Seen-notice ids are NOT connection settings: the Settings card's Save and
+    // Seen-notice ids are NOT connection settings: the Settings screen's Save and
     // Reset pass only their own fields, and neither may resurrect notices the
     // wearer already dismissed — so when the caller doesn't provide the list
     // (only notices.ts does), carry the stored one forward.
     const seen = s.seenNotices ?? loadRuntimeSettings().seenNotices
     const ids = (Array.isArray(seen) ? seen : []).filter((v) => typeof v === 'string' && v).slice(0, 50)
     if (ids.length > 0) clean.seenNotices = ids
-    // Display settings come from the glasses, not the Settings card: carried
-    // forward like the notice ids when the caller doesn't pass them.
+    // Display settings are saved on their own (saveDisplaySettings), never by
+    // the Settings screen's Save: carried forward like the notice ids when the
+    // caller doesn't pass them.
     const display = s.display ?? loadRuntimeSettings().display
     if (display && typeof display === 'object') clean.display = display
     if (Object.keys(clean).length === 0) window.localStorage?.removeItem(SETTINGS_KEY)
@@ -147,7 +148,7 @@ function resolveBridgeToken(s: RuntimeSettings): string {
   return strEnv(s.bridgeToken ?? env.VITE_BRIDGE_TOKEN, '')
 }
 /**
- * The build's bridge URL, used when none is saved in the Settings card (the
+ * The build's bridge URL, used when none is saved in the Settings screen (the
  * dev-only `VITE_` value, else localhost). No trailing slash. A wearer saves a
  * name the phone can reach from anywhere — e.g. the host's Tailscale MagicDNS
  * name (`http://my-box.tailXXXX.ts.net:8790`) or a LAN IP. Like the token and
@@ -160,7 +161,7 @@ export const BRIDGE_URL = resolveBridgeUrl({})
  *  headers). */
 export const BRIDGE_TOKEN = resolveBridgeToken({})
 
-/** The bridge URL + token RIGHT NOW, re-reading saved settings so a Settings-card
+/** The bridge URL + token RIGHT NOW, re-reading saved settings so a Settings-screen
  *  change applies WITHOUT a full page reload (a reload drops the Even glasses
  *  bridge). The consts above are the build defaults; this is the live view. */
 export function currentBridge(): { url: string; token: string } {
@@ -170,7 +171,7 @@ export function currentBridge(): { url: string; token: string } {
 
 /** Whether a bridge has been configured at all — a saved setting OR a dev-only
  *  `VITE_` value. When false and the first connection fails, the app shows the
- *  first-run setup screen (point the wearer at the panel's Settings card) rather
+ *  first-run setup screen (point the wearer at the panel's Settings screen) rather
  *  than a raw connection error. Live, so it re-evaluates after a settings save. */
 export function isBridgeConfigured(): boolean {
   const s = loadRuntimeSettings()
@@ -321,12 +322,12 @@ export function currentDeepgramKey(): string {
 }
 export const DEEPGRAM_MODEL = strEnv(env.VITE_DEEPGRAM_MODEL, 'nova-3')
 /** The build's dictation language: the Deepgram `?language=` code used when none
- *  is saved in the Settings card (`en`, unless the dev-only `VITE_` var says
+ *  is saved in the Settings screen (`en`, unless the dev-only `VITE_` var says
  *  otherwise). It is that field's placeholder, so it must NOT fold in the saved
  *  value — a blank field falls back to exactly this. */
 export const STT_LANGUAGE = strEnv(env.VITE_STT_LANGUAGE, 'en')
 /** The dictation language RIGHT NOW (re-reads saved settings — see `currentBridge`),
- *  so a language saved in the Settings card applies to the next dictation without
+ *  so a language saved in the Settings screen applies to the next dictation without
  *  a reload. */
 export function currentSttLanguage(): string {
   return strEnv(loadRuntimeSettings().sttLanguage, STT_LANGUAGE)
@@ -354,7 +355,7 @@ export function setBridgeDictation(on: boolean): void {
 }
 /** Live voice availability: the master switch plus the chosen transcriber
  *  being usable, a Deepgram key or a bridge that transcribes. Read live, so a
- *  Settings-card change, or a reconnect to another bridge, applies without a
+ *  Settings-screen change, or a reconnect to another bridge, applies without a
  *  reload. */
 export function voiceEnabled(): boolean {
   if (!VOICE_MASTER) return false

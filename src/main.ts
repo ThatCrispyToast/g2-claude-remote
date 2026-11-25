@@ -371,6 +371,22 @@ export class App {
       onLoadInfo: () => void this.loadInfo(),
       onStopTask: (id) => void this.stopTask(id),
       onApplySettings: () => void this.applySettings(),
+      onSetDisplay: (patch) => {
+        saveDisplaySettings(patch)
+        void this.persistSettings()
+        this.syncImu()
+        this.render()
+        this.panel.refreshDisplaySettings()
+      },
+      onCalibrateTilt: () => {
+        if (!this.glasses || this.glasses.unavailable) {
+          this.panel.setToast('Connect the glasses to set up head tilt.')
+          this.panel.refreshDisplaySettings()
+          return
+        }
+        this.panel.setToast('Continue on the glasses: hold your head in its normal position, then tap.', 5000)
+        this.startCalibration()
+      },
       onDismissNotice: (id) => this.dismissNotice(id),
       onExit: () => void this.exit(),
     })
@@ -387,7 +403,7 @@ export class App {
 
     // Restore panel-saved settings from the durable App-side store FIRST: before
     // the first connect, so a reopened app reconnects on its own, and before
-    // glasses.init() — the Settings card stays shut until this lands
+    // glasses.init() — the Settings screen stays shut until this lands
     // (Panel.settingsLoaded), so it may wait on nothing but this one bounded read.
     try {
       await this.hydrateSettings()
@@ -454,7 +470,7 @@ export class App {
     }
   }
 
-  /** Re-apply connection settings saved from the panel Settings card WITHOUT a
+  /** Re-apply connection settings saved from the panel Settings screen WITHOUT a
    *  page reload. A `location.reload()` tears down the WebView, which drops the
    *  Even glasses bridge — the fresh boot's `createStartUpPageContainer` then
    *  no-ops against the page still on the HUD, so renders are silently dropped and
@@ -502,7 +518,7 @@ export class App {
     }
     window.localStorage?.setItem(SETTINGS_KEY, stored)
     this.useCurrentBridge()
-    // The Settings card can open as soon as this returns, well before the first
+    // The Settings screen can open as soon as this returns, well before the first
     // connect: show the restored origin, not the load-time default.
     this.panel.setConnection({ bridge: this.connBridge, origin: this.origin, state: this.state })
   }
@@ -2362,6 +2378,7 @@ export class App {
             : { notifyDone: item.value === 'on' }
       saveDisplaySettings(patch)
       void this.persistSettings()
+      this.panel.refreshDisplaySettings()
     }
     this.openSettings()
   }
@@ -2414,6 +2431,7 @@ export class App {
     }
     saveDisplaySettings({ lookCal: { rest, read: v }, lookWake: true })
     void this.persistSettings()
+    this.panel.refreshDisplaySettings()
     this.headUp = true // the head is in the waking position right now
     this.openSettings()
   }

@@ -7,7 +7,7 @@ notes and sharp edges.
 
 Ship model: the client is distributed as a prebuilt `.ehpk`; the bridge runs on
 any host logged in to Claude Code. Builds carry NO configuration at all — every
-pack is a distribution pack — so the panel's Settings card (runtime settings in
+pack is a distribution pack — so the panel's Settings screen (runtime settings in
 localStorage) is the end-user config path, and no secret may ever be required
 at build time.
 
@@ -61,7 +61,7 @@ at build time.
    surfaced by the bridge as `RcEvent.workerState` and merged by main.ts
    (`noteEvent` — a status event carries only the mode, so its nulls must never
    erase the model or effort). The header, the Mode / Effort marks, and the
-   panel selects all read the merged state. Unknown stays blank: never guess
+   panel selectors all read the merged state. Unknown stays blank: never guess
    `default` (the pre-1.8.0 header claimed `default` for every session).
 
 ## Commands
@@ -494,10 +494,11 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   buttons (not misclick-prone), so they still send directly via `commitVoice` /
   `onSend`; don't add a panel confirm. The voice screen's tap now **reviews**
   (`reviewDictation`, footer `tap = done`), it no longer sends — `commitVoice`
-  survives only for the panel's Stop button. A second "done" while the first
-  is still finishing (mic close + Deepgram flush) is ignored, per dictation
-  run (`finishingRun`; a finish a newer run overtook backs off too): a
-  double-clicked Stop used to send the transcript split across two messages.
+  survives only for the panel's mic button (stop dictating). A second "done"
+  while the first is still finishing (mic close + Deepgram flush) is ignored,
+  per dictation run (`finishingRun`; a finish a newer run overtook backs off
+  too): a double-clicked Stop used to send the transcript split across two
+  messages.
 - **A failed action is said on the glasses.** `onActionError` puts
   `! not sent: <reason>` (or `failed: …`) in the session footer for
   `HUD_NOTE_MS`, as well as the panel's toast. The toast was all there was, so
@@ -567,9 +568,9 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   store — that mirror is what makes "shown once" survive the WebView's
   localStorage eviction, so `dismissNotice` must keep calling
   `persistSettings`. Two invariants regression-tested via browser-test: a
-  seeded `seenNotices` hides the card at boot, and a Settings-card Save/Reset
+  seeded `seenNotices` hides the card at boot, and a Settings-screen Save/Reset
   carries `seenNotices` forward (`saveRuntimeSettings` reads the stored list
-  when the caller passes none — the card only knows its four fields; losing
+  when the caller passes none — the screen's Save only knows its own fields; losing
   that merge would resurrect every dismissed notice on the next settings save).
   Prune-on-dismiss keeps the blob bounded: ids not in the current baked list
   are dropped, so retiring old notices from the source is always safe.
@@ -600,11 +601,11 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   `VITE_` value required at build time — packs must work with none set. The
   `BRIDGE_URL` / `BRIDGE_TOKEN` / `DEEPGRAM_API_KEY` / `STT_LANGUAGE` consts are
   the bottom two layers only — never the saved value — because they are the
-  Settings card's placeholders, and its hint promises a blank field falls back
+  Settings screen's placeholders, and its hint promises a blank field falls back
   to the default shown in it. Anything that connects reads the live
   `current*()` accessors. (Until 1.8.2 the first three folded in the
   load-time saved settings, so a plain browser showed saved values there.)
-- **Panel settings persist via the SDK, not browser storage.** The Settings card
+- **Panel settings persist via the SDK, not browser storage.** The Settings screen
   saves to the WebView's `window.localStorage`, but the Even app EVICTS that
   between launches — so `main.ts` mirrors the same `claude-remote.settings` JSON
   into the SDK's App-side store (`bridge.set/getLocalStorage`, which persists
@@ -617,14 +618,14 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   come back empty (see panel-only mode), where localStorage persists on its own
   anyway. Without this the wearer re-enters the bridge URL + token on every
   reopen.
-- **The Settings card fills its inputs on every OPEN, never at mount — and
+- **The Settings screen fills its inputs on every OPEN, never at mount — and
   can't open before hydration.** `Panel.mount()` runs before
   `hydrateSettings()`, so on a reopened app the storage it sees is the evicted,
   empty one: a card prefilled at mount showed a connected app as blank, and a
   Save (say, to change only the dictation language) wrote those blanks over the
   restored bridge URL, token and key — and dropped `seenNotices`, resurrecting
   dismissed notices. `wireSettings`' `fill()` re-reads `loadRuntimeSettings()`
-  each time the card opens, and a tap before `Panel.settingsLoaded()` (called
+  each time the screen opens, and a tap before `Panel.settingsLoaded()` (called
   in a `finally` after hydration, so the gate can't stick) is held and served
   then. Keep both.
 - **The bridge reads `.env.local` too** (`RC_BRIDGE_*` keys; `VITE_BRIDGE_TOKEN`
@@ -633,12 +634,12 @@ python3 scripts/mock-bridge.py   # fictional sessions → localhost:8791 (any to
   `wordlist.py`, default 5 ≈ 52 bits) and persists it to
   `~/.config/claude-remote/bridge-token`; `--open` is the only unauthenticated
   mode. A user-set token is used verbatim.
-- **Dictation source** is chosen in the Settings card. Deepgram needs a key
-  from the card or the dev environment. Bridge dictation needs the optional
+- **Dictation source** is chosen in the Settings screen. Deepgram needs a key
+  from the Settings screen or the dev environment. Bridge dictation needs the optional
   `local-stt` dependency and `whoami.local_stt`. Numbered audio and finish
   requests replay their last acknowledgement. A failed finish preserves the
   visible transcript for review. Closing a session retires its dictation run.
-- **Dictation language** is the Settings card's `sttLanguage` (any Deepgram
+- **Dictation language** is the Settings screen's `sttLanguage` (any Deepgram
   code; `multi` = mixed-language speech), else `STT_LANGUAGE` — the build
   default `en`, which is also the field's placeholder (see Layering).
   `currentSttLanguage()` is read on every (re)connect. Save

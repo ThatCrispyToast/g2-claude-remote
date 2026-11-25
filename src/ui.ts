@@ -6,12 +6,16 @@
 // control the HUD offers AND the one it can't: a real free-text send box, since
 // the phone has a keyboard. It is push-only — main.ts feeds it state via the
 // flat setX() mirrors below; the panel never polls or talks to the bridge.
-// Styled to the Even Realities *Companion App* design system (their published
-// UIUX guidelines): a light system — #EEEEEE page, white cards, near-black
-// (#232323) text, #7B7B7B secondary, a pale-yellow (#FEF991) accent for
-// attention/ongoing actions, green (#4BB956) for connection status, red
-// (#FF453A) for warnings; grotesque type on a 24/20/17/15/13/11 scale (Regular
-// 400 titles, Light 300 body), 6px card radius, 12px margins. See injectStyles().
+//
+// Three screens (sessions, settings, session) and two bottom sheets over the
+// session (the blocking prompt, and the session controls), laid out after the
+// Even Realities Software Design Guidelines (the public Figma, APP pages):
+// #EEEEEE page, white cards and grouped lists without dividers, near-black
+// (#232323) text, #7B7B7B secondary, pale yellow (#FEF991) for an ongoing
+// action or something waiting on you, green (#4BB956) for connection status,
+// red text for destructive actions; a 24/20/17/15/13/11 type scale (400 titles,
+// 300 body), 6px radius, centred navigation titles, segmented selectors on a
+// #E4E4E4 track, pop-up sheets on a 50% black overlay. See injectStyles().
 // No framework. (The glasses HUD in glasses.ts is a separate, firmware-native
 // monochrome surface and is not governed by this doc.)
 
@@ -30,7 +34,7 @@ import type {
   WorkerState,
 } from './rc/types'
 import type { Notice } from './notices'
-import { EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS, isSlashInput, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, STT_LANGUAGE, isSttLanguage, loadRuntimeSettings, saveRuntimeSettings, type RuntimeSettings, type SttSource } from './config'
+import { BLANK_AFTER_CHOICES, EFFORTS, MODELS, MODES, QUICK_SENDS, SLASH_COMMANDS, isSlashInput, APP_TITLE, BRIDGE_URL, BRIDGE_TOKEN, DEEPGRAM_API_KEY, STT_LANGUAGE, displaySettings, isSttLanguage, loadRuntimeSettings, saveRuntimeSettings, type DisplaySettings, type RuntimeSettings, type SttSource } from './config'
 import { cleanUserEcho, isQuestionRequest, settingsLine, workerNotes, rateLimitLabel, systemActivity } from './events/format'
 
 /** A side question on show: asking (answer + error null), answered, or failed. */
@@ -58,11 +62,11 @@ export interface PanelCallbacks {
   onSend: (text: string) => void
   /** Interrupt the running turn. */
   onInterrupt: () => void
-  /** Model <select> changed. */
+  /** A model was picked in the session controls. */
   onSetModel: (model: string) => void
-  /** Mode <select> changed. */
+  /** A permission mode was picked in the session controls. */
   onSetMode: (mode: PermissionMode) => void
-  /** Effort <select> changed ('auto' | 'low' | 'medium' | 'high' | 'xhigh'). */
+  /** An effort was picked ('auto' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'). */
   onSetEffort: (effort: string) => void
   /** Archive the open session (main.ts confirms/executes; the button self-confirms too). */
   onArchive: (sid: string) => void
@@ -84,72 +88,89 @@ export interface PanelCallbacks {
   onAskAside: (question: string) => void
   /** The aside card's × — forget the shown exchange. */
   onDismissAside: () => void
-  /** Fetch plan usage + git changes for the session card. */
+  /** Fetch an older page of the open session's events. */
   onOlderEvents: (before: number) => Promise<HistoryPage | null>
+  /** Fetch plan usage + git changes for the session controls. */
   onLoadInfo: () => void
   /** Stop a running background task. */
   onStopTask: (taskId: string) => void
   /** Connection settings were saved (or reset) → reconnect in place (no reload). */
   onApplySettings: () => void
+  /** A glasses display setting changed in Settings (saved right away). */
+  onSetDisplay: (patch: Partial<DisplaySettings>) => void
+  /** Set up head tilt wake: the calibration runs on the glasses. */
+  onCalibrateTilt: () => void
   /** A release notice's × was tapped → record it seen and re-render (notices.ts). */
   onDismissNotice: (id: string) => void
   /** Leave the whole app. */
   onExit: () => void
 }
 
-/** How a worker-status string maps to a dot glyph + class. */
-function statusDot(worker: string): { glyph: string; cls: string; label: string } {
+type StatusKind = 'running' | 'action' | 'idle'
+
+/** How a worker-status string maps to a status kind + its label. */
+function statusOf(worker: string): { cls: StatusKind; label: string } {
   switch (worker) {
     case 'running':
-      return { glyph: '●', cls: 'running', label: 'running' }
+      return { cls: 'running', label: 'Running' }
     case 'requires_action':
-      return { glyph: '!', cls: 'action', label: 'needs you' }
+      return { cls: 'action', label: 'Waiting on you' }
     default:
-      return { glyph: '○', cls: 'idle', label: 'idle' }
+      return { cls: 'idle', label: 'Idle' }
   }
 }
 
-/** Human "3m ago" from an ISO timestamp (or '' when absent/unparseable). */
+/** Short "3m" from an ISO timestamp (or '' when absent/unparseable). */
 function relTime(iso: string | null): string {
   if (!iso) return ''
   const t = Date.parse(iso)
   if (!Number.isFinite(t)) return ''
   const sec = Math.max(0, Math.round((Date.now() - t) / 1000))
-  if (sec < 45) return 'just now'
+  if (sec < 45) return 'now'
   const min = Math.round(sec / 60)
-  if (min < 60) return `${min}m ago`
+  if (min < 60) return `${min}m`
   const hr = Math.round(min / 60)
-  if (hr < 24) return `${hr}h ago`
-  return `${Math.round(hr / 24)}d ago`
+  if (hr < 24) return `${hr}h`
+  return `${Math.round(hr / 24)}d`
 }
 
-/** The model's display label, falling back to the raw id (or '—'). */
+/** The model's display label, falling back to the raw id (or ''). */
 function modelLabel(id: string | null): string {
-  if (!id) return '—'
+  if (!id) return ''
   return MODELS.find((m) => m.id === id)?.label ?? id
 }
 
-/** `ctx 44%`, or '' when the session doesn't report context use. */
-function contextLabel(s: ActiveSession): string {
-  return s.context ? `ctx ${s.context.percent}%` : ''
+/** A permission mode's segment label and its longer status-line form. */
+const MODE_LABELS: Record<string, { short: string; long: string }> = {
+  default: { short: 'Ask', long: 'Ask first' },
+  acceptEdits: { short: 'Edits', long: 'Accept edits' },
+  plan: { short: 'Plan', long: 'Plan mode' },
+  bypassPermissions: { short: 'Bypass', long: 'Bypass permissions' },
 }
 
-/** The plan-usage line: `5h 69% · week 18% · Fable 4%`. */
-function planLabel(info: SessionInfo): string {
-  const label = (kind: string, model: string | null): string =>
-    kind === 'session' ? '5h' : kind === 'weekly_all' ? 'week' : kind === 'weekly_scoped' ? (model ?? 'scoped') : kind
-  return (info.usage?.limits ?? []).map((l) => `${label(l.kind, l.model)} ${l.percent ?? '?'}%`).join(' · ')
+function modeLabel(mode: string | null, form: 'short' | 'long'): string {
+  if (!mode) return ''
+  return MODE_LABELS[mode]?.[form] ?? mode
 }
 
-/** Cost/turns suffix for a result row, e.g. ` · 5 turns · $0.12`, or ''. */
-function usageSuffix(e: RcEvent): string {
+/** Effort segment labels: `medium` is shortened to fit six segments. */
+function effortLabel(label: string): string {
+  return label === 'medium' ? 'med' : label
+}
+
+/** A plan-usage window's name: `5 hours`, `Week`, or the scoped model. */
+function limitLabel(kind: string, model: string | null): string {
+  return kind === 'session' ? '5 hours' : kind === 'weekly_all' ? 'Week' : kind === 'weekly_scoped' ? `Week · ${modelLabel(model) || 'model'}` : kind
+}
+
+/** `Done · 5 turns · 72.0s · $0.12` for a result row. */
+function resultLine(e: RcEvent, ok: boolean): string {
   const u = e.usage
-  if (!u) return ''
-  const bits: string[] = []
-  if (u.numTurns != null) bits.push(`${u.numTurns} turns`)
-  if (u.durationMs != null) bits.push(`${(u.durationMs / 1000).toFixed(1)}s`)
-  if (u.costUsd != null) bits.push(`$${u.costUsd}`)
-  return bits.length ? ` · ${bits.join(' · ')}` : ''
+  const bits: string[] = [ok ? 'Done' : `Stopped: ${e.subtype ?? 'error'}`]
+  if (u?.numTurns != null) bits.push(`${u.numTurns} turn${u.numTurns === 1 ? '' : 's'}`)
+  if (u?.durationMs != null) bits.push(`${(u.durationMs / 1000).toFixed(1)}s`)
+  if (u?.costUsd != null) bits.push(`$${u.costUsd}`)
+  return bits.join(' · ')
 }
 
 /** Pretty-print a tool's input map for the full (un-clipped) panel view. */
@@ -162,24 +183,67 @@ function formatInput(input: Record<string, unknown> | null): string {
   }
 }
 
+/** The one input that says what a tool call does, on one line: a command, a
+ *  path, a pattern, a URL. Its full input opens below the row. */
+function toolArg(input: Record<string, unknown> | null): string {
+  if (!input) return ''
+  for (const k of ['command', 'file_path', 'notebook_path', 'path', 'pattern', 'url', 'query', 'skill', 'description', 'prompt']) {
+    const v = input[k]
+    if (typeof v === 'string' && v.trim()) return v.replace(/\s+/g, ' ').trim()
+  }
+  const first = Object.values(input).find((v) => typeof v === 'string' && v.trim())
+  return typeof first === 'string' ? first.replace(/\s+/g, ' ').trim() : ''
+}
+
+/** The bridge's host for the connection card (`my-mac:8790`), or the origin as given. */
+function hostOf(origin: string): string {
+  try {
+    return new URL(origin).host || origin
+  } catch {
+    return origin
+  }
+}
+
+function blankLabel(s: number, lookWake: boolean): string {
+  return s === 0 ? (lookWake ? 'When looking away' : 'Never') : s < 60 ? `${s} s` : `${s / 60} min`
+}
+
 /** Starts the bridge with local dictation (its `local-stt` extra). */
 const LOCAL_STT_COMMAND =
   'uvx --from "claude-remote-bridge[local-stt] @ git+https://github.com/ThatCrispyToast/g2-claude-remote#subdirectory=server" claude-remote-bridge'
 
+// Line icons, drawn at their display size in TC-1st via currentColor.
+const ICON = {
+  back: '<svg width="10" height="18" viewBox="0 0 10 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 1 1 9l8 8"/></svg>',
+  more: '<svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>',
+  settings: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>',
+  close: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="m2 2 12 12M14 2 2 14"/></svg>',
+  chev: '<svg width="8" height="14" viewBox="0 0 8 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m1 1 6 6-6 6"/></svg>',
+  arrow: '<svg width="18" height="12" viewBox="0 0 18 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 6h15M11 1l5 5-5 5"/></svg>',
+  mic: '<svg width="18" height="20" viewBox="0 0 18 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><rect x="5.5" y="1" width="7" height="11" rx="3.5"/><path d="M2 9a7 7 0 0 0 14 0M9 16v3"/></svg>',
+  send: '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 16V2M3 8l6-6 6 6"/></svg>',
+  stop: '<span class="stop-square" aria-hidden="true"></span>',
+  external: '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><path d="M4 1h7v7M11 1 1 11"/></svg>',
+}
+
 export class Panel {
   // ── DOM refs, filled in by mount(); null until then. ──────────────────────
-  private connChip: HTMLDivElement | null = null
-  private originEl: HTMLDivElement | null = null
+  private connCard: HTMLDivElement | null = null
+  private settingsState: HTMLSpanElement | null = null
   private listView: HTMLElement | null = null
   private listEl: HTMLDivElement | null = null
+  private settingsView: HTMLElement | null = null
   private detailView: HTMLElement | null = null
   private detailTitle: HTMLDivElement | null = null
-  private detailMeta: HTMLDivElement | null = null
-  private detailSummary: HTMLDivElement | null = null
-  private permBanner: HTMLDivElement | null = null
+  private statusCard: HTMLDivElement | null = null
+  private promptOverlay: HTMLDivElement | null = null
+  private promptSheet: HTMLElement | null = null
+  private controlsOverlay: HTMLDivElement | null = null
+  private controlsSheet: HTMLElement | null = null
+  private controlsBody: HTMLDivElement | null = null
+  private controlsSub: HTMLDivElement | null = null
   private asideCard: HTMLDivElement | null = null
-  private infoBody: HTMLDivElement | null = null
-  private asideBtn: HTMLButtonElement | null = null
+  private scrollEl: HTMLDivElement | null = null
   private logEl: HTMLDivElement | null = null
   private sendInput: HTMLTextAreaElement | null = null
   private takeDraft: HTMLButtonElement | null = null
@@ -187,25 +251,20 @@ export class Panel {
   private dictateBtn: HTMLButtonElement | null = null
   private interimEl: HTMLDivElement | null = null
   private interruptBtn: HTMLButtonElement | null = null
-  private modelSel: HTMLSelectElement | null = null
-  private modeSel: HTMLSelectElement | null = null
-  private effortSel: HTMLSelectElement | null = null
-  private archiveBtn: HTMLButtonElement | null = null
-  private pinBtn: HTMLButtonElement | null = null
   private toastEl: HTMLDivElement | null = null
   private cmdMenuEl: HTMLDivElement | null = null
   private noticesEl: HTMLDivElement | null = null
+  private glassesEl: HTMLDivElement | null = null
 
   private mounted = false
   private dictating = false
   /** Set once main.ts has restored the saved settings (settingsLoaded). A tap on
    *  Settings before that is held, not served: filled from the still-empty
-   *  storage, the card would show (and Save would write) blanks. */
+   *  storage, the screen would show (and Save would write) blanks. */
   private settingsReady = false
   private settingsHeld = false
-  /** Open/close the Settings card, filling it from storage on open (wireSettings). */
-  private toggleSettings = (): void => {}
-  /** The currently-open session id (for onArchive), or null in the list view. */
+  /** Open the Settings screen, filling it from storage (wireSettings). */
+  private openSettings = (): void => {}
   private claudeLink: HTMLAnchorElement | null = null
   private olderButton: HTMLButtonElement | null = null
   private dialogDrafts = new Map<number, string>()
@@ -213,14 +272,24 @@ export class Panel {
   private historyBefore: number | null = null
   private historyRevision = 0
   private drafts = new Map<string, string>()
+  /** The currently-open session id (for onArchive), or null in the list view. */
   private currentSid: string | null = null
   // The open session as last pushed, its live worker settings, background
-  // tasks, and the on-demand info — the header meta and the session card are
-  // rendered from these together.
+  // tasks, and the on-demand info — the status card and the session controls
+  // are rendered from these together.
   private session: ActiveSession | null = null
   private worker: WorkerState | null = null
   private tasks: BackgroundTask[] = []
   private infoView: InfoView | null = null
+  /** What the prompt sheet holds: nothing, a permission, a question, or a
+   *  dialog only Claude can answer. */
+  private promptKind: 'none' | 'permission' | 'question' | 'external' = 'none'
+  /** The prompt sheet was closed with ✕: nothing was answered, and the status
+   *  card offers it again. A new prompt opens it again. */
+  private promptHidden = false
+  private promptKey = ''
+  private archiveArmed = false
+  private archiveTimer: number | null = null
   private toastTimer: number | null = null
   /** sequenceNums already rendered in the log — dedupes the history↔stream seam. */
   private seen = new Set<number>()
@@ -243,188 +312,179 @@ export class Panel {
     if (this.mounted) return
     this.mounted = true
 
-    const quickHtml = QUICK_SENDS.map(
-      (q, i) => `<button class="btn quick" data-quick="${i}">${escapeHtml(q.label)}</button>`,
-    ).join('')
-    const modelOpts = MODELS.map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`).join('')
-    const modeOpts = MODES.map((m) => `<option value="${m}">${m}</option>`).join('')
-    const effortOpts = EFFORTS.map((e) => `<option value="${e.id ?? 'auto'}">${e.label}</option>`).join('')
-
-    // Settings: the placeholders show what the build falls back to; the inputs
-    // hold the on-device overrides, filled on every open (see wireSettings).
-    const settingsHtml = `
-        <section id="settingsCard" class="settings" hidden>
-          <div class="view-title">Connection settings</div>
-          <div class="settings-conn">
-            <span class="field-label">Connected to</span>
-            <span id="origin" class="origin">—</span>
-          </div>
-          <label class="field">
-            <span class="field-label">Bridge URL</span>
-            <input id="setBridgeUrl" class="set-input" type="url" autocapitalize="off" autocorrect="off"
-              spellcheck="false" placeholder="${escapeHtml(BRIDGE_URL)}" />
-          </label>
-          <label class="field">
-            <span class="field-label">Bridge token</span>
-            <input id="setBridgeToken" class="set-input" type="password" autocapitalize="off"
-              placeholder="${BRIDGE_TOKEN ? '(using built-in token)' : '(none set)'}" />
-          </label>
-          <div class="field">
-            <span class="field-label">Dictation</span>
-            <div class="stt-source" role="radiogroup" aria-label="Dictation">
-              <button type="button" class="btn" role="radio" data-source="deepgram">Deepgram</button>
-              <button type="button" class="btn" role="radio" data-source="bridge">Bridge</button>
-            </div>
-          </div>
-          <div id="dictHint" class="settings-hint" hidden></div>
-          <label class="field">
-            <span class="field-label">Deepgram API key</span>
-            <input id="setDeepgramKey" class="set-input" type="password" autocapitalize="off"
-              placeholder="${DEEPGRAM_API_KEY ? '(using built-in key)' : '(none set)'}" />
-          </label>
-          <label class="field">
-            <span class="field-label">Dictation language (Deepgram code: en, de, fr, multi…)</span>
-            <input id="setSttLanguage" class="set-input" type="text" autocapitalize="off" autocorrect="off"
-              spellcheck="false" placeholder="${escapeHtml(STT_LANGUAGE)}" />
-          </label>
-          <div class="settings-hint">Stored only on this device. A blank field falls back to the default shown in it.</div>
-          <div class="perm-acts">
-            <button id="settingsSave" class="btn primary">Save &amp; connect</button>
-            <button id="settingsReset" class="btn">Reset</button>
-          </div>
-        </section>`
+    const chipsHtml = [
+      ...QUICK_SENDS.map((q, i) => `<button type="button" class="chip" data-quick="${i}">${escapeHtml(q.label)}</button>`),
+      '<button type="button" id="asideBtn" class="chip" title="Answered from the conversation without interrupting it or adding to it">Ask aside</button>',
+    ].join('')
 
     root.innerHTML = `
-      <main class="panel">
-        <header class="topbar">
-          <h1 class="wordmark">${escapeHtml(APP_TITLE)}</h1>
-          <div class="head-side">
-            <div id="connChip" class="chip-conn down">down</div>
-            <button id="settingsBtn" class="btn ghost settings-btn" title="Connection settings" aria-label="Connection settings">Settings</button>
+      <main class="app">
+        <section id="listView" class="screen">
+          <header class="nav">
+            <span class="nav-side"></span>
+            <h1 class="nav-title">${escapeHtml(APP_TITLE)}</h1>
+            <button id="settingsBtn" type="button" class="icon-btn" aria-label="Settings">${ICON.settings}</button>
+          </header>
+          <div class="scroll">
+            <div id="connCard" class="card conn"></div>
+            <div id="notices" class="notices" hidden></div>
+            <div id="sessionList" class="session-list"></div>
           </div>
-        </header>
-        <div id="notices" class="notices" hidden></div>
-${settingsHtml}
-        <section id="listView" class="view">
-          <div class="view-head">
-            <span class="view-title">Active sessions</span>
-            <button id="exitBtn" class="btn ghost">Exit</button>
-          </div>
-          <div id="sessionList" class="session-list"></div>
         </section>
 
-        <section id="detailView" class="view" hidden>
-          <div class="detail-head">
-            <button id="backBtn" class="btn ghost">‹ Back</button>
-            <div class="detail-headings">
-              <div id="detailTitle" class="detail-title"></div>
-              <div id="detailMeta" class="detail-meta"></div>
-              <div id="detailSummary" class="detail-summary" hidden></div>
+        <section id="settingsView" class="screen" hidden>
+          <header class="nav">
+            <button id="settingsBack" type="button" class="icon-btn" aria-label="Back to sessions">${ICON.back}</button>
+            <h1 class="nav-title">Settings</h1>
+            <span class="nav-side"></span>
+          </header>
+          <div class="scroll">
+            <section class="group">
+              <div class="group-head"><h2 class="group-title">Bridge</h2><span id="settingsState"></span></div>
+              <div class="list-card">
+                <label class="field-row"><span class="field-name">Address</span>
+                  <input id="setBridgeUrl" class="row-input" type="url" autocapitalize="off" autocorrect="off"
+                    spellcheck="false" placeholder="${escapeHtml(BRIDGE_URL)}" /></label>
+                <label class="field-row"><span class="field-name">Token</span>
+                  <input id="setBridgeToken" class="row-input" type="password" autocapitalize="off"
+                    placeholder="${BRIDGE_TOKEN ? 'Built-in token' : 'None set'}" /></label>
+              </div>
+            </section>
+
+            <section class="group">
+              <h2 class="group-title">Dictation</h2>
+              <div class="seg stt-source" role="radiogroup" aria-label="Dictation">
+                <button type="button" role="radio" data-source="deepgram">Deepgram</button>
+                <button type="button" role="radio" data-source="bridge">Bridge</button>
+              </div>
+              <div id="dictHint" class="hint" hidden></div>
+              <div id="deepgramFields" class="list-card">
+                <label class="field-row"><span class="field-name">API key</span>
+                  <input id="setDeepgramKey" class="row-input" type="password" autocapitalize="off"
+                    placeholder="${DEEPGRAM_API_KEY ? 'Built-in key' : 'None set'}" /></label>
+                <label class="field-row"><span class="field-name">Language</span>
+                  <input id="setSttLanguage" class="row-input" type="text" autocapitalize="off" autocorrect="off"
+                    spellcheck="false" placeholder="${escapeHtml(STT_LANGUAGE)}" /></label>
+              </div>
+              <div id="deepgramHint" class="hint">A Deepgram language code: en, de, pt-BR, or multi for mixed speech.</div>
+            </section>
+
+            <div class="hint">Stored only on this device. A blank field uses the default shown in it.</div>
+            <div class="stack">
+              <button id="settingsSave" type="button" class="btn primary">Save and reconnect</button>
+              <button id="settingsReset" type="button" class="btn">Reset to defaults</button>
             </div>
+
+            <section class="group">
+              <h2 class="group-title">Glasses</h2>
+              <div id="glassesSettings" class="list-card"></div>
+              <div class="hint">Saved right away. Head tilt is set up on the glasses: look ahead, then at the screen.</div>
+            </section>
+
+            <button id="exitBtn" type="button" class="btn ghost">Exit ${escapeHtml(APP_TITLE)}</button>
           </div>
+        </section>
 
-          <div id="permBanner" class="perm" hidden></div>
-          <div id="asideCard" class="aside-card" hidden></div>
+        <section id="detailView" class="screen" hidden>
+          <header class="nav">
+            <button id="backBtn" type="button" class="icon-btn" aria-label="Back to sessions">${ICON.back}</button>
+            <div id="detailTitle" class="nav-title"></div>
+            <button id="controlsBtn" type="button" class="icon-btn" aria-label="Session controls">${ICON.more}</button>
+          </header>
 
-          <button id="olderEvents" class="btn ghost" hidden>Earlier events</button>
-          <div id="log" class="log"></div>
+          <div id="sessionScroll" class="scroll log-scroll">
+            <div id="statusCard" class="card status"></div>
+            <div id="asideCard" class="card aside-card" hidden></div>
+            <button id="olderEvents" type="button" class="btn ghost older" hidden>Earlier events</button>
+            <div id="log" class="log"></div>
+          </div>
 
           <div class="composer">
-            <div class="settings-hint">Claude may read these messages as coming from a peer session.
-              <a id="claudeLink" target="_blank" rel="noopener noreferrer">Open in Claude</a> to send as yourself or run slash commands.
-              <button id="copyBtn" class="copy-draft">Copy draft</button></div>
-            <button id="takeDraft" class="btn" hidden>Copy glasses draft</button>
             <div id="cmdMenu" class="cmd-menu" hidden></div>
-            <textarea id="sendInput" class="send-input" rows="2"
-              placeholder="Message the session…" enterkeyhint="send"></textarea>
-            <div id="interim" class="interim"></div>
+            <div class="chips">${chipsHtml}</div>
+            <div id="interim" class="interim" hidden></div>
             <div class="composer-row">
-              <button id="sendBtn" class="btn primary">Send</button>
-              <button id="asideBtn" class="btn" title="Answered from the conversation without interrupting it or adding to it">Ask aside</button>
-              <button id="dictateBtn" class="btn">Dictate</button>
-              <button id="interruptBtn" class="btn danger">Interrupt</button>
+              <textarea id="sendInput" class="send-input" rows="1"
+                placeholder="Message" aria-label="Message" enterkeyhint="send"></textarea>
+              <button id="dictateBtn" type="button" class="square-btn" aria-label="Dictate">${ICON.mic}</button>
+              <button id="sendBtn" type="button" class="square-btn primary" aria-label="Send" hidden>${ICON.send}</button>
+              <button id="interruptBtn" type="button" class="square-btn" aria-label="Stop the running turn" hidden>${ICON.stop}</button>
             </div>
-            <div class="quick-row">${quickHtml}</div>
+            <div class="composer-note">Sent as a peer message.
+              <a id="claudeLink" target="_blank" rel="noopener noreferrer">Open in Claude</a> to send as you.
+              <button id="copyBtn" type="button" class="link-btn">Copy draft</button>
+              <button id="takeDraft" type="button" class="link-btn" hidden>Copy glasses draft</button></div>
           </div>
 
-          <section class="info-card">
-            <div class="info-head">
-              <span class="view-title">Session</span>
-              <button id="infoBtn" class="btn ghost">Plan &amp; changes</button>
+          <div id="controlsOverlay" class="overlay" hidden></div>
+          <section id="controlsSheet" class="sheet" role="dialog" aria-modal="true" aria-label="Session controls" hidden>
+            <div class="sheet-head">
+              <span class="nav-side"></span>
+              <div class="sheet-titles"><h2 id="controlsTitle" class="sheet-title"></h2><div id="controlsSub" class="sheet-sub"></div></div>
+              <button id="controlsClose" type="button" class="icon-btn" aria-label="Close">${ICON.close}</button>
             </div>
-            <div id="infoBody" class="info-body"></div>
+            <div id="controlsBody" class="sheet-body"></div>
           </section>
 
-          <div class="steer">
-            <label class="field">
-              <span class="field-label">Model</span>
-              <select id="modelSel" class="select">${modelOpts}</select>
-            </label>
-            <label class="field">
-              <span class="field-label">Mode</span>
-              <select id="modeSel" class="select">${modeOpts}</select>
-            </label>
-            <label class="field">
-              <span class="field-label">Effort</span>
-              <select id="effortSel" class="select">${effortOpts}</select>
-            </label>
-            <button id="pinBtn" class="btn" title="Pinned sessions lead the list, here and on claude.ai" hidden>Pin</button>
-            <button id="archiveBtn" class="btn danger archive">Archive</button>
-          </div>
-
+          <div id="promptOverlay" class="overlay" hidden></div>
+          <section id="promptSheet" class="sheet prompt" role="dialog" aria-modal="true" aria-label="Waiting on you" hidden></section>
         </section>
 
-        <div id="toast" class="toast" hidden></div>
+        <div id="toast" class="toast" role="status" hidden></div>
       </main>
     `
 
     // Cache refs.
-    this.claudeLink = root.querySelector<HTMLAnchorElement>('#claudeLink')
-    this.connChip = root.querySelector<HTMLDivElement>('#connChip')
-    this.originEl = root.querySelector<HTMLDivElement>('#origin')
-    this.listView = root.querySelector<HTMLElement>('#listView')
-    this.listEl = root.querySelector<HTMLDivElement>('#sessionList')
-    this.detailView = root.querySelector<HTMLElement>('#detailView')
-    this.detailTitle = root.querySelector<HTMLDivElement>('#detailTitle')
-    this.detailMeta = root.querySelector<HTMLDivElement>('#detailMeta')
-    this.detailSummary = root.querySelector<HTMLDivElement>('#detailSummary')
-    this.permBanner = root.querySelector<HTMLDivElement>('#permBanner')
-    this.asideCard = root.querySelector<HTMLDivElement>('#asideCard')
-    this.infoBody = root.querySelector<HTMLDivElement>('#infoBody')
-    this.asideBtn = root.querySelector<HTMLButtonElement>('#asideBtn')
-    this.olderButton = root.querySelector<HTMLButtonElement>('#olderEvents')
+    const $ = <T extends Element>(sel: string): T | null => root.querySelector<T>(sel)
+    this.claudeLink = $('#claudeLink')
+    this.connCard = $('#connCard')
+    this.settingsState = $('#settingsState')
+    this.listView = $('#listView')
+    this.listEl = $('#sessionList')
+    this.settingsView = $('#settingsView')
+    this.detailView = $('#detailView')
+    this.detailTitle = $('#detailTitle')
+    this.statusCard = $('#statusCard')
+    this.promptOverlay = $('#promptOverlay')
+    this.promptSheet = $('#promptSheet')
+    this.controlsOverlay = $('#controlsOverlay')
+    this.controlsSheet = $('#controlsSheet')
+    this.controlsBody = $('#controlsBody')
+    this.controlsSub = $('#controlsSub')
+    this.asideCard = $('#asideCard')
+    this.scrollEl = $('#sessionScroll')
+    this.olderButton = $('#olderEvents')
     this.olderButton?.addEventListener('click', () => void this.loadOlderEvents())
-    this.logEl = root.querySelector<HTMLDivElement>('#log')
-    this.sendInput = root.querySelector<HTMLTextAreaElement>('#sendInput')
-    this.sendBtn = root.querySelector<HTMLButtonElement>('#sendBtn')
-    this.dictateBtn = root.querySelector<HTMLButtonElement>('#dictateBtn')
-    this.interimEl = root.querySelector<HTMLDivElement>('#interim')
-    this.interruptBtn = root.querySelector<HTMLButtonElement>('#interruptBtn')
-    this.modelSel = root.querySelector<HTMLSelectElement>('#modelSel')
-    this.modeSel = root.querySelector<HTMLSelectElement>('#modeSel')
-    this.effortSel = root.querySelector<HTMLSelectElement>('#effortSel')
-    this.archiveBtn = root.querySelector<HTMLButtonElement>('#archiveBtn')
-    this.pinBtn = root.querySelector<HTMLButtonElement>('#pinBtn')
-    this.toastEl = root.querySelector<HTMLDivElement>('#toast')
-    this.cmdMenuEl = root.querySelector<HTMLDivElement>('#cmdMenu')
-    this.noticesEl = root.querySelector<HTMLDivElement>('#notices')
+    this.logEl = $('#log')
+    this.sendInput = $('#sendInput')
+    this.sendBtn = $('#sendBtn')
+    this.dictateBtn = $('#dictateBtn')
+    this.interimEl = $('#interim')
+    this.interruptBtn = $('#interruptBtn')
+    this.toastEl = $('#toast')
+    this.cmdMenuEl = $('#cmdMenu')
+    this.noticesEl = $('#notices')
+    this.glassesEl = $('#glassesSettings')
 
     // Wire events.
-    root.querySelector<HTMLButtonElement>('#exitBtn')?.addEventListener('click', () => this.cb.onExit())
-    root.querySelector<HTMLButtonElement>('#backBtn')?.addEventListener('click', () => this.cb.onBackToList())
+    $('#exitBtn')?.addEventListener('click', () => this.cb.onExit())
+    $('#backBtn')?.addEventListener('click', () => this.cb.onBackToList())
     this.wireSettings(root)
 
-    this.takeDraft = root.querySelector<HTMLButtonElement>('#takeDraft')
+    this.takeDraft = $('#takeDraft')
     this.takeDraft?.addEventListener('click', () => {
       const text = this.cb.onTakeGlassesDraft()
       if (!text || !this.sendInput) return
       this.appendDraft(text)
       void this.copyDraft(this.sendInput.value.length - text.length)
     })
-    root.querySelector('#copyBtn')?.addEventListener('click', () => void this.copyDraft())
+    $('#copyBtn')?.addEventListener('click', () => void this.copyDraft())
     this.sendBtn?.addEventListener('click', () => this.doSend())
     // Typing after a leading `/` drives the command autocomplete.
-    this.sendInput?.addEventListener('input', () => this.updateCommandMenu())
+    this.sendInput?.addEventListener('input', () => {
+      this.updateCommandMenu()
+      this.syncComposer()
+    })
     this.sendInput?.addEventListener('keydown', (e) => {
       // While the command menu is open it owns the arrows / Enter / Escape, so a
       // pick doesn't fall through to sending the half-typed `/co` literally.
@@ -463,33 +523,24 @@ ${settingsHtml}
     })
 
     this.interruptBtn?.addEventListener('click', () => this.cb.onInterrupt())
-    this.asideBtn?.addEventListener('click', () => this.doAside())
-    root.querySelector<HTMLButtonElement>('#infoBtn')?.addEventListener('click', () => this.cb.onLoadInfo())
+    $('#asideBtn')?.addEventListener('click', () => this.doAside())
 
-    this.modelSel?.addEventListener('change', () => {
-      if (this.modelSel) this.cb.onSetModel(this.modelSel.value)
-    })
-    this.modeSel?.addEventListener('change', () => {
-      if (this.modeSel) this.cb.onSetMode(this.modeSel.value as PermissionMode)
-    })
-    this.effortSel?.addEventListener('change', () => {
-      if (this.effortSel) this.cb.onSetEffort(this.effortSel.value)
-    })
-
-    for (const btn of Array.from(root.querySelectorAll<HTMLButtonElement>('.quick'))) {
+    for (const btn of Array.from(root.querySelectorAll<HTMLButtonElement>('[data-quick]'))) {
       btn.addEventListener('click', () => {
-        const i = Number(btn.dataset.quick)
-        const q = QUICK_SENDS[i]
+        const q = QUICK_SENDS[Number(btn.dataset.quick)]
         if (q) this.cb.onSend(q.text)
       })
     }
 
-    this.wireArchive()
-    this.pinBtn?.addEventListener('click', () => {
-      if (this.session) this.cb.onSetPinned(!this.session.pinned)
+    $('#controlsBtn')?.addEventListener('click', () => this.openControls())
+    $('#controlsClose')?.addEventListener('click', () => this.closeControls())
+    this.controlsOverlay?.addEventListener('click', () => this.closeControls())
+    this.statusCard?.addEventListener('click', (e) => {
+      if ((e.target as HTMLElement).closest('[data-review]')) this.showPrompt()
     })
 
     injectStyles()
+    this.syncComposer()
   }
 
   /** Connection settings: saved to localStorage, then applied in place via
@@ -498,7 +549,6 @@ ${settingsHtml}
    *  never leave the device — the panel is where you input your bridge/Deepgram
    *  secrets. */
   private wireSettings(root: HTMLElement): void {
-    const card = root.querySelector<HTMLElement>('#settingsCard')
     const url = root.querySelector<HTMLInputElement>('#setBridgeUrl')
     const token = root.querySelector<HTMLInputElement>('#setBridgeToken')
     const dg = root.querySelector<HTMLInputElement>('#setDeepgramKey')
@@ -519,15 +569,16 @@ ${settingsHtml}
     root.querySelectorAll<HTMLButtonElement>('.stt-source [data-source]').forEach((b) =>
       b.addEventListener('click', () => this.pickSource(b.dataset.source === 'bridge' ? 'bridge' : 'deepgram')),
     )
-    this.toggleSettings = () => {
-      if (!card) return
-      if (card.hidden) fill(loadRuntimeSettings())
-      card.hidden = !card.hidden
+    this.openSettings = () => {
+      fill(loadRuntimeSettings())
+      this.renderGlassesSettings()
+      this.showScreen('settings')
     }
     root.querySelector<HTMLButtonElement>('#settingsBtn')?.addEventListener('click', () => {
-      if (this.settingsReady) this.toggleSettings()
+      if (this.settingsReady) this.openSettings()
       else this.settingsHeld = true
     })
+    root.querySelector<HTMLButtonElement>('#settingsBack')?.addEventListener('click', () => this.showScreen('list'))
     root.querySelector<HTMLButtonElement>('#settingsSave')?.addEventListener('click', () => {
       const language = lang?.value.trim() ?? ''
       if (language && !isSttLanguage(language)) {
@@ -542,7 +593,7 @@ ${settingsHtml}
         sttLanguage: language,
         sttSource: this.cardSource,
       })
-      if (card) card.hidden = true
+      this.showScreen('list')
       this.cb.onApplySettings()
     })
     root.querySelector<HTMLButtonElement>('#settingsReset')?.addEventListener('click', () => {
@@ -552,30 +603,96 @@ ${settingsHtml}
     })
   }
 
-  /** Two-click Archive confirm (mirrors the template's delete-confirm arming). */
-  private wireArchive(): void {
-    const btn = this.archiveBtn
-    if (!btn) return
-    let armed = false
-    let timer: number | null = null
-    btn.addEventListener('click', () => {
-      if (!armed) {
-        armed = true
-        btn.textContent = 'Archive?'
-        btn.classList.add('armed')
-        timer = window.setTimeout(() => {
-          armed = false
-          btn.textContent = 'Archive'
-          btn.classList.remove('armed')
-        }, 3000)
-        return
-      }
-      if (timer !== null) clearTimeout(timer)
-      armed = false
-      btn.textContent = 'Archive'
-      btn.classList.remove('armed')
-      if (this.currentSid) this.cb.onArchive(this.currentSid)
+  /** Show one of the three screens. A session opening always wins over Settings. */
+  private showScreen(which: 'list' | 'settings' | 'detail'): void {
+    if (this.listView) this.listView.hidden = which !== 'list'
+    if (this.settingsView) this.settingsView.hidden = which !== 'settings'
+    if (this.detailView) this.detailView.hidden = which !== 'detail'
+  }
+
+  /** The glasses' display settings, read fresh: they are also changed on the
+   *  glasses, and main.ts calls refreshDisplaySettings() when they are. */
+  private renderGlassesSettings(): void {
+    const el = this.glassesEl
+    if (!el) return
+    const d = displaySettings()
+    const look = d.lookWake && d.lookCal !== null
+    el.replaceChildren()
+
+    // Blank after: a native select under a list row, so the phone's own picker opens.
+    const blank = document.createElement('label')
+    blank.className = 'field-row select-row'
+    const select = document.createElement('select')
+    select.setAttribute('aria-label', 'Blank screen after')
+    for (const v of BLANK_AFTER_CHOICES) select.add(new Option(blankLabel(v, look), String(v), false, v === d.blankAfterS))
+    select.addEventListener('change', () => this.cb.onSetDisplay({ blankAfterS: Number(select.value) }))
+    blank.innerHTML = `<span class="field-name">Blank screen after</span><span class="row-value">${escapeHtml(blankLabel(d.blankAfterS, look))}${ICON.chev}</span>`
+    blank.appendChild(select)
+
+    const tilt = this.toggleRow('Wake on head tilt', look, (on) => {
+      if (on) this.cb.onCalibrateTilt()
+      else this.cb.onSetDisplay({ lookWake: false })
     })
+
+    const cal = document.createElement('button')
+    cal.type = 'button'
+    cal.className = 'field-row'
+    cal.innerHTML = `<span class="field-name">Set up head tilt</span><span class="row-value">${d.lookCal ? 'Done' : 'Not set up'}${ICON.chev}</span>`
+    cal.addEventListener('click', () => this.cb.onCalibrateTilt())
+
+    const notify = this.toggleRow('Session notifications', d.notifyDone, (on) => this.cb.onSetDisplay({ notifyDone: on }))
+    const notifyHint = document.createElement('div')
+    notifyHint.className = 'row-hint'
+    notifyHint.textContent = 'While the screen is blank, show ! when a turn finishes or a prompt waits.'
+    notify.querySelector('.field-name')?.appendChild(notifyHint)
+
+    el.append(blank, tilt, cal, notify)
+  }
+
+  /** A list row with the Figma's square toggle (a styled checkbox). */
+  private toggleRow(label: string, on: boolean, change: (on: boolean) => void): HTMLLabelElement {
+    const row = document.createElement('label')
+    row.className = 'field-row'
+    const name = document.createElement('span')
+    name.className = 'field-name'
+    name.textContent = label
+    const toggle = document.createElement('span')
+    toggle.className = 'toggle'
+    const box = document.createElement('input')
+    box.type = 'checkbox'
+    box.setAttribute('role', 'switch')
+    box.checked = on
+    box.addEventListener('change', () => change(box.checked))
+    const knob = document.createElement('span')
+    knob.className = 'knob'
+    toggle.append(box, knob)
+    row.append(name, toggle)
+    return row
+  }
+
+  /** main.ts saved a display setting (from here or the glasses): redraw the group. */
+  refreshDisplaySettings(): void {
+    if (this.settingsView && !this.settingsView.hidden) this.renderGlassesSettings()
+  }
+
+  /** Two-tap Archive: the first tap arms it for 3 s. */
+  private archiveClick(btn: HTMLButtonElement): void {
+    if (!this.archiveArmed) {
+      this.archiveArmed = true
+      btn.textContent = 'Tap again to archive'
+      btn.classList.add('armed')
+      this.archiveTimer = window.setTimeout(() => {
+        this.archiveArmed = false
+        this.archiveTimer = null
+        btn.textContent = 'Archive'
+        btn.classList.remove('armed')
+      }, 3000)
+      return
+    }
+    if (this.archiveTimer !== null) clearTimeout(this.archiveTimer)
+    this.archiveTimer = null
+    this.archiveArmed = false
+    if (this.currentSid) this.cb.onArchive(this.currentSid)
   }
 
   setGlassesDraft(available: boolean): void {
@@ -597,6 +714,20 @@ ${settingsHtml}
     }
   }
 
+  /** Send when there is text; the mic gives way to Send while there is, and
+   *  Stop shows only while a turn runs. The box grows with its text. */
+  private syncComposer(): void {
+    const box = this.sendInput
+    const hasText = !!box?.value.trim()
+    if (this.sendBtn) this.sendBtn.hidden = !hasText
+    if (this.dictateBtn) this.dictateBtn.hidden = hasText && !this.dictating
+    if (this.interruptBtn) this.interruptBtn.hidden = this.session?.workerStatus !== 'running'
+    if (box) {
+      box.style.height = 'auto'
+      box.style.height = `${Math.min(box.scrollHeight, 132)}px`
+    }
+  }
+
   /** Read + clear the send box, firing onSend when non-empty. */
   private doSend(): void {
     const text = this.sendInput?.value.trim() ?? ''
@@ -612,13 +743,15 @@ ${settingsHtml}
       this.sendInput.value = ''
       this.sendInput.blur() // dismiss the mobile keyboard
     }
+    this.syncComposer()
   }
 
   /** Ask the send box's text as a side question; the card shows the answer. */
   private doAside(): void {
     const text = this.sendInput?.value.trim() ?? ''
     if (!text) {
-      this.setToast('Type a question to ask on the side.')
+      this.setToast('Type a question first, then tap Ask aside.')
+      this.sendInput?.focus()
       return
     }
     this.hideCommandMenu()
@@ -627,6 +760,7 @@ ${settingsHtml}
       this.sendInput.value = ''
       this.sendInput.blur()
     }
+    this.syncComposer()
   }
 
   // ── Slash-command autocomplete ─────────────────────────────────────────────
@@ -680,8 +814,7 @@ ${settingsHtml}
         row.appendChild(h)
       }
       // The menu isn't blur-hidden, so it survives the textarea losing focus on
-      // tap and a plain click lands on the row (portable across touch). chooseCmd
-      // re-focuses the box itself on the fill path.
+      // tap and a plain click lands on the row (portable across touch).
       row.addEventListener('click', () => this.chooseCmd(i))
       menu.appendChild(row)
     })
@@ -702,6 +835,7 @@ ${settingsHtml}
     this.cb.onSend(`/${cmd.name}`)
     this.sendInput.value = ''
     this.sendInput.blur()
+    this.syncComposer()
   }
 
   private hideCommandMenu(): void {
@@ -713,7 +847,7 @@ ${settingsHtml}
     }
   }
 
-  // ── Header / connection ─────────────────────────────────────────────────
+  // ── Connection ──────────────────────────────────────────────────────────
   setConnection(info: { bridge: 'ok' | 'down' | 'connecting'; whoami?: WhoAmI; origin: string; state: string }): void {
     // Only the connect check carries whoami; keep its answer for the redraws.
     if (info.bridge !== 'ok' && this.bridgeStt !== null) {
@@ -722,34 +856,52 @@ ${settingsHtml}
     }
     if (info.whoami) {
       this.bridgeStt = info.whoami.local_stt === true
+      this.loggedOut = !info.whoami.logged_in
       this.renderDictHint()
     }
-    if (this.connChip) {
-      this.connChip.className = `chip-conn ${info.bridge}`
-      const login = info.whoami && !info.whoami.logged_in ? ' · logged out' : ''
-      this.connChip.textContent = info.bridge === 'ok' ? `ok${login}` : info.bridge
-      this.connChip.title = `${info.origin} · ${info.state}`
+    const ok = info.bridge === 'ok'
+    const label = ok ? (this.loggedOut ? 'Logged out' : 'Connected') : info.bridge === 'connecting' ? 'Connecting' : 'Unreachable'
+    const cls = ok && !this.loggedOut ? 'ok' : info.bridge === 'connecting' ? 'wait' : 'bad'
+    const card = this.connCard
+    if (card) {
+      card.replaceChildren()
+      const text = document.createElement('div')
+      text.className = 'conn-text'
+      const host = document.createElement('div')
+      host.className = 'card-title'
+      host.textContent = info.origin ? hostOf(info.origin) : 'No bridge set'
+      const sub = document.createElement('div')
+      sub.className = 'card-sub'
+      sub.textContent =
+        info.bridge === 'down'
+          ? 'Check the address and token in Settings.'
+          : ok && this.loggedOut
+            ? 'Log in to Claude Code on the bridge host.'
+            : 'Claude Remote bridge'
+      text.append(host, sub)
+      card.append(text, stateBadge(label, cls))
     }
-    if (this.originEl) this.originEl.textContent = info.origin
+    this.settingsState?.replaceChildren(stateBadge(label, cls))
   }
 
   /** Whether the connected bridge transcribes dictation, once known. */
   private bridgeStt: boolean | null = null
-  /** The transcriber picked in the open Settings card (saved on Save). */
+  private loggedOut = false
+  /** The transcriber picked on the Settings screen (saved on Save). */
   private cardSource: SttSource = 'deepgram'
 
-  /** Pick a transcriber in the Settings card: mark it, and enable the
-   *  Deepgram fields only for Deepgram. */
+  /** Pick a transcriber on the Settings screen: mark it, and show the Deepgram
+   *  fields only for Deepgram. */
   private pickSource(source: SttSource): void {
     this.cardSource = source
     document.querySelectorAll<HTMLButtonElement>('.stt-source [data-source]').forEach((b) => {
       const on = b.dataset.source === source
-      b.classList.toggle('primary', on)
+      b.classList.toggle('on', on)
       b.setAttribute('aria-checked', String(on))
     })
-    for (const id of ['setDeepgramKey', 'setSttLanguage']) {
-      const input = document.getElementById(id) as HTMLInputElement | null
-      if (input) input.disabled = source === 'bridge'
+    for (const id of ['deepgramFields', 'deepgramHint']) {
+      const el = document.getElementById(id)
+      if (el) el.hidden = source === 'bridge'
     }
     this.renderDictHint()
   }
@@ -763,11 +915,11 @@ ${settingsHtml}
     el.hidden = this.cardSource !== 'bridge'
     if (el.hidden) return
     if (this.bridgeStt) {
-      el.textContent = 'Local dictation is available. The default model transcribes English.'
+      el.textContent = 'Whisper on the bridge host. The default model transcribes English.'
     } else if (this.bridgeStt === false) {
-      el.append('Restart the bridge with this command, then save Settings to reconnect.')
+      el.append('Restart the bridge with this command, then save to reconnect.')
       const cmd = document.createElement('code')
-      cmd.className = 'notice-cmd dict-cmd'
+      cmd.className = 'cmd-block'
       cmd.textContent = LOCAL_STT_COMMAND
       el.append(cmd)
     } else {
@@ -776,21 +928,20 @@ ${settingsHtml}
   }
 
   /** main.ts has restored the saved settings from the App-side store (or found
-   *  none): the Settings card may open now, and does at once if it was tapped
-   *  meanwhile. */
+   *  none): Settings may open now, and does at once if it was tapped meanwhile. */
   settingsLoaded(): void {
     this.settingsReady = true
     if (this.settingsHeld) {
       this.settingsHeld = false
-      this.toggleSettings()
+      this.openSettings()
     }
   }
 
   // ── Release notices ──────────────────────────────────────────────────────
   /** Render the not-yet-dismissed baked notices (notices.ts) as slim cards
-   *  between the header and the views. Deliberately unobtrusive: no modal, no
-   *  toast, no badge — a card that sits there until its × is tapped, then never
-   *  returns (main.ts persists the dismissal). Empty list hides the area. */
+   *  above the session list. Deliberately unobtrusive: no modal, no badge — a
+   *  card that sits there until its × is tapped, then never returns (main.ts
+   *  persists the dismissal). Empty list hides the area. */
   setNotices(list: Notice[]): void {
     const area = this.noticesEl
     if (!area) return
@@ -798,15 +949,16 @@ ${settingsHtml}
     area.hidden = list.length === 0
     for (const n of list) {
       const card = document.createElement('div')
-      card.className = `notice${n.level === 'important' ? ' important' : ''}`
+      card.className = `card notice${n.level === 'important' ? ' important' : ''}`
       const head = document.createElement('div')
       head.className = 'notice-head'
       const title = document.createElement('div')
       title.className = 'notice-title'
       title.textContent = n.title
       const dismiss = document.createElement('button')
-      dismiss.className = 'btn ghost notice-dismiss'
-      dismiss.textContent = '×'
+      dismiss.type = 'button'
+      dismiss.className = 'icon-btn small'
+      dismiss.innerHTML = ICON.close
       dismiss.setAttribute('aria-label', 'Dismiss notice')
       dismiss.addEventListener('click', () => this.cb.onDismissNotice(n.id))
       head.append(title, dismiss)
@@ -818,7 +970,7 @@ ${settingsHtml}
       if (n.command) {
         // tap-to-select mono block: the wearer copies it onto the bridge host.
         const cmd = document.createElement('code')
-        cmd.className = 'notice-cmd'
+        cmd.className = 'cmd-block'
         cmd.textContent = n.command
         card.appendChild(cmd)
       }
@@ -827,75 +979,103 @@ ${settingsHtml}
   }
 
   // ── Sessions list ────────────────────────────────────────────────────────
+  /** Grouped by what each session needs from you: waiting on you first, then
+   *  running, then idle. Within a group the order main.ts gives (pins first,
+   *  then by title) stands, so a poll never reshuffles a group. */
   setSessions(sessions: ActiveSession[], selectedId: string | null): void {
     const list = this.listEl
     if (!list) return
     list.textContent = ''
     if (sessions.length === 0) {
       const empty = document.createElement('div')
-      empty.className = 'list-empty'
-      empty.textContent = 'No active sessions.'
+      empty.className = 'card empty'
+      empty.textContent = 'No active sessions. A Claude Code session with remote control on shows up here.'
       list.appendChild(empty)
       return
     }
-    for (const s of sessions) list.appendChild(this.sessionRow(s, s.id === selectedId))
+    const groups: [string, StatusKind][] = [
+      ['Needs you', 'action'],
+      ['Running', 'running'],
+      ['Idle', 'idle'],
+    ]
+    for (const [title, kind] of groups) {
+      const members = sessions.filter((s) => statusOf(s.workerStatus).cls === kind)
+      if (members.length === 0) continue
+      const section = document.createElement('section')
+      section.className = 'group'
+      const h = document.createElement('h2')
+      h.className = 'group-title'
+      h.textContent = title
+      section.appendChild(h)
+      if (kind === 'idle') {
+        const card = document.createElement('div')
+        card.className = 'list-card'
+        for (const s of members) card.appendChild(this.idleRow(s, s.id === selectedId))
+        section.appendChild(card)
+      } else {
+        const stack = document.createElement('div')
+        stack.className = 'stack'
+        for (const s of members) stack.appendChild(this.sessionCard(s, kind, s.id === selectedId))
+        section.appendChild(stack)
+      }
+      list.appendChild(section)
+    }
   }
 
-  private sessionRow(s: ActiveSession, selected: boolean): HTMLDivElement {
-    const row = document.createElement('div')
-    // `needs` washes the row in the accent (BC-Accent) — the doc's "ongoing
-    // action / requires a warning" treatment — when the session is blocked on you.
-    const needs = s.workerStatus === 'requires_action' ? ' needs' : ''
-    row.className = `session-row${selected ? ' selected' : ''}${needs}`
-    row.setAttribute('role', 'button')
-    row.tabIndex = 0
-
-    const dot = statusDot(s.workerStatus)
-    const dotEl = document.createElement('span')
-    dotEl.className = `wdot ${dot.cls}`
-    dotEl.textContent = dot.glyph
-    dotEl.title = dot.label
-
+  /** A running or blocked session: title, what it is doing (or waiting on),
+   *  and its model, effort and context. */
+  private sessionCard(s: ActiveSession, kind: StatusKind, selected: boolean): HTMLElement {
+    const row = this.rowShell(s, `card session-card ${kind}${selected ? ' selected' : ''}`)
     const body = document.createElement('div')
-    body.className = 'session-body'
-
-    const name = document.createElement('div')
-    name.className = 'session-name'
-    name.textContent = s.title || 'Untitled session'
-    if (s.unread) {
-      const u = document.createElement('span')
-      u.className = 'unread'
-      u.title = 'Unread'
-      name.appendChild(u)
-    }
-
-    const sub = document.createElement('div')
-    sub.className = 'session-sub'
-    const bits = [s.pinned ? 'pinned' : '', modelLabel(s.model), s.effort ?? '', contextLabel(s), relTime(s.lastEventAt)]
-    sub.textContent = bits.filter(Boolean).join(' · ')
-
-    body.appendChild(name)
-    body.appendChild(sub)
-    // The server's one-line summary of where it stands — or, louder, what it
-    // is waiting on you for.
+    body.className = 'row-body'
+    const top = document.createElement('div')
+    top.className = 'row-top'
+    top.append(this.titleWithMarks(s, 'card-title big'))
+    const time = document.createElement('span')
+    time.className = 'row-time'
+    time.textContent = relTime(s.lastEventAt)
+    top.appendChild(time)
+    body.appendChild(top)
     const gist = s.needsAction || s.summary
     if (gist) {
       const line = document.createElement('div')
-      line.className = `session-gist${s.needsAction ? ' needs' : ''}`
+      line.className = 'row-gist'
       line.textContent = gist
       body.appendChild(line)
     }
-    row.appendChild(dotEl)
+    const meta = document.createElement('div')
+    meta.className = 'row-meta'
+    const bits = [s.pinned ? 'Pinned' : '', modelLabel(s.model), s.effort ?? ''].filter(Boolean)
+    const label = document.createElement('span')
+    label.textContent = bits.join(' · ')
+    meta.appendChild(label)
+    if (s.context?.percent != null) meta.append(meterEl(s.context.percent, 'small'), `${s.context.percent}%`)
+    body.appendChild(meta)
     row.appendChild(body)
+    row.insertAdjacentHTML('beforeend', `<span class="row-chev">${ICON.chev}</span>`)
+    return row
+  }
 
-    // Chevron drill-in affordance (the doc's Guide-System "drill-in" glyph). The
-    // panel is a full-Unicode WebView, so rich glyphs are fine here.
-    const chev = document.createElement('span')
-    chev.className = 'row-chev'
-    chev.setAttribute('aria-hidden', 'true')
-    chev.textContent = '›'
-    row.appendChild(chev)
+  /** An idle session: a row in the grouped Idle card. */
+  private idleRow(s: ActiveSession, selected: boolean): HTMLElement {
+    const row = this.rowShell(s, `idle-row${selected ? ' selected' : ''}`)
+    const body = document.createElement('div')
+    body.className = 'row-body'
+    body.appendChild(this.titleWithMarks(s, 'card-title'))
+    const sub = document.createElement('div')
+    sub.className = 'card-sub ellipsis'
+    sub.textContent = [s.pinned ? 'Pinned' : '', s.summary ?? '', relTime(s.lastEventAt)].filter(Boolean).join(' · ')
+    if (sub.textContent) body.appendChild(sub)
+    row.appendChild(body)
+    row.insertAdjacentHTML('beforeend', `<span class="row-chev">${ICON.chev}</span>`)
+    return row
+  }
 
+  private rowShell(s: ActiveSession, cls: string): HTMLElement {
+    const row = document.createElement('div')
+    row.className = cls
+    row.setAttribute('role', 'button')
+    row.tabIndex = 0
     const open = () => this.cb.onSelectSession(s.id)
     row.addEventListener('click', open)
     row.addEventListener('keydown', (e) => {
@@ -907,7 +1087,25 @@ ${settingsHtml}
     return row
   }
 
-  // ── Detail view (reveal / header / control-enable) ────────────────────────
+  /** The title with the unread mark: the Figma's square notification dot. */
+  private titleWithMarks(s: ActiveSession, cls: string): HTMLElement {
+    const name = document.createElement('span')
+    name.className = cls
+    const text = document.createElement('span')
+    text.className = 'ellipsis'
+    text.textContent = s.title || 'Untitled session'
+    name.appendChild(text)
+    if (s.unread) {
+      const u = document.createElement('span')
+      u.className = 'unread'
+      u.title = 'Unread'
+      u.setAttribute('aria-label', 'Unread')
+      name.appendChild(u)
+    }
+    return name
+  }
+
+  // ── Session screen ──────────────────────────────────────────────────────
   setActiveSession(session: ActiveSession | null): void {
     this.setHistoryBefore(null)
     const nextSid = session?.id ?? null
@@ -915,6 +1113,7 @@ ${settingsHtml}
       if (this.currentSid && this.sendInput.value) this.drafts.set(this.currentSid, this.sendInput.value)
       this.sendInput.value = nextSid ? this.drafts.get(nextSid) ?? '' : ''
       if (nextSid) this.drafts.delete(nextSid)
+      this.closeControls()
     }
     this.currentSid = nextSid
     if (this.claudeLink) {
@@ -922,11 +1121,11 @@ ${settingsHtml}
       else this.claudeLink.removeAttribute('href')
     }
     this.hideCommandMenu() // never carry a stale popover across an open/close
-    const showDetail = session !== null
-    if (this.listView) this.listView.hidden = showDetail
-    if (this.detailView) this.detailView.hidden = !showDetail
+    this.showScreen(session ? 'detail' : 'list')
     if (!session) {
       this.session = null
+      this.closeControls()
+      this.syncComposer()
       return
     }
     if (this.detailTitle) this.detailTitle.textContent = session.title || 'Untitled session'
@@ -934,7 +1133,7 @@ ${settingsHtml}
   }
 
   /** The open session's fresh metadata (every list poll): status, settings,
-   *  context, summary, and whether Interrupt applies. */
+   *  context, summary, and whether Stop applies. */
   refreshSession(session: ActiveSession): void {
     if (session.id !== this.currentSid) return
     this.session = session
@@ -947,48 +1146,228 @@ ${settingsHtml}
     this.renderMeta()
   }
 
+  /** Model, effort and mode as the worker last reported them. Unknown stays
+   *  blank: never a guess. */
+  private live(): { model: string | null; effort: string | null; mode: string | null } {
+    const s = this.session
+    const w = this.worker
+    return {
+      model: w?.model ?? s?.model ?? null,
+      effort: w?.effort ?? s?.effort ?? null,
+      mode: w?.permissionMode ?? s?.permissionMode ?? null,
+    }
+  }
+
   private renderMeta(): void {
     const s = this.session
     if (!s) return
-    const w = this.worker
-    const model = w?.model ?? s.model
-    const effort = w?.effort ?? s.effort
-    const mode = w?.permissionMode ?? s.permissionMode
-    if (this.detailMeta) {
-      const dot = statusDot(s.workerStatus)
-      this.detailMeta.textContent = ''
-      const d = document.createElement('span')
-      d.className = `wdot ${dot.cls}`
-      d.textContent = `${dot.glyph} ${dot.label}`
-      this.detailMeta.appendChild(d)
-      const rest = document.createElement('span')
-      rest.textContent = ` · ${[modelLabel(model), effort ?? '', mode ?? '', contextLabel(s)].filter(Boolean).join(' · ')}`
-      this.detailMeta.appendChild(rest)
-    }
-    if (this.detailSummary) {
+    const { model, effort, mode } = this.live()
+    const card = this.statusCard
+    if (card) {
+      const st = statusOf(s.workerStatus)
+      card.className = `card status ${st.cls}`
+      card.replaceChildren()
+      const text = document.createElement('div')
+      text.className = 'conn-text'
+      const line1 = document.createElement('div')
+      line1.className = 'card-title'
+      line1.textContent = [modelLabel(model), effort ?? ''].filter(Boolean).join(' · ') || 'Model not reported yet'
+      const line2 = document.createElement('div')
+      line2.className = 'card-sub'
+      line2.textContent = [modeLabel(mode, 'long'), s.context?.percent != null ? `context ${s.context.percent}%` : ''].filter(Boolean).join(' · ')
+      text.append(line1)
+      if (line2.textContent) text.append(line2)
       const gist = s.needsAction || s.summary || ''
-      this.detailSummary.textContent = gist
-      this.detailSummary.hidden = !gist
-      this.detailSummary.classList.toggle('needs', !!s.needsAction)
+      if (gist) {
+        const g = document.createElement('div')
+        g.className = 'status-gist'
+        g.textContent = gist
+        text.append(g)
+      }
+      card.appendChild(text)
+      // A prompt set aside with ✕ is one tap away: the badge reopens it.
+      if (this.promptKind !== 'none' && this.promptHidden) {
+        const review = document.createElement('button')
+        review.type = 'button'
+        review.className = 'btn small dark'
+        review.dataset.review = '1'
+        review.textContent = 'Review'
+        card.appendChild(review)
+      } else {
+        card.appendChild(stateBadge(st.label, st.cls === 'running' ? 'ok' : st.cls === 'action' ? 'plain' : 'idle'))
+      }
     }
-    // Reflect the live settings in the selects (an unknown one shows blank
-    // rather than a guess — an option that doesn't exist selects nothing). A
-    // model this build's list lacks (a newer release) is real, though: it gets
-    // an option, by id, so the select never shows another model in its place.
-    if (this.modelSel && model) {
-      if (!Array.from(this.modelSel.options).some((o) => o.value === model)) this.modelSel.add(new Option(model, model))
-      this.modelSel.value = model
+    this.syncComposer()
+    this.renderControls()
+  }
+
+  // ── Session controls (the ⋯ sheet) ───────────────────────────────────────
+  private openControls(): void {
+    if (!this.session || !this.controlsSheet) return
+    this.controlsSheet.hidden = false
+    if (this.controlsOverlay) this.controlsOverlay.hidden = false
+    this.renderControls()
+    // Usage and changes are fetched on open; each fetch leaves a hidden
+    // control request in the session's log, so it is never polled.
+    if (!this.infoView?.loading) this.cb.onLoadInfo()
+  }
+
+  private closeControls(): void {
+    if (this.controlsSheet) this.controlsSheet.hidden = true
+    if (this.controlsOverlay) this.controlsOverlay.hidden = true
+    if (this.archiveTimer !== null) clearTimeout(this.archiveTimer)
+    this.archiveTimer = null
+    this.archiveArmed = false
+  }
+
+  private controlsOpen(): boolean {
+    return !!this.controlsSheet && !this.controlsSheet.hidden
+  }
+
+  /** Segmented selector: the Figma's #E4E4E4 track with a white selected
+   *  segment. `current` null selects nothing. */
+  private segmented(
+    label: string,
+    options: { value: string; label: string; danger?: boolean }[],
+    current: string | null,
+    pick: (value: string) => void,
+  ): HTMLElement {
+    const wrap = document.createElement('div')
+    wrap.className = 'group'
+    const h = document.createElement('div')
+    h.className = 'group-title'
+    h.textContent = label
+    const seg = document.createElement('div')
+    seg.className = 'seg'
+    seg.setAttribute('role', 'radiogroup')
+    seg.setAttribute('aria-label', label)
+    seg.style.gridTemplateColumns = `repeat(${options.length}, minmax(0, 1fr))`
+    for (const o of options) {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.setAttribute('role', 'radio')
+      const on = o.value === current
+      b.setAttribute('aria-checked', String(on))
+      b.className = `${on ? 'on' : ''}${o.danger ? ' danger' : ''}`
+      b.textContent = o.label
+      b.addEventListener('click', () => {
+        if (!on) pick(o.value)
+      })
+      seg.appendChild(b)
     }
-    if (this.modeSel) this.modeSel.value = mode ?? ''
-    if (this.effortSel) this.effortSel.value = effort ?? ''
-    // Interrupt only makes sense while the worker is running.
-    if (this.interruptBtn) this.interruptBtn.disabled = s.workerStatus !== 'running'
-    // The pin is the bridge's to report; one too old to (pre-0.5.0) can't set it.
-    if (this.pinBtn) {
-      this.pinBtn.hidden = s.pinned === undefined
-      this.pinBtn.textContent = s.pinned ? 'Unpin' : 'Pin'
+    wrap.append(h, seg)
+    return wrap
+  }
+
+  private renderControls(): void {
+    const body = this.controlsBody
+    const s = this.session
+    if (!body || !s || !this.controlsOpen()) return
+    const title = document.getElementById('controlsTitle')
+    if (title) title.textContent = s.title || 'Untitled session'
+    const { model, effort, mode } = this.live()
+    if (this.controlsSub) {
+      const version = this.worker?.ccVersion ?? s.ccVersion
+      this.controlsSub.textContent = version ? `Claude Code ${version}` : ''
     }
-    this.renderInfo()
+    body.replaceChildren()
+
+    // A model this build's list lacks (a newer release) is real: it gets its
+    // own segment, so the selector never shows another model in its place.
+    const models = MODELS.map((m) => ({ value: m.id, label: m.label }))
+    if (model && !models.some((m) => m.value === model)) models.push({ value: model, label: model })
+    body.appendChild(this.segmented('Model', models, model, (v) => this.cb.onSetModel(v)))
+    body.appendChild(
+      this.segmented(
+        'Effort',
+        EFFORTS.map((e) => ({ value: e.id ?? 'auto', label: effortLabel(e.label) })),
+        effort,
+        (v) => this.cb.onSetEffort(v),
+      ),
+    )
+    body.appendChild(
+      this.segmented(
+        'Permissions',
+        MODES.map((m) => ({ value: m, label: modeLabel(m, 'short'), danger: m === 'bypassPermissions' })),
+        mode,
+        (v) => this.cb.onSetMode(v as PermissionMode),
+      ),
+    )
+
+    // Usage: context from the session object (free), plan windows on demand.
+    const usage = document.createElement('div')
+    usage.className = 'group'
+    const uh = document.createElement('div')
+    uh.className = 'group-head'
+    const ut = document.createElement('div')
+    ut.className = 'group-title'
+    ut.textContent = 'Usage'
+    const refresh = document.createElement('button')
+    refresh.type = 'button'
+    refresh.className = 'link-btn'
+    refresh.textContent = this.infoView?.loading ? 'Asking…' : 'Refresh'
+    refresh.disabled = !!this.infoView?.loading
+    refresh.addEventListener('click', () => this.cb.onLoadInfo())
+    uh.append(ut, refresh)
+    const uc = document.createElement('div')
+    uc.className = 'card usage'
+    const v = this.infoView
+    const ctx = v?.info?.context ?? s.context
+    if (ctx?.percent != null) uc.appendChild(usageRow('Context', ctx.percent))
+    for (const l of v?.info?.usage?.limits ?? []) if (l.percent != null) uc.appendChild(usageRow(limitLabel(l.kind, l.model), l.percent))
+    if (ctx?.usedTokens != null && ctx.maxTokens != null) uc.appendChild(noteLine(`${ctx.usedTokens.toLocaleString()} of ${ctx.maxTokens.toLocaleString()} context tokens`))
+    for (const c of v?.info?.context?.categories ?? []) uc.appendChild(noteLine(`${c.name} · ${c.tokens.toLocaleString()} tokens`))
+    if (s.rateLimit) uc.appendChild(noteLine(rateLimitLabel(s)))
+    if (v?.error) uc.appendChild(noteLine(v.error))
+    if (!uc.childElementCount) uc.appendChild(noteLine(v?.loading ? 'Asking the worker…' : 'Context usage unavailable'))
+    usage.append(uh, uc)
+    body.appendChild(usage)
+
+    // Changes, background tasks, the link out: one grouped list.
+    const list = document.createElement('div')
+    list.className = 'list-card'
+    const d = v?.info?.diff
+    const changes = d ? (d.files ? `${d.files} file${d.files > 1 ? 's' : ''} · +${d.added} −${d.removed}` : 'None uncommitted') : v?.info?.diffPending ? 'Still counting' : v?.loading ? '…' : '—'
+    list.appendChild(infoRow('Changes', changes))
+    for (const t of this.tasks) {
+      const row = infoRow(t.description || t.id, '')
+      const stop = document.createElement('button')
+      stop.type = 'button'
+      stop.className = 'btn small danger'
+      stop.textContent = 'Stop'
+      stop.addEventListener('click', () => this.cb.onStopTask(t.id))
+      row.appendChild(stop)
+      list.appendChild(row)
+    }
+    if (this.tasks.length === 0) list.appendChild(infoRow('Background tasks', 'None running'))
+    const link = document.createElement('a')
+    link.className = 'field-row'
+    link.target = '_blank'
+    link.rel = 'noopener noreferrer'
+    link.href = `https://claude.ai/code/${encodeURIComponent(s.id)}`
+    link.innerHTML = `<span class="field-name">Open in Claude</span><span class="row-value">${ICON.external}</span>`
+    list.appendChild(link)
+    body.appendChild(list)
+
+    // Pin (when the bridge reports pins) and Archive.
+    const acts = document.createElement('div')
+    acts.className = 'pair'
+    if (s.pinned !== undefined) {
+      const pin = document.createElement('button')
+      pin.type = 'button'
+      pin.className = 'btn'
+      pin.title = 'Pinned sessions lead the list, here and on claude.ai'
+      pin.textContent = s.pinned ? 'Unpin' : 'Pin'
+      pin.addEventListener('click', () => this.cb.onSetPinned(!s.pinned))
+      acts.appendChild(pin)
+    }
+    const archive = document.createElement('button')
+    archive.type = 'button'
+    archive.className = `btn danger${this.archiveArmed ? ' armed' : ''}`
+    archive.textContent = this.archiveArmed ? 'Tap again to archive' : 'Archive'
+    archive.addEventListener('click', () => this.archiveClick(archive))
+    acts.appendChild(archive)
+    body.appendChild(acts)
   }
 
   // ── Side question card ─────────────────────────────────────────────────────
@@ -1000,12 +1379,14 @@ ${settingsHtml}
     card.hidden = !aside
     if (!aside) return
     const head = document.createElement('div')
-    head.className = 'aside-head'
+    head.className = 'notice-head'
     const label = document.createElement('span')
-    label.textContent = 'ASIDE · not in the transcript'
+    label.className = 'aside-label'
+    label.textContent = 'Asked aside · not in the transcript'
     const close = document.createElement('button')
-    close.className = 'btn ghost notice-dismiss'
-    close.textContent = '×'
+    close.type = 'button'
+    close.className = 'icon-btn small'
+    close.innerHTML = ICON.close
     close.setAttribute('aria-label', 'Dismiss')
     close.addEventListener('click', () => this.cb.onDismissAside())
     head.append(label, close)
@@ -1018,59 +1399,25 @@ ${settingsHtml}
     card.append(head, q, a)
   }
 
-  // ── Session card (tasks, plan usage, changes) ──────────────────────────────
+  // ── Background tasks + on-demand info ───────────────────────────────────
   /** The running background set (live from the event stream). */
   setTasks(tasks: BackgroundTask[]): void {
     this.tasks = tasks
-    this.renderInfo()
+    this.renderControls()
   }
 
   /** The on-demand part — plan usage + git changes — or null to clear it. */
   setInfo(view: InfoView | null): void {
     this.infoView = view
-    this.renderInfo()
+    this.renderControls()
   }
 
+  /** `/context` or `/usage` from the send box: show them in the controls sheet. */
   focusInfo(): void {
-    this.infoBody?.closest('section')?.scrollIntoView({ block: 'center' })
-  }
-
-  private renderInfo(): void {
-    const body = this.infoBody
-    if (!body) return
-    body.replaceChildren()
-    const row = (text: string, cls = 'info-row'): HTMLDivElement => {
-      const el = document.createElement('div')
-      el.className = cls
-      el.textContent = text
-      body.appendChild(el)
-      return el
-    }
-    for (const t of this.tasks) {
-      const el = row(`Background: ${t.description || t.id}`, 'info-row task')
-      const stop = document.createElement('button')
-      stop.className = 'btn danger'
-      stop.textContent = 'Stop'
-      stop.addEventListener('click', () => this.cb.onStopTask(t.id))
-      el.appendChild(stop)
-    }
-    const v = this.infoView
-    if (v?.info?.usage?.limits.length) row(`Plan · ${planLabel(v.info)}`)
-    if (v?.info?.diff) {
-      const d = v.info.diff
-      row(d.files ? `Changes · ${d.files} file${d.files > 1 ? 's' : ''} +${d.added} −${d.removed}` : 'Changes · none uncommitted')
-    } else if (v?.info?.diffPending) {
-      row('Changes · still being counted, ask again')
-    }
-    if (v?.loading) row('Asking the worker…', 'info-row muted')
-    else if (v?.error) row(v.error, 'info-row muted')
-    const s = this.session
-    const ctx = v?.info?.context ?? s?.context
-    if (s) row(ctx?.percent != null ? `Context · ${ctx.percent}% (${ctx.usedTokens} of ${ctx.maxTokens} tokens)` : 'Context usage unavailable')
-    for (const c of v?.info?.context?.categories ?? []) row(`${c.name} · ${c.tokens} tokens`)
-    if (s?.rateLimit) row(rateLimitLabel(s))
-    const settings = this.worker ? settingsLine(this.worker) : ''
-    if (s?.ccVersion || settings) row([settings, s?.ccVersion ? `Claude Code ${s.ccVersion}` : ''].filter(Boolean).join(' · '), 'info-row muted')
+    if (!this.session || !this.controlsSheet) return
+    this.controlsSheet.hidden = false
+    if (this.controlsOverlay) this.controlsOverlay.hidden = false
+    this.renderControls()
   }
 
   // ── Event log ─────────────────────────────────────────────────────────────
@@ -1104,7 +1451,7 @@ ${settingsHtml}
       if (node) fragment.appendChild(node)
     }
     log.prepend(fragment)
-    if (previous && offset != null) log.scrollTop += previous.getBoundingClientRect().top - offset
+    if (previous && offset != null && this.scrollEl) this.scrollEl.scrollTop += previous.getBoundingClientRect().top - offset
     this.setHistoryBefore(page.before != null && page.before < before ? page.before : null)
   }
 
@@ -1118,7 +1465,7 @@ ${settingsHtml}
       this.appendNode(e)
     }
     this.setHistoryBefore(before)
-    this.autoScroll()
+    if (this.scrollEl) this.scrollEl.scrollTop = this.scrollEl.scrollHeight
   }
 
   appendEvent(e: RcEvent): void {
@@ -1129,23 +1476,38 @@ ${settingsHtml}
       if (this.seen.has(e.sequenceNum)) return
       this.seen.add(e.sequenceNum)
     }
+    const follow = this.nearBottom()
     this.appendNode(e)
-    this.autoScroll()
+    if (follow && this.scrollEl) this.scrollEl.scrollTop = this.scrollEl.scrollHeight
   }
 
   /** Render one event into the log, folding a run of identically-rendered
-   *  simple rows into a single `… ×N` row (see `lastFold`). */
+   *  simple rows into a single `… ×N` row (see `lastFold`), and joining a run
+   *  of tool calls into one card. */
   private appendNode(e: RcEvent): void {
-    if (!this.logEl) return
+    const log = this.logEl
+    if (!log) return
     // The panel twin of EventLog's reset: only what follows a /clear stays. `seen`
     // survives, so a replay can't bring the old events back.
     if (e.type === 'conversation_reset' && !e.parentToolUseId) {
       this.setHistoryBefore(null)
-      this.logEl.textContent = ''
+      log.textContent = ''
       this.lastFold = null
     }
     const node = this.eventNode(e)
     if (!node) return
+    // Consecutive tool calls (from one agent: the main loop or a subagent)
+    // share one card, as the HUD packs them into one chain line.
+    const last = log.lastElementChild
+    if (
+      node.classList.contains('tools') &&
+      last?.classList.contains('tools') &&
+      node.classList.contains('subagent') === last.classList.contains('subagent')
+    ) {
+      last.append(...Array.from(node.children))
+      this.lastFold = null
+      return
+    }
     const foldable = node.childElementCount === 0
     const key = foldable ? `${e.parentToolUseId ?? ''}\0${node.className}\0${node.textContent ?? ''}` : ''
     if (foldable && this.lastFold?.key === key) {
@@ -1153,41 +1515,37 @@ ${settingsHtml}
       this.lastFold.el.textContent = `${this.lastFold.base} ×${this.lastFold.count}`
       return
     }
-    this.logEl.appendChild(node)
+    log.appendChild(node)
     this.lastFold = foldable ? { key, base: node.textContent ?? '', count: 1, el: node } : null
   }
 
   private eventNode(e: RcEvent): HTMLDivElement | null {
     const node = renderEventNode(e)
     if (!node) return null
-    if (e.parentToolUseId) {
-      node.prepend(document.createTextNode('Subagent · '))
-      node.classList.add('subagent')
-    }
+    if (e.parentToolUseId) node.classList.add('subagent')
     return node
   }
 
   /** Follow the newest event unless the reader scrolled up into history. */
-  private autoScroll(): void {
-    const el = this.logEl
-    if (!el) return
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120
-    if (nearBottom) el.scrollTop = el.scrollHeight
+  private nearBottom(): boolean {
+    const el = this.scrollEl
+    return !el || el.scrollHeight - el.scrollTop - el.clientHeight < 120
   }
 
   // ── Voice dictation ──────────────────────────────────────────────────────
-  /** Reflect dictation active/idle on the Dictate button. Driven by main.ts's
+  /** Reflect dictation active/idle on the mic button. Driven by main.ts's
    *  voice lifecycle (not by interim-text presence, which lags the mic opening). */
   setDictating(active: boolean): void {
     this.dictating = active
     if (this.dictateBtn) {
-      this.dictateBtn.classList.toggle('active', active)
-      this.dictateBtn.textContent = active ? 'Stop' : 'Dictate'
+      this.dictateBtn.classList.toggle('live', active)
+      this.dictateBtn.setAttribute('aria-label', active ? 'Stop dictating' : 'Dictate')
     }
     if (!active && this.interimEl) {
       this.interimEl.textContent = ''
       this.interimEl.hidden = true
     }
+    this.syncComposer()
   }
 
   setInterim(text: string): void {
@@ -1204,118 +1562,230 @@ ${settingsHtml}
     if (!box) return
     const draft = box.value.trimEnd()
     box.value = draft ? `${draft} ${text}` : text
+    this.syncComposer()
   }
 
-  // ── Permission banner ────────────────────────────────────────────────────
+  // ── Blocking prompt (a pop-up sheet over the session) ─────────────────────
+  /** Open the sheet for `kind`. A new prompt (`key` changed) opens even if the
+   *  last one was closed with ✕. */
+  private presentPrompt(kind: 'permission' | 'question' | 'external', key: string): HTMLElement | null {
+    const sheet = this.promptSheet
+    if (!sheet) return null
+    if (key !== this.promptKey) this.promptHidden = false
+    this.promptKey = key
+    this.promptKind = kind
+    sheet.replaceChildren()
+    this.closeControls()
+    this.syncPromptVisibility()
+    return sheet
+  }
+
+  private clearPrompt(): void {
+    this.promptKind = 'none'
+    this.promptKey = ''
+    this.promptHidden = false
+    this.promptSheet?.replaceChildren()
+    this.syncPromptVisibility()
+  }
+
+  private hidePrompt(): void {
+    this.promptHidden = true
+    this.syncPromptVisibility()
+  }
+
+  private showPrompt(): void {
+    this.promptHidden = false
+    this.syncPromptVisibility()
+  }
+
+  private syncPromptVisibility(): void {
+    const open = this.promptKind !== 'none' && !this.promptHidden
+    if (this.promptSheet) this.promptSheet.hidden = !open
+    if (this.promptOverlay) this.promptOverlay.hidden = !open
+    this.renderMeta()
+  }
+
+  /** The sheet's centred title, description and a ✕ that sets it aside. */
+  private promptHead(sheet: HTMLElement, title: string, desc: string): void {
+    const head = document.createElement('div')
+    head.className = 'sheet-head'
+    const side = document.createElement('span')
+    side.className = 'nav-side'
+    const titles = document.createElement('div')
+    titles.className = 'sheet-titles'
+    const h = document.createElement('h2')
+    h.className = 'sheet-title'
+    h.textContent = title
+    titles.appendChild(h)
+    if (desc) {
+      const d = document.createElement('div')
+      d.className = 'sheet-desc'
+      d.textContent = desc
+      titles.appendChild(d)
+    }
+    const close = document.createElement('button')
+    close.type = 'button'
+    close.className = 'icon-btn'
+    close.innerHTML = ICON.close
+    close.setAttribute('aria-label', 'Set aside without answering')
+    close.title = 'Set aside without answering'
+    close.addEventListener('click', () => this.hidePrompt())
+    head.append(side, titles, close)
+    sheet.appendChild(head)
+  }
+
   setPermission(p: PermissionRequest | null): void {
-    const banner = this.permBanner
-    if (!banner) return
     if (!p) {
-      banner.hidden = true
-      banner.textContent = ''
+      if (this.promptKind === 'permission' || this.promptKind === 'external') this.clearPrompt()
       return
     }
-    banner.hidden = false
-    banner.textContent = ''
+    const sheet = this.presentPrompt('permission', p.toolUseId ?? `${p.toolName}\0${formatInput(p.input)}`)
+    if (!sheet) return
+    const tool = p.toolName ?? 'this tool'
+    const desc = typeof p.input?.description === 'string' ? p.input.description : ''
+    this.promptHead(sheet, `Allow ${tool}?`, desc)
 
-    const head = document.createElement('div')
-    head.className = 'perm-head'
-    head.textContent = `NEEDS YOU · ${p.toolName ?? 'tool'}`
-    banner.appendChild(head)
-
+    const body = document.createElement('div')
+    body.className = 'sheet-body'
     const input = formatInput(p.input)
     if (input) {
       const pre = document.createElement('pre')
-      pre.className = 'perm-input'
-      pre.textContent = input
-      banner.appendChild(pre)
+      pre.className = 'code-card'
+      // A lone command or path reads best as itself; anything richer as JSON.
+      const keys = Object.keys(p.input ?? {}).filter((k) => k !== 'description')
+      const lone = keys.length === 1 ? p.input?.[keys[0]] : undefined
+      pre.textContent = typeof lone === 'string' ? lone : input
+      body.appendChild(pre)
     }
 
     const acts = document.createElement('div')
-    acts.className = 'perm-acts'
-    const allow = document.createElement('button')
-    allow.className = 'btn primary'
-    allow.textContent = 'Allow'
-    allow.addEventListener('click', () => this.cb.onAnswerPermission('allow'))
-    const deny = document.createElement('button')
-    deny.className = 'btn danger'
-    deny.textContent = 'Deny'
-    const note = document.createElement('input')
-    note.className = 'set-input'
-    note.placeholder = 'Optional reason for denying'
-    note.setAttribute('aria-label', note.placeholder)
-    deny.addEventListener('click', () => this.cb.onAnswerPermission('deny', note.value.trim()))
-    acts.appendChild(allow)
-    acts.appendChild(deny)
+    acts.className = 'stack'
+    acts.appendChild(arrowButton('Allow', 'primary', () => this.cb.onAnswerPermission('allow')))
     if (p.sessionRule) {
-      const rule = document.createElement('button')
-      rule.className = 'btn session-rule'
-      rule.textContent = `Allow for this session · ${p.sessionRule}`
-      rule.onclick = () => this.cb.onAnswerPermission('allow', undefined, p.sessionRule!)
-      acts.appendChild(rule)
+      const rule = p.sessionRule
+      const btn = arrowButton('Allow for this session', '', () => this.cb.onAnswerPermission('allow', undefined, rule))
+      const r = document.createElement('span')
+      r.className = 'btn-note'
+      r.textContent = rule
+      btn.appendChild(r)
+      acts.appendChild(btn)
     }
-    banner.append(note, acts)
+    const note = document.createElement('input')
+    note.className = 'text-input'
+    note.placeholder = 'Optional: what to do instead'
+    note.setAttribute('aria-label', 'Reason for denying')
+    const deny = arrowButton('Deny', 'danger', () => this.cb.onAnswerPermission('deny', note.value.trim()))
+    note.addEventListener('input', () => {
+      const label = deny.querySelector('.btn-label')
+      if (label) label.textContent = note.value.trim() ? 'Deny with note' : 'Deny'
+    })
+    acts.appendChild(deny)
+    const noteWrap = document.createElement('label')
+    noteWrap.className = 'group'
+    const noteLabel = document.createElement('span')
+    noteLabel.className = 'group-title'
+    noteLabel.textContent = 'Deny with a note'
+    noteWrap.append(noteLabel, note)
+    body.append(acts, noteWrap)
+    sheet.appendChild(body)
   }
 
   showExternalDialog(): void {
-    if (!this.permBanner) return
-    this.permBanner.hidden = false
-    this.permBanner.textContent = 'Open this session in Claude to answer its dialog.'
+    const sheet = this.presentPrompt('external', `external:${this.currentSid}`)
+    if (!sheet) return
+    this.promptHead(sheet, 'Answer in Claude', 'This dialog can only be answered in Claude.')
+    const body = document.createElement('div')
+    body.className = 'sheet-body'
+    const link = document.createElement('a')
+    link.className = 'btn primary arrow-btn'
+    link.target = '_blank'
+    link.rel = 'noopener noreferrer'
+    if (this.currentSid) link.href = `https://claude.ai/code/${encodeURIComponent(this.currentSid)}`
+    link.innerHTML = `${ICON.arrow}<span class="btn-label">Open in Claude</span>`
+    body.appendChild(link)
+    sheet.appendChild(body)
   }
 
   // ── Question dialog (AskUserQuestion / request_user_dialog) ─────────────────
   /** Render a blocking QUESTION with its options as buttons (or hide when null).
-   *  Shares the permission banner — only one blocking prompt is ever pending. A
-   *  picked option shows selected. Clicking one answers a single-select
+   *  A picked option shows selected. Clicking one answers a single-select
    *  question; a multi-select toggles it and is answered by its Done button
    *  (`done[i]` = question i is settled). */
   setDialog(questions: DialogQuestion[] | null, picks: string[][], done: boolean[]): void {
-    const banner = this.permBanner
-    if (!banner) return
     if (questions !== this.draftQuestions) {
       this.dialogDrafts.clear()
       this.draftQuestions = questions
     }
     if (!questions || questions.length === 0) {
-      banner.hidden = true
-      banner.textContent = ''
+      if (this.promptKind === 'question') this.clearPrompt()
       return
     }
-    banner.hidden = false
-    banner.textContent = ''
+    const key = `q:${questions.map((q) => q.question).join('\0')}`
+    const scroll = this.promptSheet?.querySelector('.sheet-body')?.scrollTop ?? 0
+    const sheet = this.presentPrompt('question', key)
+    if (!sheet) return
+    const first = questions[0]
+    this.promptHead(sheet, questions.length > 1 ? `Claude asks ${questions.length} questions` : first.header || 'Claude asks', '')
 
-    const head = document.createElement('div')
-    head.className = 'perm-head'
-    head.textContent = `NEEDS YOU · QUESTION${questions.length > 1 ? ` (${questions.length})` : ''}`
-    banner.appendChild(head)
-
+    const body = document.createElement('div')
+    body.className = 'sheet-body'
     questions.forEach((q, qi) => {
       const block = document.createElement('div')
-      block.className = 'q-block'
-
+      block.className = 'group'
       const qt = document.createElement('div')
       qt.className = 'q-text'
-      qt.textContent = `${q.question || q.header || 'Question'}${q.multiSelect ? ' (pick any)' : ''}`
+      qt.textContent = q.question || q.header || 'Question'
       block.appendChild(qt)
+      if (q.multiSelect) {
+        const hint = document.createElement('div')
+        hint.className = 'group-title'
+        hint.textContent = 'Pick any, then tap Done'
+        block.appendChild(hint)
+      }
 
       const opts = document.createElement('div')
-      opts.className = 'q-opts'
+      opts.className = 'stack'
       const options = q.options.length ? q.options : [{ label: 'Proceed', description: '' }]
       for (const o of options) {
         const chosen = (picks[qi] ?? []).includes(o.label)
         const b = document.createElement('button')
-        b.className = `btn q-opt${chosen ? ' chosen' : ''}`
-        b.textContent = o.description ? `${o.label} — ${o.description}` : o.label
+        b.type = 'button'
+        b.className = `btn option${chosen ? ' chosen' : ''}`
+        b.setAttribute('aria-pressed', String(chosen))
+        const l = document.createElement('span')
+        l.className = 'option-label'
+        l.textContent = o.label
+        b.appendChild(l)
+        if (o.description) {
+          const d = document.createElement('span')
+          d.className = 'option-desc'
+          d.textContent = o.description
+          b.appendChild(d)
+        }
         b.addEventListener('click', () => this.cb.onPickDialogOption(qi, o.label))
         opts.appendChild(b)
       }
+      for (const label of picks[qi] ?? []) {
+        if (options.some((o) => o.label === label)) continue
+        const pick = document.createElement('button')
+        pick.type = 'button'
+        pick.className = 'btn option chosen'
+        pick.textContent = label
+        pick.onclick = () => this.cb.onPickDialogOption(qi, label)
+        opts.appendChild(pick)
+      }
+      block.appendChild(opts)
+
+      const otherRow = document.createElement('div')
+      otherRow.className = 'input-row'
       const custom = document.createElement('input')
       custom.placeholder = 'Other answer'
       custom.setAttribute('aria-label', `Other answer for ${q.question}`)
-      custom.className = 'set-input'
+      custom.className = 'text-input'
       const other = document.createElement('button')
+      other.type = 'button'
       other.className = 'btn'
-      other.textContent = q.multiSelect ? 'Add answer' : 'Use answer'
+      other.textContent = q.multiSelect ? 'Add' : 'Use'
       custom.value = this.dialogDrafts.get(qi) ?? ''
       other.disabled = !custom.value.trim()
       custom.oninput = () => {
@@ -1328,40 +1798,33 @@ ${settingsHtml}
         this.dialogDrafts.delete(qi)
         this.cb.onPickDialogOption(qi, value)
       }
-      for (const label of picks[qi] ?? []) {
-        if (options.some((o) => o.label === label)) continue
-        const pick = document.createElement('button')
-        pick.className = 'btn chosen'
-        pick.textContent = label
-        pick.onclick = () => this.cb.onPickDialogOption(qi, label)
-        opts.appendChild(pick)
-      }
-      block.append(opts, custom, other)
+      otherRow.append(custom, other)
+      block.appendChild(otherRow)
+
       if (q.multiSelect) {
         const n = picks[qi]?.length ?? 0
-        const ok = document.createElement('button')
-        ok.className = `btn q-done${n > 0 && !done[qi] ? ' primary' : ''}`
-        ok.textContent = done[qi] ? `Done · ${n} picked` : n > 0 ? `Done (${n})` : 'Done'
+        const ok = arrowButton(done[qi] ? `Done · ${n} picked` : n > 0 ? `Done (${n})` : 'Done', n > 0 && !done[qi] ? 'primary' : '', () =>
+          this.cb.onConfirmDialogPicks(qi),
+        )
         ok.disabled = n === 0 || !!done[qi]
-        ok.addEventListener('click', () => this.cb.onConfirmDialogPicks(qi))
         block.appendChild(ok)
       }
-      banner.appendChild(block)
+      body.appendChild(block)
     })
-
-    const acts = document.createElement('div')
-    acts.className = 'perm-acts'
     const cancel = document.createElement('button')
-    cancel.className = 'btn'
-    cancel.textContent = 'Dismiss'
+    cancel.type = 'button'
+    cancel.className = 'btn ghost'
+    cancel.textContent = 'Dismiss the question'
     cancel.addEventListener('click', () => this.cb.onCancelDialog())
-    acts.appendChild(cancel)
-    banner.appendChild(acts)
+    body.appendChild(cancel)
+    sheet.appendChild(body)
+    // A pick re-renders the sheet; keep the reader where they were.
+    body.scrollTop = scroll
   }
 
   // ── Transient toast ──────────────────────────────────────────────────────
   /** Show `msg` for `ms` ('' hides it). A long message needs a longer `ms`. */
-  setToast(msg: string, ms = 2600): void {
+  setToast(msg: string, ms = 3000): void {
     const el = this.toastEl
     if (!el) return
     if (this.toastTimer !== null) {
@@ -1403,26 +1866,98 @@ function escapeHtml(s: string): string {
   })
 }
 
+/** A status label with the Figma's square dot: `ok` green, `bad` red,
+ *  `wait`/`idle` grey, `plain` no dot. */
+function stateBadge(label: string, cls: 'ok' | 'bad' | 'wait' | 'idle' | 'plain'): HTMLSpanElement {
+  const el = document.createElement('span')
+  el.className = `state ${cls}`
+  el.textContent = label
+  return el
+}
+
+/** A thin bar for a percentage (context, plan windows). */
+function meterEl(percent: number, size: 'small' | 'full'): HTMLSpanElement {
+  const track = document.createElement('span')
+  track.className = `meter ${size}`
+  const fill = document.createElement('span')
+  fill.style.width = `${Math.max(0, Math.min(100, percent))}%`
+  track.appendChild(fill)
+  return track
+}
+
+function usageRow(label: string, percent: number): HTMLDivElement {
+  const row = document.createElement('div')
+  row.className = 'usage-row'
+  const l = document.createElement('span')
+  l.textContent = label
+  const p = document.createElement('span')
+  p.className = 'usage-pct'
+  p.textContent = `${percent}%`
+  row.append(l, meterEl(percent, 'full'), p)
+  return row
+}
+
+function noteLine(text: string): HTMLDivElement {
+  const el = document.createElement('div')
+  el.className = 'usage-note'
+  el.textContent = text
+  return el
+}
+
+function infoRow(name: string, value: string): HTMLDivElement {
+  const row = document.createElement('div')
+  row.className = 'field-row'
+  const n = document.createElement('span')
+  n.className = 'field-name ellipsis'
+  n.textContent = name
+  row.appendChild(n)
+  if (value) {
+    const v = document.createElement('span')
+    v.className = 'row-value'
+    v.textContent = value
+    row.appendChild(v)
+  }
+  return row
+}
+
+/** The Figma's "→ Button text" button. */
+function arrowButton(label: string, cls: string, click: () => void): HTMLButtonElement {
+  const b = document.createElement('button')
+  b.type = 'button'
+  b.className = `btn arrow-btn ${cls}`.trim()
+  b.innerHTML = ICON.arrow
+  const l = document.createElement('span')
+  l.className = 'btn-label'
+  l.textContent = label
+  b.appendChild(l)
+  b.addEventListener('click', click)
+  return b
+}
+
 /**
- * One RcEvent → a rich log node (or null to drop it: partial stream deltas,
+ * One RcEvent → a log node (or null to drop it: partial stream deltas,
  * control responses, bare tool_result echoes). Unlike the HUD's renderEventParts,
- * this shows the FULL tool input and full usage line — the phone has room.
+ * this keeps each tool's FULL input, folded under a one-line row — the phone
+ * has room.
  */
 function renderEventNode(e: RcEvent): HTMLDivElement | null {
   switch (e.type) {
     case 'assistant': {
+      const text = e.text.trim()
+      const tools = e.toolUses.length ? toolGroup(e.toolUses) : null
+      if (!text) return tools
       const row = document.createElement('div')
       row.className = 'ev ev-assistant'
-      const text = e.text.trim()
-      if (text) {
-        const body = document.createElement('div')
-        body.className = 'ev-text'
-        body.textContent = text
-        row.appendChild(body)
-      }
-      for (const t of e.toolUses) row.appendChild(toolBlock(t))
-      // Nothing to show (empty assistant frame) → drop it.
-      return row.childNodes.length ? row : null
+      const body = document.createElement('div')
+      body.className = 'ev-text'
+      body.textContent = text
+      row.appendChild(body)
+      if (!tools) return row
+      // Text and tools in one event: the text card, then the tool card.
+      const wrap = document.createElement('div')
+      wrap.className = 'ev ev-pair'
+      wrap.append(row, tools)
+      return wrap
     }
 
     case 'user': {
@@ -1433,7 +1968,7 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
         if (notes.length === 0) return null
         const row = document.createElement('div')
         row.className = 'ev ev-system'
-        row.textContent = notes.map((n) => `◆ ${n}`).join('\n')
+        row.textContent = notes.join('\n')
         return row
       }
       // Clean local-command echoes the same way the HUD does: strip the
@@ -1441,8 +1976,7 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
       // a fired slash command reads as `/context`, not raw XML tag soup.
       const text = cleanUserEcho(e.text).trim()
       if (!text) return null // bare tool_result echo / caveat-only — noise
-      // Your message → a right-aligned dark bubble (the doc's BC-Highlight
-      // treatment); the assistant's replies stay as plain flowing text.
+      // Your message → a right-aligned #F6F6F6 card (the Figma's sent bubble).
       const row = document.createElement('div')
       row.className = 'ev ev-user'
       const body = document.createElement('div')
@@ -1457,7 +1991,7 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
       const ok = !(u?.isError ?? false) && e.subtype !== 'error' && !e.subtype?.startsWith('error')
       const row = document.createElement('div')
       row.className = `ev ev-result ${ok ? 'ok' : 'err'}`
-      row.textContent = `${ok ? '✓ done' : `✗ ${e.subtype ?? 'error'}`}${usageSuffix(e)}`
+      row.textContent = resultLine(e, ok)
       return row
     }
 
@@ -1465,9 +1999,9 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
       // Workers re-post init on every attach and every model / mode / effort
       // change: it reads as "settings now" (an older bridge can't say more).
       let label = ''
-      if (e.subtype === 'init') label = e.workerState ? `◆ ${settingsLine(e.workerState)}` : `◆ session started (${e.model ?? 'unknown'})`
-      else if (e.subtype === 'compact_boundary') label = '◆ context compacted'
-      if (!label && systemActivity(e)) label = `◆ ${systemActivity(e)}`
+      if (e.subtype === 'init') label = e.workerState ? settingsLine(e.workerState) : `Session started (${e.model ?? 'unknown model'})`
+      else if (e.subtype === 'compact_boundary') label = 'Context compacted'
+      if (!label && systemActivity(e)) label = systemActivity(e)
       if (!label) return null
       const row = document.createElement('div')
       row.className = 'ev ev-system'
@@ -1478,14 +2012,14 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
     case 'conversation_reset': {
       const row = document.createElement('div')
       row.className = 'ev ev-system'
-      row.textContent = '◆ conversation cleared'
+      row.textContent = 'Conversation cleared'
       return row
     }
 
     case 'catch_up_truncated': {
       const row = document.createElement('div')
       row.className = 'ev ev-system'
-      row.textContent = '◆ some earlier events were skipped'
+      row.textContent = 'Some earlier events were skipped'
       return row
     }
 
@@ -1496,9 +2030,9 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
       const p = e.permissionRequest
       if (isQuestionRequest(e)) {
         const gist = p?.questions?.[0]?.question || p?.questions?.[0]?.header || p?.prompt || 'a question'
-        row.textContent = `⚠ asks: ${gist}`
+        row.textContent = `Asked you: ${gist}`
       } else {
-        row.textContent = `⚠ needs you: ${p?.toolName ?? 'tool'}`
+        row.textContent = `Asked to use ${p?.toolName ?? 'a tool'}`
       }
       return row
     }
@@ -1509,20 +2043,31 @@ function renderEventNode(e: RcEvent): HTMLDivElement | null {
   }
 }
 
-/** A `⚙ Name` header + the tool's full input as a <pre> block. */
-function toolBlock(t: RcEvent['toolUses'][number]): HTMLDivElement {
+/** Tool calls as one-line rows in a card; a tap opens the full input. */
+function toolGroup(tools: RcEvent['toolUses']): HTMLDivElement {
   const wrap = document.createElement('div')
-  wrap.className = 'ev-tool'
-  const head = document.createElement('div')
-  head.className = 'ev-tool-head'
-  head.textContent = `⚙ ${t.name ?? 'tool'}`
-  wrap.appendChild(head)
-  const input = formatInput(t.input)
-  if (input) {
-    const pre = document.createElement('pre')
-    pre.className = 'ev-tool-input'
-    pre.textContent = input
-    wrap.appendChild(pre)
+  wrap.className = 'ev tools'
+  for (const t of tools) {
+    const input = formatInput(t.input)
+    const row = document.createElement(input ? 'details' : 'div')
+    row.className = 'tool'
+    const head = document.createElement(input ? 'summary' : 'div')
+    head.className = 'tool-head'
+    const name = document.createElement('span')
+    name.className = 'tool-name'
+    name.textContent = t.name ?? 'Tool'
+    const arg = document.createElement('span')
+    arg.className = 'tool-arg'
+    arg.textContent = toolArg(t.input)
+    head.append(name, arg)
+    row.appendChild(head)
+    if (input) {
+      const pre = document.createElement('pre')
+      pre.className = 'tool-input'
+      pre.textContent = input
+      row.appendChild(pre)
+    }
+    wrap.appendChild(row)
   }
   return wrap
 }
@@ -1534,296 +2079,302 @@ let stylesInjected = false
 function injectStyles(): void {
   if (stylesInjected) return
   stylesInjected = true
-  // Even Realities Companion-App LIGHT system, per their UIUX guidelines:
-  //   BC-3rd #EEEEEE page · BC-1st #FFFFFF cards · BC-2nd #F6F6F6 supporting ·
-  //   BC-4th #E4E4E4 pressed fills · TC-1st #232323 text · TC-2nd #7B7B7B
-  //   secondary · BC-Accent #FEF991 (the "ongoing action / warning" fill) ·
-  //   TC-Green #4BB956 connection · TC-Red #FF453A warnings — as a TEXT color:
-  //   the doc's red button is red text on a standard fill, never a red border ·
-  //   SC-2nd 8% #232323 input fill · SC-1st 50% black overlay.
-  //   Hierarchy is FILL CONTRAST, never hairline borders — every component in
-  //   the doc (buttons, cards, list rows, headers, dropdowns, modals, toasts)
-  //   is a flat fill; only floating surfaces (toast, popover) carry a shadow.
-  //   Type is strictly the 24/20/17/15/13/11 scale, weights 400 (Regular,
-  //   titles + 13px-and-down) and 300 (Light, 15px+ body), ~-0.01em tracking;
-  //   the mono code blocks sit at 12px, outside the doc's system (it has none).
-  //   Spacing rides the doc's quantum — 6px same-element, 12px same-subject,
-  //   24px cross-subject — with 16px card padding and 12px page margins.
-  //   Radius 6px (4px nested). The proprietary FK Grotesk isn't shippable, so
-  //   the system grotesque stack stands in. Disabled = opacity, per the doc.
+  // Even Realities Software Design Guidelines (public Figma, APP pages), light:
+  //   BC-3rd #EEEEEE page · BC-1st #FFFFFF cards · BC-2nd #F6F6F6 sent message
+  //   and supporting fills · BC-4th #E4E4E4 selector track and pressed fills ·
+  //   BC-Highlight #232323 primary button · BC-Accent #FEF991 an ongoing
+  //   action or something waiting on you · TC-1st #232323 · TC-2nd #7B7B7B ·
+  //   TC-Green #4BB956 connection · TC-Red #FF453A as TEXT on a white button ·
+  //   SC-1st 50% black overlay behind a pop-up · SC-2nd 8% #232323 input fill.
+  //   Flat fills, no borders, no divider lines inside a grouped list; only
+  //   floating surfaces (toast, popover) carry a shadow. Type on the
+  //   24/20/17/15/13/11 scale, 400 titles and 300 body, -1% tracking. 6px
+  //   radius (4-5px nested), 12px page margins, 6/12/24px spacing. FK Grotesk
+  //   isn't shippable, so the system grotesque stack stands in. Disabled =
+  //   opacity, per the Figma's button notes.
   const css = `
     :root {
       color-scheme: light;
-      /* Background colors (BC) */
-      --bc-3rd:    #EEEEEE;               /* page — main background */
-      --bc-2nd:    #F6F6F6;               /* supporting surface on white */
-      --bc-1st:    #FFFFFF;               /* cards, rows, standard buttons */
-      --bc-4th:    #E4E4E4;               /* deeper layer — pressed fills */
-      --bc-hi:     #232323;               /* BC-Highlight — primary button fill */
-      --bc-accent: #FEF991;               /* ongoing action / warning fill */
-      --sc-1st:    rgba(35,35,35,0.5);    /* modal overlay */
-      --sc-2nd:    rgba(35,35,35,0.08);   /* text-input fill (8% #232323) */
-      /* Text colors (TC) */
-      --tc-1st:    #232323;               /* primary body + titles */
-      --tc-2nd:    #7B7B7B;               /* secondary */
-      --tc-hi:     #FFFFFF;               /* text on dark fills (TC-Highlight) */
-      --tc-red:    #FF453A;               /* warnings / deny / errors */
-      --tc-green:  #4BB956;               /* connection status / success */
-      --r: 6px;      /* default card radius */
-      --r-in: 4px;   /* offset (inset) radius */
-      --m: 12px;     /* default screen margin */
-      --shadow: 0 8px 24px rgba(35,35,35,0.14);   /* floating: toast, popover */
+      --bc-3rd:    #EEEEEE;
+      --bc-2nd:    #F6F6F6;
+      --bc-1st:    #FFFFFF;
+      --bc-4th:    #E4E4E4;
+      --bc-hi:     #232323;
+      --bc-accent: #FEF991;
+      --sc-1st:    rgba(0,0,0,0.5);
+      --sc-2nd:    rgba(35,35,35,0.08);
+      --tc-1st:    #232323;
+      --tc-2nd:    #7B7B7B;
+      --tc-hi:     #FFFFFF;
+      --tc-red:    #FF453A;
+      --tc-red-text: #D63A2F;           /* TC-Red darkened to read as text on white */
+      --tc-green:  #4BB956;
+      --tc-green-text: #2E7D36;         /* the same for green status text */
+      --tc-accent-2nd: #5E5A1F;         /* secondary text on the accent fill */
+      --r: 6px;
+      --r-in: 4px;
+      --m: 12px;
+      --shadow: 0 8px 24px rgba(35,35,35,0.14);
       --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', 'Segoe UI', Roboto, system-ui, sans-serif;
       --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
     }
     html, body { margin: 0; height: 100%; background: var(--bc-3rd); color: var(--tc-1st);
-      font: 300 15px/1.5 var(--font); letter-spacing: -0.01em;
+      font: 300 15px/1.45 var(--font); letter-spacing: -0.01em;
       -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
       touch-action: manipulation; -webkit-text-size-adjust: 100%; overscroll-behavior: none; }
     #app { display: flex; height: 100%; }
-    .panel { display: flex; flex-direction: column; gap: 24px; width: 100%; overflow-y: auto;
-      max-width: 620px; margin: 0 auto; padding: 12px var(--m) 24px; box-sizing: border-box; }
-    ::-webkit-scrollbar { width: 8px; height: 8px; }
-    ::-webkit-scrollbar-thumb { background: #CFCFCF; border-radius: 999px; }
+    button, input, select, textarea { font: inherit; color: inherit; letter-spacing: inherit; }
+    button { cursor: pointer; }
+    [hidden] { display: none !important; }
+    .app { position: relative; width: 100%; max-width: 620px; margin: 0 auto; height: 100%; overflow: hidden; }
+    .screen { position: absolute; inset: 0; display: flex; flex-direction: column; }
+    .scroll { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column;
+      gap: 24px; padding: 4px var(--m) 24px; -webkit-overflow-scrolling: touch; }
+    .log-scroll { gap: 12px; }
+    .scroll > *, .sheet-body > *, .log > * { flex-shrink: 0; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-thumb { background: #CFCFCF; border-radius: 3px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    /* One keyboard-focus treatment for everything interactive; taps show none. */
-    .btn:focus-visible, .select:focus-visible, .set-input:focus-visible,
-    .send-input:focus-visible, .session-row:focus-visible, .cmd-row:focus-visible {
+    button:focus-visible, a:focus-visible, select:focus-visible, [role="button"]:focus-visible, summary:focus-visible {
       outline: 2px solid var(--tc-1st); outline-offset: 2px; }
+    input:focus-visible, textarea:focus-visible { outline: none; }
+    .ellipsis { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-    /* ── Top bar ─────────────────────────────────────────────────────────── */
-    /* A slim, single-line app bar: wordmark left, connection + settings right.
-       The wordmark never wraps; the bridge origin lives in the Settings card
-       (not the bar), so a long hostname can never squeeze the title onto two
-       lines the way it used to. */
-    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 34px; }
-    .wordmark { font-size: 17px; font-weight: 400; margin: 0; color: var(--tc-1st);
-      white-space: nowrap; flex: 0 0 auto; }
-    .head-side { display: flex; align-items: center; gap: 6px; flex: 0 1 auto; min-width: 0; }
-    .settings-btn { flex: 0 0 auto; }
-    .chip-conn { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 400;
-      padding: 5px 12px; border-radius: 999px; white-space: nowrap; text-transform: lowercase; flex: 0 0 auto;
-      background: var(--bc-1st); }
-    .chip-conn::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-    .chip-conn.ok { color: var(--tc-green); background: rgba(75,185,86,0.12); }
-    .chip-conn.down { color: var(--tc-red); background: rgba(255,69,58,0.10); }
-    .chip-conn.connecting { color: var(--tc-2nd); background: var(--bc-2nd); }
+    /* ── Navigation bar: centred title, 44px targets either side ─────────── */
+    .nav { flex: 0 0 auto; display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px;
+      align-items: center; padding: 6px 4px; }
+    .nav-title { margin: 0; text-align: center; font-size: 17px; font-weight: 400; letter-spacing: -0.17px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .nav-side { width: 44px; height: 44px; }
+    .icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px;
+      padding: 0; border: 0; border-radius: var(--r); background: transparent; color: var(--tc-1st); }
+    .icon-btn:active { background: var(--bc-4th); }
+    .icon-btn.small { flex: 0 0 auto; width: 36px; height: 36px; margin: -8px -10px -8px 0; color: var(--tc-2nd); }
 
-    /* ── Connection settings card ────────────────────────────────────────── */
-    .settings { display: flex; flex-direction: column; gap: 12px; padding: 16px;
-      background: var(--bc-1st); border-radius: var(--r); }
-    .settings[hidden] { display: none; }
-    /* Standard buttons inside the white card ride BC-2nd (the doc's supporting
-       color on top of BC-1st) so they don't vanish white-on-white. */
-    .settings .btn:not(.primary) { background: var(--bc-2nd); }
-    .settings .btn:not(.primary):active { background: var(--bc-4th); }
-    .set-input { width: 100%; box-sizing: border-box; padding: 12px;
-      font: 400 15px/1.3 var(--font); letter-spacing: -0.01em; color: var(--tc-1st);
-      background: var(--sc-2nd); border: 0; border-radius: var(--r);
-      outline: none; -webkit-appearance: none; }
-    .set-input::placeholder { color: var(--tc-2nd); }
-    .settings-hint { font-size: 13px; font-weight: 400; color: var(--tc-2nd); line-height: 1.45; }
-    /* The bridge origin, relocated here from the top bar. */
-    .settings-conn { display: flex; flex-direction: column; gap: 3px; }
-    .origin { font-size: 13px; color: var(--tc-2nd); font-variant-numeric: tabular-nums; word-break: break-all; }
+    /* ── Cards, groups, grouped lists ────────────────────────────────────── */
+    .card { padding: 12px 16px; background: var(--bc-1st); border-radius: var(--r); }
+    .card-title { display: flex; align-items: center; gap: 8px; min-width: 0;
+      font-size: 15px; font-weight: 400; color: var(--tc-1st); }
+    .card-title.big { font-size: 17px; letter-spacing: -0.17px; }
+    .card-sub { font-size: 13px; font-weight: 400; color: var(--tc-2nd); }
+    .group { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+    .group-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 4px; }
+    .group-title { margin: 0; padding: 0 4px; font-size: 13px; font-weight: 400; color: var(--tc-2nd); }
+    .group-head .group-title { padding: 0; }
+    .stack { display: flex; flex-direction: column; gap: 6px; }
+    .pair { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 6px; }
+    .hint { padding: 0 4px; font-size: 13px; font-weight: 400; color: var(--tc-2nd); line-height: 1.45; }
+    .list-card { display: flex; flex-direction: column; background: var(--bc-1st); border-radius: var(--r); overflow: hidden; }
+    .field-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 48px;
+      padding: 0 16px; box-sizing: border-box; width: 100%; border: 0; background: transparent; text-align: left;
+      color: var(--tc-1st); text-decoration: none; position: relative; font-size: 15px; font-weight: 300; }
+    button.field-row:active, a.field-row:active, .select-row:active { background: var(--bc-2nd); }
+    .field-row .field-name { flex: 0 1 auto; min-width: 0; padding: 12px 0; }
+    .row-hint { margin-top: 2px; font-size: 13px; font-weight: 400; color: var(--tc-2nd); }
+    .row-value { display: inline-flex; align-items: center; gap: 10px; flex: 0 0 auto; color: var(--tc-2nd); font-size: 15px; }
+    .row-input { flex: 1; min-width: 0; border: 0; background: none; outline: none; text-align: right;
+      font-size: 15px; font-weight: 300; color: var(--tc-2nd); padding: 12px 0; }
+    .row-input:focus { color: var(--tc-1st); }
+    .row-input::placeholder { color: #ABABAB; }
+    .select-row select { position: absolute; inset: 0; width: 100%; opacity: 0; cursor: pointer; }
+    .text-input { width: 100%; min-width: 0; box-sizing: border-box; height: 48px; padding: 0 16px; border: 0;
+      border-radius: var(--r); background: var(--sc-2nd); font-size: 15px; font-weight: 300; outline: none; }
+    .text-input::placeholder, .send-input::placeholder { color: var(--tc-2nd); }
+    .input-row { display: flex; gap: 6px; }
+    .input-row .btn { flex: 0 0 auto; }
+
+    /* ── Status labels: the Figma's square dot ───────────────────────────── */
+    .state { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
+      font-size: 13px; font-weight: 400; color: var(--tc-1st); white-space: nowrap; }
+    .state:empty { display: none; }
+    .state::before { content: ''; width: 6px; height: 6px; background: currentColor; }
+    .state.ok { color: var(--tc-green-text); }
+    .state.ok::before { background: var(--tc-green); }
+    .state.bad { color: var(--tc-red-text); }
+    .state.wait, .state.idle { color: var(--tc-2nd); }
+    .state.plain::before { display: none; }
+
+    /* ── Sessions screen ─────────────────────────────────────────────────── */
+    .conn { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .conn-text { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+    .session-list { display: flex; flex-direction: column; gap: 24px; }
+    .empty { color: var(--tc-2nd); font-size: 15px; line-height: 1.45; }
+    .session-card { display: flex; align-items: center; gap: 12px; padding: 16px; cursor: pointer; }
+    .session-card:active, .session-card.selected { background: var(--bc-2nd); }
+    .session-card.action { background: var(--bc-accent); }
+    .session-card.action:active { background: #F4EE87; }
+    .row-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+    .row-top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .row-time { flex: 0 0 auto; font-size: 13px; font-weight: 400; color: var(--tc-2nd); }
+    .row-gist { font-size: 15px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .row-meta { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 13px; font-weight: 400;
+      color: var(--tc-2nd); font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .row-meta > span:first-child { overflow: hidden; text-overflow: ellipsis; }
+    .session-card.action .row-time, .session-card.action .row-meta { color: var(--tc-accent-2nd); }
+    .row-chev { flex: 0 0 auto; display: inline-flex; color: var(--tc-2nd); }
+    .session-card.action .row-chev { color: var(--tc-1st); }
+    .idle-row { display: flex; align-items: center; gap: 12px; padding: 14px 16px; cursor: pointer; }
+    .idle-row:active, .idle-row.selected { background: var(--bc-2nd); }
+    .unread { flex: 0 0 auto; width: 8px; height: 8px; background: var(--bc-accent); box-shadow: inset 0 0 0 1px rgba(35,35,35,0.25); }
+    .session-card.action .unread { background: var(--tc-1st); box-shadow: none; }
+    .meter { flex: 0 0 auto; height: 4px; border-radius: 2px; background: var(--bc-4th); overflow: hidden; }
+    .meter > span { display: block; height: 100%; background: var(--tc-1st); }
+    .meter.small { width: 72px; }
+    .meter.full { flex: 1; min-width: 0; }
 
     /* ── Release notices ─────────────────────────────────────────────────── */
-    /* Slim dismissible cards above the views (notices.ts). Fill contrast per
-       the doc: 'important' rides the BC-Accent wash (the same treatment as a
-       blocked session row), 'info' a plain white card — no borders, no shadow. */
     .notices { display: flex; flex-direction: column; gap: 6px; }
-    .notices[hidden] { display: none; }
-    .notice { display: flex; flex-direction: column; gap: 6px; padding: 12px 16px;
-      background: var(--bc-1st); border-radius: var(--r); }
+    .notice { display: flex; flex-direction: column; gap: 6px; }
     .notice.important { background: var(--bc-accent); }
-    .notice-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
-    .notice-title { font-size: 15px; font-weight: 400; color: var(--tc-1st); }
-    .notice-dismiss { flex: 0 0 auto; font-size: 17px; line-height: 1; padding: 2px 8px;
-      min-width: 0; color: var(--tc-2nd); }
+    .notice-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .notice-title { font-size: 15px; font-weight: 400; }
     .notice-body { font-size: 13px; font-weight: 400; color: var(--tc-2nd); line-height: 1.45; }
     .notice.important .notice-body { color: var(--tc-1st); }
-    /* Copy-ready command: 8% fill, tap selects the whole line for copying. */
-    .dict-cmd { display: block; margin-top: 6px; }
-    .stt-source { display: flex; gap: 6px; }
-    .stt-source .btn { flex: 1; }
-    .set-input:disabled { opacity: .45; }
-    .notice-cmd { font: 400 12px/1.5 var(--mono); letter-spacing: 0; color: var(--tc-1st);
-      background: var(--sc-2nd); border-radius: var(--r-in); padding: 8px 10px;
+    .cmd-block { display: block; margin-top: 6px; font: 400 12px/1.5 var(--mono); letter-spacing: 0;
+      color: var(--tc-1st); background: var(--sc-2nd); border-radius: var(--r-in); padding: 8px 10px;
       word-break: break-all; user-select: all; -webkit-user-select: all; }
 
-    /* ── View scaffolding ────────────────────────────────────────────────── */
-    .view { display: flex; flex-direction: column; gap: 12px; }
-    .view[hidden] { display: none; }
-    .view-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-    .view-title { font-size: 13px; font-weight: 400; color: var(--tc-2nd); letter-spacing: -0.01em; }
+    /* ── Segmented selector: #E4E4E4 track, white selected segment ───────── */
+    .seg { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; padding: 2px;
+      border-radius: var(--r); background: var(--bc-4th); }
+    .seg button { min-width: 0; height: 40px; padding: 0 4px; border: 0; border-radius: 5px; background: transparent;
+      font-size: 13px; font-weight: 400; color: var(--tc-2nd); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .seg button.on { background: var(--bc-1st); color: var(--tc-1st); }
+    .seg button.danger { color: var(--tc-red-text); }
+    .stt-source button { font-size: 15px; }
 
-    /* ── Session list ────────────────────────────────────────────────────── */
-    .session-list { display: flex; flex-direction: column; gap: 6px; }
-    .list-empty { color: var(--tc-2nd); font-size: 15px; padding: 12px 2px; }
-    .session-row { display: flex; align-items: center; gap: 12px; padding: 12px 16px;
-      background: var(--bc-1st); border-radius: var(--r); cursor: pointer;
-      transition: background 0.15s; }
-    .session-row:active { background: var(--bc-2nd); }
-    .session-row.selected { background: var(--bc-2nd); }
-    /* Blocked-on-you → the accent (BC-Accent) wash: the doc's warning treatment. */
-    .session-row.needs { background: var(--bc-accent); }
-    .session-row.needs:active { background: #F7EF7E; }
-    .wdot { flex: 0 0 auto; font-size: 13px; line-height: 1; }
-    .wdot.running { color: var(--tc-green); }
-    .wdot.idle { color: var(--tc-2nd); }
-    .wdot.action { color: var(--tc-1st); }
-    .session-body { flex: 1; min-width: 0; }
-    .session-name { font-size: 15px; font-weight: 400; color: var(--tc-1st);
-      display: flex; align-items: center; gap: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .unread { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--tc-1st); }
-    .session-sub { font-size: 13px; font-weight: 400; color: var(--tc-2nd); font-variant-numeric: tabular-nums;
-      margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .session-gist { font-size: 13px; font-weight: 300; color: var(--tc-2nd); margin-top: 3px;
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .session-gist.needs { color: var(--tc-1st); font-weight: 400; }
-    .row-chev { flex: 0 0 auto; color: var(--tc-2nd); font-size: 17px; line-height: 1; margin-left: 2px; }
+    /* ── Toggle: dark track, square-ish white knob ───────────────────────── */
+    .toggle { position: relative; flex: 0 0 auto; width: 44px; height: 26px; border-radius: var(--r); background: #C9C9C9; transition: background .15s; }
+    .toggle input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+    .toggle .knob { position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: var(--r-in);
+      background: var(--bc-1st); pointer-events: none; transition: left .15s; }
+    .toggle:has(input:checked) { background: var(--bc-hi); }
+    .toggle:has(input:checked) .knob { left: 21px; }
+    .toggle:has(input:focus-visible) { outline: 2px solid var(--tc-1st); outline-offset: 2px; }
 
-    /* ── Detail header ───────────────────────────────────────────────────── */
-    .detail-head { display: flex; align-items: flex-start; gap: 12px; }
-    .detail-headings { min-width: 0; flex: 1; }
-    .detail-title { font-size: 17px; font-weight: 400; color: var(--tc-1st);
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .detail-meta { font-size: 13px; font-weight: 400; color: var(--tc-2nd); margin-top: 2px; font-variant-numeric: tabular-nums; }
-    .detail-meta .wdot { font-size: 12px; margin-right: 0; }
-    .detail-summary { font-size: 13px; font-weight: 400; color: var(--tc-2nd); margin-top: 6px; line-height: 1.4; }
-    .detail-summary[hidden] { display: none; }
-    .detail-summary.needs { color: var(--tc-1st); }
-
-    /* ── Permission / question banner (BC-Accent = the doc's warning fill) ─── */
-    .perm { display: flex; flex-direction: column; gap: 12px; padding: 16px;
-      background: var(--bc-accent); border-radius: var(--r); }
-    .perm[hidden] { display: none; }
-    .perm-head { font-size: 13px; font-weight: 400; color: var(--tc-1st); }
-    .perm-input { margin: 0; max-height: 180px; overflow: auto; padding: 12px; font: 400 12px/1.5 var(--mono);
-      color: var(--tc-1st); background: var(--bc-1st); border-radius: var(--r-in);
-      white-space: pre-wrap; word-break: break-word; }
-    .perm-acts { display: flex; gap: 6px; }
-    .perm-acts .btn { flex: 1; }
-    .perm-acts { flex-wrap: wrap; }
-    .perm-acts .session-rule { flex-basis: 100%; overflow-wrap: anywhere; white-space: normal; }
-
-    /* Question dialog (options as buttons) */
-    .q-block { display: flex; flex-direction: column; gap: 6px; }
-    .q-text { font-size: 15px; font-weight: 400; color: var(--tc-1st); line-height: 1.4; }
-    .q-opts { display: flex; flex-direction: column; gap: 6px; }
-    .q-opt { width: 100%; min-width: 0; text-align: left; white-space: normal; background: var(--bc-1st); }
-    .q-opt.chosen { color: var(--tc-hi); background: var(--bc-hi); }
-    .q-done { align-self: flex-start; }
-
-    /* ── Side question card (a white card: an answer, not a warning) ────────── */
-    .aside-card { display: flex; flex-direction: column; gap: 6px; padding: 12px 16px;
-      background: var(--bc-1st); border-radius: var(--r); }
-    .aside-card[hidden] { display: none; }
-    .aside-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
-      font-size: 11px; font-weight: 400; color: var(--tc-2nd); }
+    /* ── Session screen ──────────────────────────────────────────────────── */
+    .status { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .status.action { background: var(--bc-accent); }
+    .status.action .card-sub, .status.action .status-gist { color: var(--tc-accent-2nd); }
+    .status-gist { margin-top: 4px; font-size: 13px; font-weight: 400; color: var(--tc-2nd);
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .aside-card { display: flex; flex-direction: column; gap: 6px; }
+    .aside-label { font-size: 11px; font-weight: 400; color: var(--tc-2nd); }
     .aside-q { font-size: 13px; font-weight: 400; color: var(--tc-2nd); }
-    .aside-a { font-size: 15px; font-weight: 300; color: var(--tc-1st); white-space: pre-wrap; line-height: 1.45; }
+    .aside-a { white-space: pre-wrap; }
     .aside-a.pending { color: var(--tc-2nd); }
-    .aside-a.err { color: var(--tc-red); }
+    .aside-a.err { color: var(--tc-red-text); }
+    .older { align-self: center; }
 
-    /* ── Session card (tasks, plan usage, changes) ───────────────────────── */
-    .info-card { display: flex; flex-direction: column; gap: 6px; }
-    .info-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-    .info-body { display: flex; flex-direction: column; gap: 6px; }
-    .info-body:empty { display: none; }
-    .info-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px;
-      font-size: 13px; font-weight: 400; color: var(--tc-1st); background: var(--bc-1st); border-radius: var(--r);
-      font-variant-numeric: tabular-nums; }
-    .info-row.muted { color: var(--tc-2nd); background: transparent; padding: 0 2px; }
-    .info-row .btn { flex: 0 0 auto; min-width: 0; padding: 8px 12px; font-size: 13px; }
-
-    /* ── Event log ───────────────────────────────────────────────────────── */
-    .log { flex: 1; min-height: 200px; max-height: 46vh; overflow-y: auto; display: flex;
-      flex-direction: column; gap: 12px; padding: 16px; background: var(--bc-1st);
-      border-radius: var(--r); }
-    .ev { font-size: 15px; line-height: 1.5; word-break: break-word; }
+    .log { display: flex; flex-direction: column; gap: 12px; }
+    .ev { word-break: break-word; min-width: 0; }
     .ev-text { white-space: pre-wrap; }
-    .ev-assistant .ev-text { color: var(--tc-1st); font-weight: 300; }
-    /* Your message → a right-aligned dark bubble (BC-Highlight). */
-    .ev-user { display: flex; justify-content: flex-end; }
-    .ev-user .ev-text { color: var(--tc-hi); font-weight: 400; background: var(--bc-hi);
-      padding: 8px 12px; border-radius: var(--r); max-width: 85%; }
-    .ev-system { color: var(--tc-2nd); font-size: 13px; font-weight: 400; white-space: pre-line; }
-    .ev-result { font-size: 13px; font-weight: 400; font-variant-numeric: tabular-nums; }
-    .ev-result.ok { color: var(--tc-green); }
-    .ev-result.err { color: var(--tc-red); }
-    .ev-perm { color: var(--tc-1st); font-size: 13px; font-weight: 400; }
-    .ev-tool { margin-top: 6px; }
-    .ev-tool-head { font-size: 13px; font-weight: 400; color: var(--tc-2nd); }
-    .ev-tool-input { margin: 4px 0 0; max-height: 220px; overflow: auto; padding: 12px;
-      font: 400 12px/1.5 var(--mono); color: var(--tc-1st); background: var(--bc-2nd);
-      border-radius: var(--r-in); white-space: pre-wrap; word-break: break-word; }
+    .ev-pair { display: flex; flex-direction: column; gap: 12px; }
+    .ev-assistant { padding: 12px 16px; background: var(--bc-1st); border-radius: var(--r); }
+    .ev-user { align-self: flex-end; max-width: 82%; padding: 12px 16px; background: var(--bc-2nd); border-radius: var(--r); }
+    .ev-system, .ev-result, .ev-perm { padding: 0 4px; font-size: 13px; font-weight: 400; color: var(--tc-2nd);
+      white-space: pre-line; font-variant-numeric: tabular-nums; }
+    .ev-result.err { color: var(--tc-red-text); }
+    .ev-perm { color: var(--tc-1st); }
+    .subagent { margin-left: 16px; }
+    .subagent.ev-assistant::before, .subagent.tools::before { content: 'Subagent'; display: block;
+      font-size: 11px; font-weight: 400; color: var(--tc-2nd); }
+    .subagent.tools::before { padding: 8px 14px 0; }
+    .tools { display: flex; flex-direction: column; background: var(--bc-1st); border-radius: var(--r); overflow: hidden; }
+    .tool-head { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 0 14px; list-style: none; cursor: pointer; }
+    .tool-head::-webkit-details-marker { display: none; }
+    div.tool-head { cursor: default; }
+    details[open] > .tool-head, .tool-head:active { background: var(--bc-2nd); }
+    .tool-name { flex: 0 0 auto; min-width: 40px; font-size: 13px; font-weight: 400; color: var(--tc-2nd); }
+    .tool-arg { flex: 1; min-width: 0; font: 400 12px/1.4 var(--mono); letter-spacing: 0;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tool-input, .code-card { margin: 0; max-height: 240px; overflow: auto; padding: 12px 14px;
+      font: 400 12px/1.5 var(--mono); letter-spacing: 0; color: var(--tc-1st); white-space: pre-wrap; word-break: break-word; }
+    .tool-input { background: var(--bc-2nd); }
+    .code-card { flex: 0 0 auto; background: var(--bc-1st); border-radius: var(--r); max-height: 30vh; font-size: 13px; }
 
-    /* ── Composer ────────────────────────────────────────────────────────── */
-    .composer { position: relative; display: flex; flex-direction: column; gap: 6px; }
-    .send-input { width: 100%; box-sizing: border-box; resize: vertical; min-height: 48px; padding: 12px;
-      font: 300 15px/1.45 var(--font); letter-spacing: -0.01em; color: var(--tc-1st); background: var(--sc-2nd);
-      border: 0; border-radius: var(--r); outline: none; -webkit-appearance: none; }
-    .send-input::placeholder { color: var(--tc-2nd); }
-    .interim { font-size: 13px; color: var(--tc-2nd); font-style: italic; padding: 0 2px; }
-    .interim[hidden] { display: none; }
-    .copy-draft { font: inherit; color: inherit; background: none; border: 0; padding: 2px 4px; text-decoration: underline; cursor: pointer; }
-    .composer-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
-    .composer-row .btn { min-width: 0; padding: 12px 6px; }
-    /* Canned sends: even, intentional widths (3-up then 2-up at phone width),
-       not a ragged auto-wrap. Each row's chips share the width equally. */
-    .quick-row { display: flex; flex-wrap: wrap; gap: 6px; }
-    .quick-row .quick { flex: 1 1 30%; min-width: 96px; }
-
-    /* ── Slash-command autocomplete (floats above the composer) ───────────── */
-    /* A floating popover: shadow only, and the rows are a segmented list —
-       0px apart with a fill highlight, no divider hairlines (per the doc). */
-    .cmd-menu { position: absolute; left: 0; right: 0; bottom: 100%; margin-bottom: 6px; z-index: 5;
+    /* ── Composer (a white sheet pinned under the log) ───────────────────── */
+    .composer { position: relative; flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px;
+      padding: 10px var(--m) calc(12px + env(safe-area-inset-bottom, 0px)); background: var(--bc-1st);
+      border-radius: var(--r) var(--r) 0 0; }
+    .chips { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; margin: 0 calc(-1 * var(--m)); padding: 0 var(--m); }
+    .chips::-webkit-scrollbar { display: none; }
+    .chip { flex: 0 0 auto; height: 32px; padding: 0 12px; border: 0; border-radius: var(--r);
+      background: var(--bc-2nd); font-size: 13px; font-weight: 400; white-space: nowrap; }
+    .chip:active { background: var(--bc-4th); }
+    .composer-row { display: flex; align-items: flex-end; gap: 6px; }
+    .send-input { flex: 1; min-width: 0; min-height: 48px; max-height: 132px; box-sizing: border-box; resize: none;
+      padding: 13px 16px; border: 0; border-radius: var(--r); background: var(--sc-2nd);
+      font-size: 15px; font-weight: 300; line-height: 1.45; outline: none; -webkit-appearance: none; }
+    .square-btn { flex: 0 0 48px; height: 48px; display: inline-flex; align-items: center; justify-content: center;
+      padding: 0; border: 0; border-radius: var(--r); background: var(--bc-2nd); color: var(--tc-1st); }
+    .square-btn:active { background: var(--bc-4th); }
+    .square-btn.primary, .square-btn.live { background: var(--bc-hi); color: var(--tc-hi); }
+    .stop-square { width: 12px; height: 12px; border-radius: 2px; background: var(--tc-red); }
+    .interim { padding: 0 4px; font-size: 13px; color: var(--tc-2nd); font-style: italic; }
+    .composer-note { font-size: 11px; font-weight: 400; color: var(--tc-2nd); line-height: 1.5; }
+    .composer-note a { color: var(--tc-1st); }
+    .link-btn { padding: 0; border: 0; background: none; font-size: inherit; font-weight: 400; color: var(--tc-1st);
+      text-decoration: underline; }
+    .group-head .link-btn { font-size: 13px; color: var(--tc-2nd); text-decoration: none; }
+    .cmd-menu { position: absolute; left: var(--m); right: var(--m); bottom: 100%; margin-bottom: 6px; z-index: 5;
       max-height: 232px; overflow-y: auto; display: flex; flex-direction: column;
       background: var(--bc-1st); border-radius: var(--r); box-shadow: var(--shadow); }
-    .cmd-menu[hidden] { display: none; }
     .cmd-row { display: flex; align-items: baseline; gap: 12px; width: 100%; box-sizing: border-box;
-      text-align: left; padding: 12px 16px; background: transparent; border: 0; cursor: pointer; }
+      text-align: left; padding: 12px 16px; background: transparent; border: 0; }
     .cmd-row.active, .cmd-row:active { background: var(--bc-2nd); }
-    .cmd-name { flex: 0 0 auto; font: 400 13px/1.2 var(--mono); color: var(--tc-1st); }
+    .cmd-name { flex: 0 0 auto; font: 400 13px/1.2 var(--mono); }
     .cmd-hint { flex: 1 1 auto; min-width: 0; font-size: 13px; font-weight: 400; color: var(--tc-2nd);
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; }
 
-    /* ── Steering ────────────────────────────────────────────────────────── */
-    .steer { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; align-items: end; }
-    .steer .archive { grid-column: 1 / -1; }
-    .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-    .field-label { font-size: 11px; font-weight: 400; color: var(--tc-2nd); }
-    /* Dropdowns are BC-2nd bars with a chevron, like the doc's headers. */
-    .select { width: 100%; box-sizing: border-box; padding: 12px 34px 12px 12px; font: 400 15px/1 var(--font);
-      color: var(--tc-1st); background-color: var(--bc-2nd); border: 0; border-radius: var(--r);
-      -webkit-appearance: none; appearance: none; cursor: pointer; outline: none;
-      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%237B7B7B' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-      background-repeat: no-repeat; background-position: right 12px center; }
+    /* ── Pop-up sheets over the session (SC-1st overlay, #EEEEEE sheet) ──── */
+    .overlay { position: absolute; inset: 0; z-index: 20; background: var(--sc-1st); }
+    .sheet { position: absolute; left: 0; right: 0; bottom: 0; z-index: 21; max-height: 88%; display: flex;
+      flex-direction: column; background: var(--bc-3rd); border-radius: var(--r) var(--r) 0 0; }
+    .sheet-head { flex: 0 0 auto; display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: start;
+      padding: 12px 4px 4px; }
+    .sheet-titles { text-align: center; padding-top: 8px; min-width: 0; }
+    .sheet-title { margin: 0; font-size: 17px; font-weight: 400; letter-spacing: -0.17px; overflow-wrap: anywhere; }
+    .sheet-sub { font-size: 13px; font-weight: 400; color: var(--tc-2nd); }
+    .sheet-desc { margin-top: 2px; font-size: 15px; color: var(--tc-2nd); }
+    .sheet-body { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 20px;
+      padding: 12px var(--m) calc(16px + env(safe-area-inset-bottom, 0px)); }
+    .prompt .sheet-body { gap: 12px; }
+    .usage { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; }
+    .usage-row { display: grid; grid-template-columns: 92px minmax(0, 1fr) 40px; align-items: center; gap: 10px;
+      font-size: 13px; font-weight: 400; font-variant-numeric: tabular-nums; }
+    .usage-pct { text-align: right; }
+    .usage-note { font-size: 13px; font-weight: 400; color: var(--tc-2nd); }
+    .q-text { padding: 0 4px; font-size: 15px; font-weight: 400; line-height: 1.4; }
+    .btn.option { flex-direction: column; align-items: flex-start; justify-content: center; gap: 2px; min-height: 48px;
+      padding: 12px 16px; text-align: left; line-height: 1.35; white-space: normal; }
+    .option-desc { font-size: 13px; font-weight: 400; color: var(--tc-2nd); }
+    .btn.option.chosen { background: var(--bc-hi); color: var(--tc-hi); }
+    .btn.option.chosen .option-desc { color: #BDBDBD; }
 
-    /* ── Buttons ─────────────────────────────────────────────────────────── */
-    /* All flat fills: standard = BC-1st white, primary = BC-Highlight dark,
-       danger = red TEXT on the standard fill, pressed = the next-darker grey. */
-    .btn { min-width: 84px; padding: 12px; font: 400 15px/1 var(--font); letter-spacing: -0.01em;
-      color: var(--tc-1st); background: var(--bc-1st); border: 0; border-radius: var(--r);
-      cursor: pointer; transition: background 0.15s, opacity 0.15s; }
+    /* ── Buttons: white, dark, red text on white; pressed = darker fill ──── */
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 12px; min-height: 48px;
+      padding: 0 16px; box-sizing: border-box; border: 0; border-radius: var(--r); background: var(--bc-1st);
+      color: var(--tc-1st); font-size: 15px; font-weight: 400; text-decoration: none; text-align: center;
+      transition: background .15s, opacity .15s; }
     .btn:active { background: var(--bc-4th); }
-    .btn:disabled { opacity: 0.4; cursor: default; }   /* doc: disabled = opacity, not overlay */
-    .btn.primary { color: var(--tc-hi); background: var(--bc-hi); }
-    .btn.primary:active { background: #3A3A3A; }
-    .btn.danger { color: var(--tc-red); background: var(--bc-1st); }
-    .btn.danger:active { background: var(--bc-4th); }
-    .btn.danger.armed { color: var(--tc-hi); background: var(--tc-red); }
-    .btn.ghost { background: transparent; color: var(--tc-2nd); min-width: 0; padding: 10px 12px; }
+    .btn:disabled { opacity: .4; cursor: default; }
+    .btn.primary, .btn.dark { background: var(--bc-hi); color: var(--tc-hi); }
+    .btn.primary:active, .btn.dark:active { background: #3A3A3A; }
+    .btn.danger { color: var(--tc-red-text); }
+    .btn.danger.armed { background: var(--tc-red); color: var(--tc-hi); }
+    .btn.ghost { background: transparent; color: var(--tc-2nd); }
     .btn.ghost:active { background: var(--bc-4th); }
-    .btn.active { color: var(--tc-hi); background: var(--bc-hi); }
+    .btn.small { flex: 0 0 auto; min-height: 32px; padding: 0 12px; font-size: 13px; }
+    .arrow-btn { width: 100%; flex-wrap: wrap; row-gap: 0; padding-top: 8px; padding-bottom: 8px; }
+    .btn-note { flex-basis: 100%; font: 400 12px/1.4 var(--mono); letter-spacing: 0; color: var(--tc-2nd);
+      overflow-wrap: anywhere; }
 
-    /* ── Toast (BC-1st + soft shadow; the doc's small informative toast, ~3s) ─ */
-    .toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 10;
-      max-width: 88vw; padding: 12px 16px; font-size: 15px; font-weight: 400; line-height: 1.4;
-      text-align: center; color: var(--tc-1st); background: var(--bc-1st);
+    /* ── Toast: white, shadow, 3 s (the Figma's confirmation toast) ──────── */
+    .toast { position: fixed; left: 50%; top: calc(56px + env(safe-area-inset-top, 0px)); transform: translateX(-50%);
+      z-index: 40; width: max-content; max-width: calc(100vw - 32px); box-sizing: border-box; padding: 12px 16px;
+      font-size: 15px; font-weight: 400; line-height: 1.4; text-align: center; background: var(--bc-1st);
       border-radius: var(--r); box-shadow: var(--shadow); }
-    .toast[hidden] { display: none; }
   `
   const style = document.createElement('style')
   style.textContent = css
